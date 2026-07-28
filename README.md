@@ -2,7 +2,13 @@
 
 **Île-de-France & France multimodal transit** — journey planning, live network map, and estimated vehicle positions, built entirely from **raw open data**. No Navitia, Hove.io, or other commercial journey APIs.
 
-<video src="docs/demo.mp4" controls width="100%"></video>
+<p align="center">
+  <a href="https://github.com/princefr/transit/raw/main/docs/demo.mp4">
+    <img src="docs/demo-poster.png" alt="Transit demo — click to play video" width="800" />
+  </a>
+</p>
+
+<p align="center"><strong><a href="docs/demo.mp4">▶ Watch demo</a></strong> (2½ min) · <a href="https://github.com/princefr/transit/raw/main/docs/demo.mp4">raw MP4</a></p>
 
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -54,7 +60,8 @@ See also [`docs/IDFM_DAILY.md`](docs/IDFM_DAILY.md), [`docs/REDIS_CACHE.md`](doc
 | **Rust** 1.75+ | `rustup` recommended |
 | **RAM** 8–16 GB+ | IDFM + SNCF together is memory-heavy |
 | **Disk** ~2 GB+ | GTFS zips cached under `./data/` |
-| **PRIM API key** | Required for IDFM realtime ([marketplace](https://prim.iledefrance-mobilites.fr/)) |
+| **`IDFM_PRIM_API_KEY`** | Required for IDFM realtime SIRI Lite ([PRIM marketplace](https://prim.iledefrance-mobilites.fr/)) |
+| **`DATASETS_API_KEY`** or **`DATAGOUV_API_KEY`** | Required when [data.gouv.fr](https://www.data.gouv.fr/) / dataset portals expect `X-API-KEY` for GTFS downloads (`make sync-idfm`, `daily_sync.sh`); set one alias, not both |
 | **Redis** (optional) | Response cache for search / vehicles / itineraries |
 | **OSRM** (optional) | Street-level walk geometry; public demo URL in config |
 
@@ -71,11 +78,22 @@ cd transit
 make setup          # wasm target, scripts, .env from .env.example
 ```
 
-Edit `.env` and set your PRIM key for live IDFM data:
+Edit `.env` and set API keys (see [`.env.example`](.env.example)):
 
 ```bash
+# PRIM SIRI Lite — live IDFM delays, vehicles, alerts
 IDFM_PRIM_API_KEY=your_prim_api_key_here
+
+# data.gouv.fr / transport.data.gouv.fr GTFS downloads (X-API-KEY header)
+# Use DATASETS_API_KEY or DATAGOUV_API_KEY (aliases; first wins in scripts)
+DATASETS_API_KEY=your_datasets_api_key_here
 ```
+
+| Variable | Used for | Where to get it |
+|----------|----------|-----------------|
+| `IDFM_PRIM_API_KEY` | PRIM SIRI Lite + optional GTFS-RT (`apikey` header) | [prim.iledefrance-mobilites.fr](https://prim.iledefrance-mobilites.fr/) marketplace |
+| `DATASETS_API_KEY` | GTFS zip fetch via `make sync-idfm` / `scripts/daily_sync.sh` | [data.gouv.fr](https://www.data.gouv.fr/) account → API key (if portal requires auth) |
+| `DATAGOUV_API_KEY` | Same as `DATASETS_API_KEY` (alternate name) | Same |
 
 ### 2. Pre-download IDFM GTFS (recommended)
 
@@ -128,9 +146,12 @@ make smoke          # probes /health and GraphQL against BASE_URL
 
 - **File:** `config/default.toml`
 - **Override:** `TRANSIT_CONFIG=/path/to.toml`
-- **Env:** `TRANSIT__SERVER__BIND=127.0.0.1:8080` (figment `__` nesting)
+- **Secrets:** `.env` (loaded by `make run`, `scripts/run_server.sh`, systemd) — never commit
+- **Env overrides:** `TRANSIT__SERVER__BIND=127.0.0.1:8080` (figment `__` nesting)
 
 Key sections: `[server]`, `[routing]`, `[graphql]`, `[prim]`, `[[feeds]]`, optional `[redis]` and `[ban]`.
+
+Feed downloads can also use per-feed auth in TOML (`auth_header` + `auth_env`); see comments in `config/default.toml` for `IDFM_PRIM_API_KEY` and `DATASETS_API_KEY`.
 
 ```bash
 # Optional: address autocomplete (Base Adresse Nationale, Île-de-France)
