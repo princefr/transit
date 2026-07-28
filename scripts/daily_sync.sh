@@ -10,7 +10,8 @@
 #   BUILD_LINES=1    rebuild lignes.geojson when inputs present
 #   TRACES_GEOJSON   path to IDFM traces for BUILD_LINES
 #   SKIP_LINES=1     never build lines
-#   DATASETS_API_KEY / DATAGOUV_API_KEY  optional X-API-KEY (PRIM marketplace key; same value as IDFM_PRIM_API_KEY)
+#   PRIM_DATASET_KEY  optional X-API-KEY (PRIM dataset download key — not IDFM_PRIM_API_KEY)
+#   Legacy fallbacks: DATASETS_API_KEY, then DATAGOUV_API_KEY
 #
 # Cron 03:30 Europe/Paris: ./scripts/install_cron.sh
 # systemd: scripts/transit.timer + transit-daily-sync.service
@@ -40,7 +41,9 @@ BUILD_LINES="${BUILD_LINES:-0}"
 LOCK="/tmp/transit-daily-sync-${FEED_ID}.lock"
 
 CURL_EXTRA=()
-if [[ -n "${DATASETS_API_KEY:-}" ]]; then
+if [[ -n "${PRIM_DATASET_KEY:-}" ]]; then
+  CURL_EXTRA+=(-H "X-API-KEY: ${PRIM_DATASET_KEY}")
+elif [[ -n "${DATASETS_API_KEY:-}" ]]; then
   CURL_EXTRA+=(-H "X-API-KEY: ${DATASETS_API_KEY}")
 elif [[ -n "${DATAGOUV_API_KEY:-}" ]]; then
   CURL_EXTRA+=(-H "X-API-KEY: ${DATAGOUV_API_KEY}")

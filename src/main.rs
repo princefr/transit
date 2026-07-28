@@ -28,8 +28,11 @@ async fn main() -> anyhow::Result<()> {
     if std::env::var("IDFM_PRIM_API_KEY").is_ok() {
         info!("IDFM_PRIM_API_KEY is set (value not logged)");
     }
-    if std::env::var("DATASETS_API_KEY").is_ok() || std::env::var("DATAGOUV_API_KEY").is_ok() {
-        info!("DATASETS_API_KEY/DATAGOUV_API_KEY is set (value not logged)");
+    if std::env::var("PRIM_DATASET_KEY").is_ok()
+        || std::env::var("DATASETS_API_KEY").is_ok()
+        || std::env::var("DATAGOUV_API_KEY").is_ok()
+    {
+        info!("PRIM_DATASET_KEY (or legacy DATASETS_API_KEY/DATAGOUV_API_KEY) is set (value not logged)");
     }
 
     let config = Config::load().map_err(|e| anyhow::anyhow!(e))?;

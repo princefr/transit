@@ -61,7 +61,7 @@ See also [`docs/IDFM_DAILY.md`](docs/IDFM_DAILY.md), [`docs/REDIS_CACHE.md`](doc
 | **RAM** 8–16 GB+ | IDFM + SNCF together is memory-heavy |
 | **Disk** ~2 GB+ | GTFS zips cached under `./data/` |
 | **`IDFM_PRIM_API_KEY`** | PRIM marketplace key for IDFM realtime SIRI Lite ([prim.iledefrance-mobilites.fr](https://prim.iledefrance-mobilites.fr/)); `apikey` header |
-| **`DATASETS_API_KEY`** or **`DATAGOUV_API_KEY`** | Same PRIM marketplace key for GTFS zip downloads (`make sync-idfm`, `daily_sync.sh`); `X-API-KEY` header — not a separate [data.gouv.fr](https://www.data.gouv.fr/) account key; set one alias, not both |
+| **`PRIM_DATASET_KEY`** | Separate PRIM key for GTFS zip downloads (`make sync-idfm`, `daily_sync.sh`); `X-API-KEY` header — not the same value as `IDFM_PRIM_API_KEY` |
 | **Redis** (optional) | Response cache for search / vehicles / itineraries |
 | **OSRM** (optional) | Street-level walk geometry; public demo URL in config |
 
@@ -81,20 +81,21 @@ make setup          # wasm target, scripts, .env from .env.example
 Edit `.env` and set API keys (see [`.env.example`](.env.example)):
 
 ```bash
-# PRIM marketplace key — realtime SIRI Lite (apikey header)
-IDFM_PRIM_API_KEY=your_prim_api_key_here
+# PRIM realtime key — SIRI Lite (apikey header)
+IDFM_PRIM_API_KEY=your_prim_realtime_api_key_here
 
-# Same PRIM key value for GTFS downloads (X-API-KEY header); aliases — first wins in scripts
-DATASETS_API_KEY=your_prim_api_key_here
+# Separate PRIM dataset key for GTFS downloads (X-API-KEY header)
+PRIM_DATASET_KEY=your_prim_dataset_api_key_here
 ```
 
-PRIM issues marketplace API keys used for both realtime and dataset access. This repo uses two env vars because callers send different headers (`apikey` vs `X-API-KEY`); **you can paste the same key into both**.
+PRIM issues separate marketplace keys for realtime and dataset access. This repo uses two env vars because callers send different headers (`apikey` vs `X-API-KEY`) and the keys are **not interchangeable**.
 
 | Variable | Used for | Header | Where to get it |
 |----------|----------|--------|-----------------|
 | `IDFM_PRIM_API_KEY` | PRIM SIRI Lite + optional GTFS-RT | `apikey` | [prim.iledefrance-mobilites.fr](https://prim.iledefrance-mobilites.fr/) marketplace |
-| `DATASETS_API_KEY` | GTFS zip via `make sync-idfm` / `scripts/daily_sync.sh` | `X-API-KEY` | Same PRIM key (reuse `IDFM_PRIM_API_KEY` value) |
-| `DATAGOUV_API_KEY` | Same as `DATASETS_API_KEY` (alternate env name) | `X-API-KEY` | Same |
+| `PRIM_DATASET_KEY` | GTFS zip via `make sync-idfm` / `scripts/daily_sync.sh` | `X-API-KEY` | PRIM Datahub / dataset product (separate key) |
+| `DATASETS_API_KEY` | Legacy fallback for `PRIM_DATASET_KEY` | `X-API-KEY` | Deprecated alias |
+| `DATAGOUV_API_KEY` | Legacy fallback for `PRIM_DATASET_KEY` | `X-API-KEY` | Deprecated alias |
 
 ### 2. Pre-download IDFM GTFS (recommended)
 
@@ -152,7 +153,7 @@ make smoke          # probes /health and GraphQL against BASE_URL
 
 Key sections: `[server]`, `[routing]`, `[graphql]`, `[prim]`, `[[feeds]]`, optional `[redis]` and `[ban]`.
 
-Feed downloads can also use per-feed auth in TOML (`auth_header` + `auth_env`); see comments in `config/default.toml` for `IDFM_PRIM_API_KEY` and `DATASETS_API_KEY`.
+Feed downloads can also use per-feed auth in TOML (`auth_header` + `auth_env`); see comments in `config/default.toml` for `IDFM_PRIM_API_KEY` and `PRIM_DATASET_KEY`.
 
 ```bash
 # Optional: address autocomplete (Base Adresse Nationale, Île-de-France)

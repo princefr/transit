@@ -37,9 +37,9 @@ First boot of IDFM can take **minutes** (download + `spawn_blocking` parse). `/h
 
 ```bash
 cp .env.example .env
-# edit (same PRIM marketplace key can fill both — different HTTP headers):
+# edit (two separate PRIM keys — do not reuse the same value):
 #   IDFM_PRIM_API_KEY=...     # realtime SIRI / GTFS-RT: apikey header
-#   DATASETS_API_KEY=...      # GTFS zip download: X-API-KEY (optional on public data.gouv URLs)
+#   PRIM_DATASET_KEY=...      # GTFS zip download: X-API-KEY (legacy: DATASETS_API_KEY, DATAGOUV_API_KEY)
 chmod 600 .env
 ```
 

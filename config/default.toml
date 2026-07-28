@@ -116,11 +116,12 @@ priority = 50
 # Keep trips active in the next 14 days only (memory guard for huge stop_times)
 static_horizon_days = 14
 
-# GTFS zip downloads: DATASETS_API_KEY / DATAGOUV_API_KEY in .env (PRIM marketplace key,
-# X-API-KEY header — same key value as IDFM_PRIM_API_KEY). Optional for public data.gouv URLs.
+# GTFS zip downloads: PRIM_DATASET_KEY in .env (separate PRIM dataset key, X-API-KEY header —
+# not IDFM_PRIM_API_KEY). Legacy fallbacks: DATASETS_API_KEY, DATAGOUV_API_KEY.
+# Optional for public data.gouv URLs.
 # Example [[feeds]] auth when the static_url host expects X-API-KEY:
 #   auth_header = "X-API-KEY"
-#   auth_env = "DATASETS_API_KEY"
+#   auth_env = "PRIM_DATASET_KEY"
 
 # --- Optional Redis cache (disabled by default) ---
 # Hot GraphQL paths: search, map vehicles (bbox/near), itineraries, /health.
