@@ -1,0 +1,24 @@
+[package]
+name = "ban-search"
+version = "0.1.0"
+edition = "2021"
+description = "France Base Adresse Nationale (BAN) download, index, and autocomplete"
+license = "MIT"
+keywords = ["ban", "adresse", "france", "geocoding", "autocomplete"]
+
+[dependencies]
+anyhow = "1"
+bincode = "1"
+csv = "1"
+flate2 = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "gzip"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "ban-index"
+path = "src/bin/ban_index.rs"

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+  <!-- Vehicle position: circle + direction chevron (points up / heading) -->
+  <circle cx="12" cy="12" r="9" fill="currentColor" opacity="0.15"/>
+  <circle cx="12" cy="12" r="7" fill="currentColor" opacity="0.25" stroke="currentColor" stroke-width="1.5"/>
+  <path fill="currentColor" d="M12 6.5l4.5 8H7.5L12 6.5z"/>
+</svg>

@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+  <!-- Station / gare building facade -->
+  <path d="M3 20h18"/>
+  <path d="M5 20V9l7-5 7 5v11"/>
+  <rect x="9.5" y="13" width="5" height="7" rx="0.5"/>
+  <path d="M8 11h1.5M14.5 11H16"/>
+  <path d="M8 14.5h1.5M14.5 14.5H16"/>
+</svg>

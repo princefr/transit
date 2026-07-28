@@ -1,0 +1,134 @@
+[server]
+bind = "0.0.0.0:8080"
+graphql_playground = true
+
+[runtime]
+# RAPTOR runs on blocking pool; keep a few free for health/stops while planning.
+blocking_threads = 8
+max_concurrent_static_builds = 1
+max_outbound_rt_requests = 8
+rt_request_timeout_secs = 15
+static_download_timeout_secs = 600
+data_dir = "./data"
+
+[routing]
+timezone = "Europe/Paris"
+default_transfer_s = 180
+max_transfers = 6
+max_results = 10
+raptor_max_rounds = 8
+walk_speed_m_s = 1.2
+max_walk_meters = 2000
+# Walk links between boardable stops (complete transfer graph). 400m+ for monomodal RER↔Métro.
+hub_link_radius_m = 450
+# OSRM for street-level walk/bike paths on the map (access, egress, transfers).
+# Empty = straight lines only. Public demo (best-effort) or self-host:
+osrm_url = "https://router.project-osrm.org"
+# Or env: TRANSIT_OSRM_URL=https://router.project-osrm.org
+bike_speed_m_s = 4.2
+max_bike_meters = 5000
+
+[graphql]
+max_complexity = 300
+max_depth = 15
+# IDFM-scale RAPTOR is heavy; 90s is enough for ≤4 results without hanging the process.
+itinerary_timeout_secs = 90
+
+# Base Adresse Nationale — local autocomplete (see crates/ban-search).
+# Build index: make ban-index   (downloads IDF depts + writes data/ban/index.bin)
+[ban]
+enabled = true
+# data_dir = "./data/ban"   # default: {runtime.data_dir}/ban
+# departments = ["75", "77", "78", "91", "92", "93", "94", "95"]
+
+[redis]
+enabled = false
+url = "redis://127.0.0.1:6379"
+search_ttl_secs = 300
+vehicles_ttl_secs = 10
+itinerary_ttl_secs = 45
+health_ttl_secs = 5
+
+[[feeds]]
+id = "sncf"
+enabled = true
+static_url = "https://eu.ftp.opendatasoft.com/sncf/plandata/Export_OpenData_SNCF_GTFS_NewTripId.zip"
+trip_updates_url = "https://proxy.transport.data.gouv.fr/resource/sncf-gtfs-rt-trip-updates"
+service_alerts_url = "https://proxy.transport.data.gouv.fr/resource/sncf-gtfs-rt-service-alerts"
+# vehicle_positions_url = ""
+static_check_interval_secs = 1800
+rt_poll_interval_secs = 60
+user_agent = "transit-rs/0.1 (France multimodal GTFS server)"
+priority = 100
+
+# --- PRIM SIRI Lite continuous pull (apikey = IDFM_PRIM_API_KEY) ---
+# Merges into RealtimeOverlay feed "idfm" (trip updates, alerts, SM vehicles).
+# Quotas (official): SM 1e6/day | ET 1e3/day | GM 2e4/day — soft budgets leave headroom.
+#
+# PRIM enforces short-term rate limits (HTTP 429) — keep pollers sparse.
+#   ET: 1 LineRef every 120s (~720/day under 900 budget)
+#   SM: 1 MonitoringRef every 60s + global 700ms gap between all PRIM calls
+#   GM: 1 LineRef every 90s
+[prim]
+enabled = true
+base_url = "https://prim.iledefrance-mobilites.fr"
+api_key_env = "IDFM_PRIM_API_KEY"
+# feed_id = "idfm"
+et_interval_secs = 120
+et_daily_budget = 700
+et_lines_per_tick = 1
+gm_interval_secs = 90
+gm_daily_budget = 10000
+sm_interval_secs = 60
+sm_daily_budget = 20000
+sm_max_stops_per_cycle = 1
+# Legacy aliases (still accepted):
+disruptions_interval_secs = 90
+vehicles_interval_secs = 120
+# Optional overrides (empty = built-in expanded metro/RER/tram/bus + hub seeds):
+# line_refs = ["STIF:Line::C01371:", "STIF:Line::C01742:"]
+# seed_monitoring_refs = ["STIF:StopPoint:Q:463041:", "STIF:StopArea:SP:43152:"]
+
+# --- Île-de-France Mobilités (IDFM) static GTFS ---
+# Prefer offline zip via scripts/daily_sync.sh into data/idfm/current.zip.
+# After daily_sync changes the zip, restart transit (RESTART=1) — no SIGHUP reload yet.
+# PRIM docs: https://prim.iledefrance-mobilites.fr/
+# Ops runbook: docs/IDFM_DAILY.md
+#
+# RAM: full IDFM stop_times is huge. static_horizon_days keeps only trips whose
+# service runs in [today, today+N] when packing. Still expect multi‑GB RAM; 16GB+
+# safer without a tight horizon. SNCF+IDFM often 8–16GB+.
+[[feeds]]
+id = "idfm"
+enabled = true
+static_url = "https://www.data.gouv.fr/api/1/datasets/r/413988ed-d340-467b-8be2-7b999fcd207a"
+# Realtime: PRIM pollers use raw SIRI (ET/GM) via rt::adapter — not Navitia.
+# Optional GTFS-RT URLs when your key has access (protobuf); same adapter path:
+# trip_updates_url = "https://prim.iledefrance-mobilites.fr/marketplace/gtfs-rt/trip-updates"
+# service_alerts_url = "https://prim.iledefrance-mobilites.fr/marketplace/gtfs-rt/service-alerts"
+# vehicle_positions_url = "https://prim.iledefrance-mobilites.fr/marketplace/gtfs-rt/vehicle-positions"
+# auth_header = "apikey"
+# auth_env = "IDFM_PRIM_API_KEY"
+static_check_interval_secs = 3600
+rt_poll_interval_secs = 30
+user_agent = "transit-rs/0.1 (France multimodal GTFS server)"
+priority = 50
+# Keep trips active in the next 14 days only (memory guard for huge stop_times)
+static_horizon_days = 14
+
+# Dataset downloads (data.gouv.fr): set DATASETS_API_KEY in .env if a portal requires it.
+# Example feed auth for portals that expect X-API-KEY:
+#   auth_header = "X-API-KEY"
+#   auth_env = "DATASETS_API_KEY"
+
+# --- Optional Redis cache (disabled by default) ---
+# Hot GraphQL paths: search, map vehicles (bbox/near), itineraries, /health.
+# App works without Redis; enable for multi-instance or repeat-query latency wins.
+# Local: docker run -d -p 6379:6379 redis:7-alpine
+# [redis]
+# enabled = true
+# url = "redis://127.0.0.1:6379"
+# search_ttl_secs = 300
+# vehicles_ttl_secs = 10
+# itinerary_ttl_secs = 45
+# health_ttl_secs = 5

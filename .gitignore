@@ -1,0 +1,8 @@
+.env
+.env.local
+data/
+target/
+web/dist/
+web/target/
+*.log
+pe-results.md

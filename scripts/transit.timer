@@ -1,0 +1,31 @@
+# systemd timer: run IDFM daily GTFS sync 3× per day (Datahub / data.gouv).
+#
+# This unit fires a oneshot service that must exist as transit-daily-sync.service
+# (template below is installed from docs/IDFM_DAILY.md or generate with the
+# companion unit written next to this file).
+#
+# Install:
+#   sudo cp scripts/transit.timer /etc/systemd/system/
+#   sudo cp scripts/transit-daily-sync.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now transit.timer
+#   systemctl list-timers | grep transit
+#
+# Crontab alternative (no systemd):
+#   15 5,13,21 * * * /home/ondonda/rust/transit/scripts/daily_sync.sh >>/home/ondonda/rust/transit/data/logs/cron.log 2>&1
+
+[Unit]
+Description=Schedule IDFM / transit GTFS daily_sync (3× daily)
+Documentation=file:///home/ondonda/rust/transit/docs/IDFM_DAILY.md
+
+[Timer]
+# Morning, afternoon, evening UTC-ish; adjust for local ops
+OnCalendar=*-*-* 05:15:00
+OnCalendar=*-*-* 13:15:00
+OnCalendar=*-*-* 21:15:00
+Persistent=true
+RandomizedDelaySec=120
+Unit=transit-daily-sync.service
+
+[Install]
+WantedBy=timers.target

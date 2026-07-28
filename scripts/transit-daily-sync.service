@@ -1,0 +1,31 @@
+# oneshot companion for scripts/transit.timer
+#
+#   sudo cp scripts/transit-daily-sync.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl start transit-daily-sync.service   # manual test
+#   journalctl -u transit-daily-sync.service -n 50
+
+[Unit]
+Description=Download IDFM GTFS into data/idfm and optionally restart transit
+Documentation=file:///home/ondonda/rust/transit/docs/IDFM_DAILY.md
+After=network-online.target
+Wants=network-online.target
+# Restart transit after a successful sync when RESTART=1 (default here).
+# OnFailure can mail/notify via a separate unit if desired.
+
+[Service]
+Type=oneshot
+User=ondonda
+Group=ondonda
+WorkingDirectory=/home/ondonda/rust/transit
+Environment=RESTART=1
+Environment=BUILD_LINES=0
+Environment=FEED_ID=idfm
+# Environment=GTFS_URL=https://www.data.gouv.fr/api/1/datasets/r/413988ed-d340-467b-8be2-7b999fcd207a
+ExecStart=/home/ondonda/rust/transit/scripts/daily_sync.sh
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+# Non-zero exit from daily_sync marks the unit failed (cron-compatible notify).
+SuccessExitStatus=0

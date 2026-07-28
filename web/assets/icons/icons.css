@@ -1,0 +1,53 @@
+/**
+ * Transit icon utilities (mask + currentColor).
+ * Paths are relative to this file (assets/icons/).
+ *
+ * Usage:
+ *   <span class="t-icon t-icon--bus" aria-hidden="true"></span>
+ *   <span class="t-icon t-icon--live t-icon--sm" style="color: #16a34a"></span>
+ */
+
+.t-icon {
+  display: inline-block;
+  width: 1.5rem;
+  height: 1.5rem;
+  flex-shrink: 0;
+  vertical-align: middle;
+  background-color: currentColor;
+  -webkit-mask: var(--t-icon) center / contain no-repeat;
+  mask: var(--t-icon) center / contain no-repeat;
+}
+
+.t-icon--sm { width: 1rem; height: 1rem; }
+.t-icon--md { width: 1.5rem; height: 1.5rem; }
+.t-icon--lg { width: 2rem; height: 2rem; }
+
+.t-icon--train { --t-icon: url("./train.svg"); }
+.t-icon--bus { --t-icon: url("./bus.svg"); }
+.t-icon--metro { --t-icon: url("./metro.svg"); }
+.t-icon--tram { --t-icon: url("./tram.svg"); }
+.t-icon--ferry { --t-icon: url("./ferry.svg"); }
+.t-icon--walk { --t-icon: url("./walk.svg"); }
+.t-icon--wheelchair { --t-icon: url("./wheelchair.svg"); }
+.t-icon--bike { --t-icon: url("./bike.svg"); }
+.t-icon--transfer { --t-icon: url("./transfer.svg"); }
+.t-icon--alert { --t-icon: url("./alert.svg"); }
+.t-icon--delay { --t-icon: url("./delay.svg"); }
+.t-icon--live { --t-icon: url("./live.svg"); }
+.t-icon--station { --t-icon: url("./station.svg"); }
+.t-icon--platform { --t-icon: url("./platform.svg"); }
+.t-icon--vehicle { --t-icon: url("./vehicle.svg"); }
+
+/* Pins keep intrinsic colors — use as background-image, not mask */
+.t-icon--pin-origin,
+.t-icon--pin-destination {
+  background-color: transparent;
+  -webkit-mask: none;
+  mask: none;
+  background-position: center;
+  background-size: contain;
+  background-repeat: no-repeat;
+}
+
+.t-icon--pin-origin { background-image: url("./pin-origin.svg"); }
+.t-icon--pin-destination { background-image: url("./pin-destination.svg"); }

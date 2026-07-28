@@ -1,0 +1,126 @@
+{
+  "version": 1,
+  "basePath": "assets/icons",
+  "defaultViewBox": "0 0 24 24",
+  "icons": [
+    {
+      "id": "train",
+      "file": "train.svg",
+      "label": "Train / rail",
+      "modes": ["RAIL", "HIGH_SPEED_RAIL", "TGV"],
+      "use": "Route legs and mode filters for intercity / regional rail"
+    },
+    {
+      "id": "bus",
+      "file": "bus.svg",
+      "label": "Bus",
+      "modes": ["BUS", "COACH", "TROLLEYBUS"],
+      "use": "Bus and coach route segments and filters"
+    },
+    {
+      "id": "metro",
+      "file": "metro.svg",
+      "label": "Metro / subway",
+      "modes": ["SUBWAY", "METRO", "RAPID_TRANSIT"],
+      "use": "Underground / metro line indicators"
+    },
+    {
+      "id": "tram",
+      "file": "tram.svg",
+      "label": "Tram",
+      "modes": ["TRAM", "LIGHT_RAIL", "STREETCAR"],
+      "use": "Tram and light-rail legs"
+    },
+    {
+      "id": "ferry",
+      "file": "ferry.svg",
+      "label": "Ferry",
+      "modes": ["FERRY", "WATER"],
+      "use": "Water transit / ferry connections"
+    },
+    {
+      "id": "walk",
+      "file": "walk.svg",
+      "label": "Walk / pedestrian",
+      "modes": ["WALK", "PEDESTRIAN"],
+      "use": "Walking segments between stops or first/last mile"
+    },
+    {
+      "id": "wheelchair",
+      "file": "wheelchair.svg",
+      "label": "Wheelchair accessibility",
+      "modes": [],
+      "use": "Accessible stop, vehicle, or journey badges"
+    },
+    {
+      "id": "bike",
+      "file": "bike.svg",
+      "label": "Bike",
+      "modes": ["BICYCLE", "BIKE", "BIKESHARE"],
+      "use": "Cycling legs and bike-share options"
+    },
+    {
+      "id": "transfer",
+      "file": "transfer.svg",
+      "label": "Transfer / connection",
+      "modes": [],
+      "use": "Interchange between services or modes"
+    },
+    {
+      "id": "pin-origin",
+      "file": "pin-origin.svg",
+      "label": "Origin pin (green)",
+      "modes": [],
+      "use": "Map marker for journey start; fixed green fill"
+    },
+    {
+      "id": "pin-destination",
+      "file": "pin-destination.svg",
+      "label": "Destination pin (red)",
+      "modes": [],
+      "use": "Map marker for journey end; fixed red fill"
+    },
+    {
+      "id": "alert",
+      "file": "alert.svg",
+      "label": "Alert / warning",
+      "modes": [],
+      "use": "Service alerts, disruptions, GTFS-RT alerts"
+    },
+    {
+      "id": "delay",
+      "file": "delay.svg",
+      "label": "Delay clock",
+      "modes": [],
+      "use": "Delayed departures/arrivals and schedule slip"
+    },
+    {
+      "id": "live",
+      "file": "live.svg",
+      "label": "Realtime / live pulse",
+      "modes": [],
+      "use": "Live tracking indicator; realtime-fed data"
+    },
+    {
+      "id": "station",
+      "file": "station.svg",
+      "label": "Station / gare",
+      "modes": [],
+      "use": "Station building or major stop POI"
+    },
+    {
+      "id": "platform",
+      "file": "platform.svg",
+      "label": "Platform sign",
+      "modes": [],
+      "use": "Platform number / track assignment UI"
+    },
+    {
+      "id": "vehicle",
+      "file": "vehicle.svg",
+      "label": "Vehicle position",
+      "modes": [],
+      "use": "Live vehicle on map; rotate via CSS/transform for heading"
+    }
+  ]
+}

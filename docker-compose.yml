@@ -1,0 +1,16 @@
+services:
+  transit:
+    build: .
+    image: transit:local
+    ports:
+      - "8080:8080"
+    volumes:
+      # Persist downloaded GTFS / RT cache across restarts
+      - ./data:/app/data
+      # Optional: mount a custom config over the image default
+      # - ./config/default.toml:/app/config/default.toml:ro
+    environment:
+      RUST_LOG: info,transit=info
+      TRANSIT__SERVER__BIND: 0.0.0.0:8080
+      TRANSIT__RUNTIME__DATA_DIR: /app/data
+    restart: unless-stopped

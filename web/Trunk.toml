@@ -1,0 +1,18 @@
+[build]
+target = "index.html"
+dist = "dist"
+# Avoid "error minifying or copying JS loader … No such file or directory"
+# which is a race on dist/.stage when trunk serve rebuilds while files change.
+minify = "never"
+# Keep file names stable enough for concurrent copy steps
+filehash = true
+
+[watch]
+ignore = ["dist", "target"]
+
+[serve]
+addresses = ["127.0.0.1"]
+port = 8088
+open = false
+# Prefer websocket reloads; avoids hammering rebuilds
+ws_protocol = "ws"

@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Transit — Itinéraires & carte</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+      crossorigin=""
+    />
+    <link data-trunk rel="css" href="styles.css" />
+    <link data-trunk rel="copy-dir" href="assets" />
+    <!-- wasm-opt "z" is slow and races with trunk serve rebuilds; use "0" for stable serve -->
+    <link data-trunk rel="rust" data-wasm-opt="0" />
+    <script
+      src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+      integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+      crossorigin=""
+    ></script>
+    <link data-trunk rel="copy-file" href="map.js" />
+  </head>
+  <body>
+    <div id="app">
+      <aside id="sidebar" class="sidebar">
+        <header class="brand card-header">
+          <div class="brand-row">
+            <div class="brand-mark" aria-hidden="true">T</div>
+            <div>
+              <h1>Transit</h1>
+              <p class="subtitle">Multimodal · Île-de-France &amp; France</p>
+            </div>
+          </div>
+          <div id="health-badge" class="badge badge-muted">API…</div>
+        </header>
+
+        <div id="static-loading-banner" class="static-loading-banner" role="status" aria-live="polite">
+          <span class="spinner" aria-hidden="true"></span>
+          <span id="static-loading-banner-text">Chargement des horaires…</span>
+        </div>
+
+        <section class="panel card">
+          <div class="card-title">Planifier</div>
+          <label class="field">
+            <span class="label">Départ (gare ou adresse)</span>
+            <div class="input-wrap">
+              <input
+                id="origin-input"
+                class="input"
+                type="search"
+                placeholder="Ville ou gare"
+                autocomplete="off"
+              />
+              <span id="origin-loading" class="field-spinner" hidden aria-hidden="true"></span>
+            </div>
+            <ul id="origin-suggest" class="suggest" hidden></ul>
+            <label class="check check-inline bike-check" title="Premier kilomètre à vélo jusqu’au transport">
+              <input id="bike-from" type="checkbox" />
+              <img src="assets/icons/bike.svg" alt="" width="14" height="14" class="bike-check-icon" />
+              <span>Vélo</span>
+            </label>
+          </label>
+          <label class="field">
+            <span class="label">Arrivée (gare ou adresse)</span>
+            <div class="input-wrap">
+              <input
+                id="dest-input"
+                class="input"
+                type="search"
+                placeholder="ex. Aulnay-sous-Bois, Châtelet…"
+                autocomplete="off"
+              />
+              <span id="dest-loading" class="field-spinner" hidden aria-hidden="true"></span>
+            </div>
+            <ul id="dest-suggest" class="suggest" hidden></ul>
+            <label class="check check-inline bike-check" title="Dernier kilomètre à vélo depuis le transport">
+              <input id="bike-to" type="checkbox" />
+              <img src="assets/icons/bike.svg" alt="" width="14" height="14" class="bike-check-icon" />
+              <span>Vélo</span>
+            </label>
+          </label>
+          <div class="row">
+            <label class="field grow">
+              <span class="label" id="time-field-label">Heure (optionnel)</span>
+              <input id="depart-at" class="input" type="datetime-local" />
+            </label>
+          </div>
+          <div class="checks">
+            <label class="check">
+              <input id="arrive-by" type="checkbox" />
+              <span>Arriver avant</span>
+            </label>
+            <label class="check">
+              <input id="wheelchair" type="checkbox" />
+              <span>Fauteuil roulant</span>
+            </label>
+          </div>
+          <button id="plan-btn" class="btn btn-primary" type="button" disabled title="En attente du chargement des horaires GTFS">
+            <span id="plan-btn-spinner" class="btn-spinner" hidden></span>
+            <span id="plan-btn-label">Calculer l’itinéraire</span>
+          </button>
+          <p id="status" class="status" role="status"></p>
+        </section>
+
+        <section class="panel card">
+          <div class="card-title-row">
+            <div class="card-title">Itinéraires</div>
+            <span class="badge badge-soft">jusqu’à 4</span>
+          </div>
+          <label class="check live-toggle muted-check">
+            <input id="live-vehicles" type="checkbox" />
+            <span>Temps réel véhicule (hors focus itinéraire)</span>
+          </label>
+          <p id="live-vehicles-status" class="live-empty" hidden></p>
+          <div id="journeys" class="journeys empty">
+            Planifiez un trajet pour voir les propositions.
+          </div>
+        </section>
+
+        <details class="panel card details-panel">
+          <summary class="card-title">Carte &amp; réseau</summary>
+          <label class="check live-toggle">
+            <input id="idfm-lines" type="checkbox" checked />
+            <span>Lignes IDFM (référentiel)</span>
+          </label>
+          <p id="idfm-lines-count" class="hint">Chargement des lignes…</p>
+          <div class="mode-filters" id="idfm-mode-filters">
+            <label class="chip"><input type="checkbox" value="metro" checked /> Métro</label>
+            <label class="chip"><input type="checkbox" value="rail" checked /> RER/Train</label>
+            <label class="chip"><input type="checkbox" value="tram" checked /> Tram</label>
+            <label class="chip"><input type="checkbox" value="bus" checked /> Bus</label>
+            <label class="chip"><input type="checkbox" value="funicular" checked /> Funiculaire</label>
+            <label class="chip"><input type="checkbox" value="cableway" checked /> Cable</label>
+          </div>
+          <label class="check">
+            <input id="idfm-soon" type="checkbox" checked />
+            <span>Prochainement actives</span>
+          </label>
+          <label class="check live-toggle">
+            <input id="global-live" type="checkbox" checked disabled title="Disponible une fois les horaires chargés" />
+            <span>Réseau en direct (masqué si itinéraire sélectionné)</span>
+          </label>
+          <p id="global-live-status" class="live-empty" hidden></p>
+        </details>
+
+        <details class="panel card details-panel">
+          <summary class="card-title">Départs</summary>
+          <p class="hint">Sélectionnez un arrêt — SIRI live si dispo, sinon GTFS.</p>
+          <div id="departures" class="departures empty">—</div>
+        </details>
+
+        <section class="panel card legend-panel">
+          <div class="card-title">Modes</div>
+          <ul id="mode-legend" class="legend"></ul>
+        </section>
+
+        <footer class="footer">
+          <code id="graphql-url-label"></code>
+        </footer>
+      </aside>
+
+      <main id="map-wrap">
+        <div id="map"></div>
+        <div
+          id="static-loading-overlay"
+          class="static-loading-overlay"
+          aria-busy="true"
+          aria-live="polite"
+        >
+          <div class="static-loading-card">
+            <span class="spinner spinner-lg" aria-hidden="true"></span>
+            <h2 class="static-loading-title">Chargement des horaires</h2>
+            <p id="static-loading-message" class="static-loading-message">
+              Préparation des données GTFS…
+            </p>
+            <ul id="static-loading-feeds" class="static-loading-feeds"></ul>
+            <p class="static-loading-hint hint">
+              La première importation IDFM peut prendre plusieurs minutes. Les fonctionnalités
+              temps réel et la recherche d’itinéraires seront disponibles une fois le chargement
+              terminé.
+            </p>
+          </div>
+        </div>
+        <!-- Traffic ticker: top bar, slow scroll right → left (shown as soon as UI boots) -->
+        <div id="traffic-ticker-bar" class="traffic-ticker-bar">
+          <span class="traffic-ticker-label">Info trafic</span>
+          <div class="traffic-ticker-viewport">
+            <div id="traffic-messages" class="traffic-ticker-track">
+              <span class="traffic-ticker-seg">Chargement des infos trafic…</span>
+            </div>
+          </div>
+        </div>
+        <div class="map-focus-banner" id="map-focus-banner" hidden>
+          <span>Itinéraire sélectionné — véhicules et réseau masqués</span>
+        </div>
+        <div id="map-global-live-badge" class="map-live-badge map-global-live-badge" hidden>
+          <img src="assets/icons/live.svg" alt="" width="14" height="14" />
+          <span id="map-global-live-count">0 véhicules en direct</span>
+        </div>
+        <div id="map-live-badge" class="map-live-badge map-journey-live-badge" hidden>
+          <img src="assets/icons/live.svg" alt="" width="14" height="14" />
+          Temps réel
+        </div>
+        <!-- Bottom trip detail card (filled when an itinerary is selected) -->
+        <div id="trip-detail-card" class="trip-detail-card" hidden>
+          <div class="trip-detail-head">
+            <div class="trip-detail-head-main">
+              <div id="trip-detail-title" class="trip-detail-title">—</div>
+              <div id="trip-detail-meta" class="trip-detail-meta"></div>
+            </div>
+            <button
+              id="trip-detail-close"
+              class="trip-detail-close"
+              type="button"
+              aria-label="Fermer le détail"
+              title="Fermer"
+            >
+              ×
+            </button>
+          </div>
+          <div id="trip-detail-body" class="trip-detail-body"></div>
+        </div>
+      </main>
+    </div>
+    <script src="map.js"></script>
+    <script>
+      (function () {
+        function applyIdfmFilters() {
+          if (!window.TransitMap || !window.TransitMap.setIdfmLineFilters) return;
+          const modes = [];
+          document.querySelectorAll("#idfm-mode-filters input[type=checkbox]").forEach((el) => {
+            if (el.checked) modes.push(el.value);
+          });
+          const soon = document.getElementById("idfm-soon");
+          window.TransitMap.setIdfmLineFilters(modes, soon ? soon.checked : true);
+        }
+        function bind() {
+          const toggle = document.getElementById("idfm-lines");
+          if (toggle) {
+            toggle.addEventListener("change", () => {
+              if (window.TransitMap) {
+                window.TransitMap.setIdfmLinesVisible(toggle.checked);
+              }
+            });
+          }
+          document.querySelectorAll("#idfm-mode-filters input, #idfm-soon").forEach((el) => {
+            el.addEventListener("change", applyIdfmFilters);
+          });
+          if (window.TransitMap) {
+            window.TransitMap.init();
+            if (toggle && toggle.checked) {
+              window.TransitMap.setIdfmLinesVisible(true);
+            }
+          }
+        }
+        if (document.readyState === "loading") {
+          document.addEventListener("DOMContentLoaded", bind);
+        } else {
+          bind();
+        }
+      })();
+    </script>
+  </body>
+</html>

@@ -1,0 +1,57 @@
+[workspace]
+members = [".", "crates/ban-search"]
+exclude = ["web"]
+resolver = "2"
+
+[package]
+name = "transit"
+version = "0.1.0"
+edition = "2021"
+description = "France multimodal GTFS / GTFS-RT itinerary server with GraphQL"
+license = "MIT"
+default-run = "transit"
+
+[dependencies]
+ban-search = { path = "crates/ban-search" }
+anyhow = "1"
+arc-swap = "1"
+async-graphql = { version = "7", features = ["chrono", "playground"] }
+async-graphql-axum = "7"
+async-stream = "0.3"
+axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+csv = "1"
+dotenvy = "0.15"
+figment = { version = "0.10", features = ["toml", "env"] }
+futures-util = "0.3"
+hex = "0.4"
+prost = "0.13"
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "stream", "blocking", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[build-dependencies]
+prost-build = "0.13"
+protoc-bin-vendored = "3"
+
+[dev-dependencies]
+tempfile = "3"
+tokio-test = "0.4"
+
+[[bin]]
+name = "transit"
+path = "src/main.rs"

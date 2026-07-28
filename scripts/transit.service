@@ -1,0 +1,57 @@
+# systemd unit for the transit GraphQL server.
+#
+# Install (user service example):
+#   mkdir -p ~/.config/systemd/user
+#   cp scripts/transit.service ~/.config/systemd/user/
+#   # edit WorkingDirectory / User paths
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now transit.service
+#
+# System-wide:
+#   sudo cp scripts/transit.service /etc/systemd/system/
+#   sudoedit /etc/systemd/system/transit.service   # set User, WorkingDirectory
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now transit.service
+#
+# Pair with scripts/transit.timer for daily IDFM sync, or a separate
+# transit-daily-sync.service (see docs/IDFM_DAILY.md).
+
+[Unit]
+Description=transit GraphQL GTFS/GTFS-RT server
+Documentation=file:///home/ondonda/rust/transit/docs/IDFM_DAILY.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# CHANGE ME: run as a dedicated user with access to the tree and data/
+User=ondonda
+Group=ondonda
+WorkingDirectory=/home/ondonda/rust/transit
+
+# Load secrets (IDFM_PRIM_API_KEY, etc.). File must not be world-readable.
+EnvironmentFile=-/home/ondonda/rust/transit/.env
+Environment=RUST_LOG=info,transit=info
+Environment=TRANSIT__RUNTIME__DATA_DIR=/home/ondonda/rust/transit/data
+
+# Prefer prebuilt release binary (deploy path). Fallback: use run_server.sh.
+ExecStart=/home/ondonda/rust/transit/target/release/transit
+# ExecStart=/home/ondonda/rust/transit/scripts/run_server.sh
+# ExecStart=/home/ondonda/rust/transit/scripts/run_server.sh
+# with SKIP_CARGO=1 after cargo build --release
+
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=120
+
+# Large IDFM+SNCF static parse needs headroom
+LimitNOFILE=65536
+# Optional memory ceiling (uncomment if you want cgroup kill on runaway):
+# MemoryMax=12G
+
+# Hardening (relax if data/ is outside WorkingDirectory)
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
