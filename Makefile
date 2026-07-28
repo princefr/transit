@@ -30,7 +30,7 @@ help: ## Show this help
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
 	@echo ""
 	@echo "Env: RUST_LOG=$(RUST_LOG)  BASE_URL=$(BASE_URL)"
-	@echo "     API keys via .env — IDFM_PRIM_API_KEY, DATASETS_API_KEY (see .env.example)"
+	@echo "     API keys via .env — PRIM marketplace: IDFM_PRIM_API_KEY (apikey), DATASETS_API_KEY (X-API-KEY; same key value OK)"
 
 # ─── Setup ───────────────────────────────────────────────────────────────────
 
@@ -54,9 +54,9 @@ env: ## Create .env from .env.example if missing
 		cp $(ROOT)/.env.example $(ROOT)/.env && chmod 600 $(ROOT)/.env && echo "created .env"; \
 	else \
 		printf '%s\n' \
-			'# PRIM SIRI Lite apikey (IDFM marketplace)' \
+			'# PRIM marketplace — realtime apikey header' \
 			'IDFM_PRIM_API_KEY=' \
-			'# data.gouv.fr GTFS downloads (X-API-KEY); set one alias' \
+			'# Same PRIM key for GTFS downloads (X-API-KEY); set one alias' \
 			'DATASETS_API_KEY=' \
 			'DATAGOUV_API_KEY=' \
 			'RUST_LOG=info,transit=info' \

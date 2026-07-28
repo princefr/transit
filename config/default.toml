@@ -116,8 +116,9 @@ priority = 50
 # Keep trips active in the next 14 days only (memory guard for huge stop_times)
 static_horizon_days = 14
 
-# Dataset downloads (data.gouv.fr): set DATASETS_API_KEY in .env if a portal requires it.
-# Example feed auth for portals that expect X-API-KEY:
+# GTFS zip downloads: DATASETS_API_KEY / DATAGOUV_API_KEY in .env (PRIM marketplace key,
+# X-API-KEY header — same key value as IDFM_PRIM_API_KEY). Optional for public data.gouv URLs.
+# Example [[feeds]] auth when the static_url host expects X-API-KEY:
 #   auth_header = "X-API-KEY"
 #   auth_env = "DATASETS_API_KEY"
 

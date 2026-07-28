@@ -10,7 +10,7 @@
 #   BUILD_LINES=1    rebuild lignes.geojson when inputs present
 #   TRACES_GEOJSON   path to IDFM traces for BUILD_LINES
 #   SKIP_LINES=1     never build lines
-#   DATASETS_API_KEY / DATAGOUV_API_KEY  optional download auth
+#   DATASETS_API_KEY / DATAGOUV_API_KEY  optional X-API-KEY (PRIM marketplace key; same value as IDFM_PRIM_API_KEY)
 #
 # Cron 03:30 Europe/Paris: ./scripts/install_cron.sh
 # systemd: scripts/transit.timer + transit-daily-sync.service

@@ -60,8 +60,8 @@ See also [`docs/IDFM_DAILY.md`](docs/IDFM_DAILY.md), [`docs/REDIS_CACHE.md`](doc
 | **Rust** 1.75+ | `rustup` recommended |
 | **RAM** 8–16 GB+ | IDFM + SNCF together is memory-heavy |
 | **Disk** ~2 GB+ | GTFS zips cached under `./data/` |
-| **`IDFM_PRIM_API_KEY`** | Required for IDFM realtime SIRI Lite ([PRIM marketplace](https://prim.iledefrance-mobilites.fr/)) |
-| **`DATASETS_API_KEY`** or **`DATAGOUV_API_KEY`** | Required when [data.gouv.fr](https://www.data.gouv.fr/) / dataset portals expect `X-API-KEY` for GTFS downloads (`make sync-idfm`, `daily_sync.sh`); set one alias, not both |
+| **`IDFM_PRIM_API_KEY`** | PRIM marketplace key for IDFM realtime SIRI Lite ([prim.iledefrance-mobilites.fr](https://prim.iledefrance-mobilites.fr/)); `apikey` header |
+| **`DATASETS_API_KEY`** or **`DATAGOUV_API_KEY`** | Same PRIM marketplace key for GTFS zip downloads (`make sync-idfm`, `daily_sync.sh`); `X-API-KEY` header — not a separate [data.gouv.fr](https://www.data.gouv.fr/) account key; set one alias, not both |
 | **Redis** (optional) | Response cache for search / vehicles / itineraries |
 | **OSRM** (optional) | Street-level walk geometry; public demo URL in config |
 
@@ -81,19 +81,20 @@ make setup          # wasm target, scripts, .env from .env.example
 Edit `.env` and set API keys (see [`.env.example`](.env.example)):
 
 ```bash
-# PRIM SIRI Lite — live IDFM delays, vehicles, alerts
+# PRIM marketplace key — realtime SIRI Lite (apikey header)
 IDFM_PRIM_API_KEY=your_prim_api_key_here
 
-# data.gouv.fr / transport.data.gouv.fr GTFS downloads (X-API-KEY header)
-# Use DATASETS_API_KEY or DATAGOUV_API_KEY (aliases; first wins in scripts)
-DATASETS_API_KEY=your_datasets_api_key_here
+# Same PRIM key value for GTFS downloads (X-API-KEY header); aliases — first wins in scripts
+DATASETS_API_KEY=your_prim_api_key_here
 ```
 
-| Variable | Used for | Where to get it |
-|----------|----------|-----------------|
-| `IDFM_PRIM_API_KEY` | PRIM SIRI Lite + optional GTFS-RT (`apikey` header) | [prim.iledefrance-mobilites.fr](https://prim.iledefrance-mobilites.fr/) marketplace |
-| `DATASETS_API_KEY` | GTFS zip fetch via `make sync-idfm` / `scripts/daily_sync.sh` | [data.gouv.fr](https://www.data.gouv.fr/) account → API key (if portal requires auth) |
-| `DATAGOUV_API_KEY` | Same as `DATASETS_API_KEY` (alternate name) | Same |
+PRIM issues marketplace API keys used for both realtime and dataset access. This repo uses two env vars because callers send different headers (`apikey` vs `X-API-KEY`); **you can paste the same key into both**.
+
+| Variable | Used for | Header | Where to get it |
+|----------|----------|--------|-----------------|
+| `IDFM_PRIM_API_KEY` | PRIM SIRI Lite + optional GTFS-RT | `apikey` | [prim.iledefrance-mobilites.fr](https://prim.iledefrance-mobilites.fr/) marketplace |
+| `DATASETS_API_KEY` | GTFS zip via `make sync-idfm` / `scripts/daily_sync.sh` | `X-API-KEY` | Same PRIM key (reuse `IDFM_PRIM_API_KEY` value) |
+| `DATAGOUV_API_KEY` | Same as `DATASETS_API_KEY` (alternate env name) | `X-API-KEY` | Same |
 
 ### 2. Pre-download IDFM GTFS (recommended)
 
