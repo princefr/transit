@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::cell_bitset::CellBitSet;
 use super::calendar::ServiceCalendar;
 use super::siri_trip_map::SiriTripAliases;
 
@@ -364,9 +365,28 @@ pub struct StaticEpoch {
     /// Merged headsign pool across feeds; indices remapped when packing stop_times.
     pub headsign_pool: Vec<String>,
     pub stop_departures: Vec<Vec<(u32, u32)>>,
+    /// Per-stop flag: at least one departure belongs to a frequency-based trip.
+    /// RAPTOR disables sorted-list early exit on those stops (template times
+    /// are not comparable to wall-clock board times).
+    pub stop_has_freq: Vec<bool>,
     pub walk_edges: Vec<WalkEdge>,
     /// Adjacency for walk: stop_idx -> edges
     pub walk_adj: Vec<Vec<usize>>,
+    /// Per-stop partition cell id (0..num_cells). Used by FLASH-TB arc-flags.
+    pub stop_partition: Vec<u32>,
+    /// Number of partition cells.
+    pub num_cells: u32,
+    /// Arc-flags for transfer pruning (FLASH-TB).
+    /// arc_flags[edge_idx] is a bitset over cells: bit C is set if this
+    /// transfer edge is on a shortest path to some stop in cell C.
+    pub arc_flags: Vec<CellBitSet>,
+    /// Precomputed Trip-to-Trip Transfers for FLASH-TB.
+    /// trip_transfers[T1_idx][alight_off] = Vec<TripTransferEntry>
+    pub trip_transfers: Vec<Vec<Vec<TripTransferEntry>>>,
+    /// Line ID for each trip (index into `line_trips`).
+    pub line_of_trip: Vec<u32>,
+    /// Trips per line, sorted by first departure time.
+    pub line_trips: Vec<Vec<u32>>,
     pub calendars: HashMap<String, Arc<ServiceCalendar>>,
     /// Merged namespaced shape_id → ordered polyline points as (lat, lon).
     pub shapes: HashMap<String, Vec<(f64, f64)>>,
@@ -386,6 +406,9 @@ pub struct StaticEpoch {
     pub place_name_index: HashMap<String, Vec<u32>>,
     /// Parent stop id → child stop indices (GTFS `parent_station`).
     pub children_by_parent: HashMap<String, Vec<u32>>,
+    /// Precomputed per-stop search rows for autocomplete (normalized name/id,
+    /// place kind, has-departures) — avoids re-normalizing 50k+ stops per query.
+    pub stop_search: Vec<crate::search::StopSearchEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -417,6 +440,14 @@ pub struct GlobalTrip {
     pub frequency_windows: Vec<FrequencyWindow>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TripTransferEntry {
+    pub target_trip: u32,
+    pub target_board_off: u32,
+    pub min_transfer_s: u32,
+    pub arc_flags: CellBitSet,
+}
+
 impl StaticEpoch {
     pub fn empty() -> Self {
         Self {
@@ -430,8 +461,15 @@ impl StaticEpoch {
             stop_times: Vec::new(),
             headsign_pool: vec![String::new()],
             stop_departures: Vec::new(),
+            stop_has_freq: Vec::new(),
             walk_edges: Vec::new(),
             walk_adj: Vec::new(),
+            stop_partition: Vec::new(),
+            num_cells: 0,
+            arc_flags: Vec::new(),
+            trip_transfers: Vec::new(),
+            line_of_trip: Vec::new(),
+            line_trips: Vec::new(),
             calendars: HashMap::new(),
             shapes: HashMap::new(),
             fares: Vec::new(),
@@ -442,6 +480,7 @@ impl StaticEpoch {
             geo_boardable_points: Vec::new(),
             place_name_index: HashMap::new(),
             children_by_parent: HashMap::new(),
+            stop_search: Vec::new(),
         }
     }
 
@@ -704,9 +743,439 @@ pub fn build_epoch(bundles: Vec<Arc<FeedStaticBundle>>, extra_walk: Vec<WalkEdge
         }
     }
 
+    sort_stop_departures(&mut epoch);
+    compute_line_groups(&mut epoch);
+    compute_partition(&mut epoch);
+    compute_trip_transfers(&mut epoch);
+    compute_arc_flags(&mut epoch);
+    epoch.stop_search = crate::search::build_stop_search_index(&epoch);
     build_geo_and_place_indexes(&mut epoch);
-
     epoch
+}
+
+/// Sort each stop's departure list by scheduled departure time so RAPTOR can
+/// binary-search the first boardable entry, and flag stops served by
+/// frequency-based trips (template times break the ordering invariant).
+fn sort_stop_departures(epoch: &mut StaticEpoch) {
+    epoch.stop_has_freq = vec![false; epoch.stops.len()];
+    let trips = &epoch.trips;
+    let stop_times = &epoch.stop_times;
+    let dep_of = |(trip_idx, off): &(u32, u32)| -> u32 {
+        let t = &trips[*trip_idx as usize];
+        stop_times[(t.stop_time_start + off) as usize].departure_s
+    };
+    for (stop_idx, deps) in epoch.stop_departures.iter_mut().enumerate() {
+        deps.sort_by_key(dep_of);
+        if deps
+            .iter()
+            .any(|&(t, _)| !trips[t as usize].frequency_windows.is_empty())
+        {
+            epoch.stop_has_freq[stop_idx] = true;
+        }
+    }
+}
+
+/// Compute line groups: trips sharing the same stop-index sequence belong to the same line.
+/// Within each line, trips are sorted by first departure time.
+fn compute_line_groups(epoch: &mut StaticEpoch) {
+    use std::collections::HashMap;
+
+    let mut pattern_to_line: HashMap<Vec<u32>, u32> = HashMap::new();
+    let mut line_of_trip = Vec::with_capacity(epoch.trips.len());
+    let mut line_trips: Vec<Vec<u32>> = Vec::new();
+
+    for (ti, trip) in epoch.trips.iter().enumerate() {
+        let start = trip.stop_time_start as usize;
+        let len = trip.stop_time_len as usize;
+        let pattern: Vec<u32> = (0..len)
+            .map(|off| epoch.stop_times[start + off].stop_idx)
+            .collect();
+
+        let line_id = if let Some(&lid) = pattern_to_line.get(&pattern) {
+            lid
+        } else {
+            let lid = line_trips.len() as u32;
+            pattern_to_line.insert(pattern, lid);
+            line_trips.push(Vec::new());
+            lid
+        };
+
+        line_of_trip.push(line_id);
+        line_trips[line_id as usize].push(ti as u32);
+    }
+
+    // Sort trips within each line by first departure time
+    for trips in &mut line_trips {
+        trips.sort_by_key(|&ti| {
+            let trip = &epoch.trips[ti as usize];
+            epoch.stop_times[trip.stop_time_start as usize].departure_s
+        });
+    }
+
+    epoch.line_of_trip = line_of_trip;
+    epoch.line_trips = line_trips;
+}
+
+fn compute_partition(epoch: &mut StaticEpoch) {
+    let n = epoch.stops.len();
+    if n == 0 {
+        epoch.stop_partition = Vec::new();
+        epoch.num_cells = 0;
+        return;
+    }
+
+    const TARGET_DEPTH: u32 = 8; // 2^8 = 256 cells
+    let num_cells = 1u32 << TARGET_DEPTH;
+
+    // Collect (index, lat, lon) for stops with coordinates
+    let mut coords: Vec<(usize, f64, f64)> = epoch
+        .stops
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| Some((i, s.lat?, s.lon?)))
+        .collect();
+
+    epoch.stop_partition = vec![0u32; n];
+
+    if coords.is_empty() {
+        epoch.num_cells = 1;
+        return;
+    }
+
+    // Recursive bisection
+    fn bisect(coords: &mut [(usize, f64, f64)], cell_base: u32, depth: u32, target_depth: u32, out: &mut [u32]) {
+        if depth >= target_depth || coords.len() <= 1 {
+            for &(i, _, _) in coords.iter() {
+                out[i] = cell_base;
+            }
+            return;
+        }
+        // Find longest axis
+        let (mut min_lat, mut max_lat) = (f64::INFINITY, f64::NEG_INFINITY);
+        let (mut min_lon, mut max_lon) = (f64::INFINITY, f64::NEG_INFINITY);
+        for &(_, lat, lon) in coords.iter() {
+            min_lat = min_lat.min(lat); max_lat = max_lat.max(lat);
+            min_lon = min_lon.min(lon); max_lon = max_lon.max(lon);
+        }
+        let lat_span = max_lat - min_lat;
+        let lon_span = max_lon - min_lon;
+        // Sort by longest axis and split in half
+        if lat_span >= lon_span {
+            coords.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        } else {
+            coords.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+        }
+        let mid = coords.len() / 2;
+        let (left, right) = coords.split_at_mut(mid);
+        let cells_per_half = 1u32 << (target_depth - depth - 1);
+        bisect(left, cell_base, depth + 1, target_depth, out);
+        bisect(right, cell_base + cells_per_half, depth + 1, target_depth, out);
+    }
+
+    bisect(&mut coords, 0, 0, TARGET_DEPTH, &mut epoch.stop_partition);
+    epoch.num_cells = num_cells;
+}
+
+/// Precompute trip-to-trip transfers for FLASH-TB.
+/// trip_transfers[t1][alight_off] = Vec<TripTransferEntry> listing the
+/// earliest boardable trip on each reachable line from each alight stop.
+fn compute_trip_transfers(epoch: &mut StaticEpoch) {
+    const DEFAULT_TRANSFER_S: u32 = 120;
+    
+    let n_trips = epoch.trips.len();
+    let num_cells = epoch.num_cells;
+    let mut all_transfers: Vec<Vec<Vec<TripTransferEntry>>> = Vec::with_capacity(n_trips);
+    
+    for ti in 0..n_trips {
+        let trip = &epoch.trips[ti];
+        let start = trip.stop_time_start as usize;
+        let len = trip.stop_time_len as usize;
+        let mut per_alight: Vec<Vec<TripTransferEntry>> = Vec::with_capacity(len);
+        
+        for off in 0..len {
+            let st = &epoch.stop_times[start + off];
+            if st.drop_off_type == 1 {
+                per_alight.push(Vec::new());
+                continue;
+            }
+            let alight_stop = st.stop_idx as usize;
+            let alight_arr = st.arrival_s;
+            let board_after = alight_arr.saturating_add(DEFAULT_TRANSFER_S);
+            
+            let mut entries: Vec<TripTransferEntry> = Vec::new();
+            let mut seen_lines: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            
+            // Walk to neighboring stops (including self-transfer at same stop)
+            let adj = epoch.walk_adj.get(alight_stop).cloned().unwrap_or_default();
+            
+            // Also consider the alight stop itself (same-stop transfer)
+            let target_stops: Vec<(u32, u32)> = std::iter::once((alight_stop as u32, 0u32))
+                .chain(adj.iter().map(|&ei| {
+                    let e = &epoch.walk_edges[ei];
+                    (e.to_stop_idx, e.duration_s)
+                }))
+                .collect();
+            
+            for (target_stop, walk_dur) in target_stops {
+                let effective_board = board_after.saturating_add(walk_dur);
+                let deps = match epoch.stop_departures.get(target_stop as usize) {
+                    Some(d) => d,
+                    None => continue,
+                };
+                if deps.is_empty() { continue; }
+                
+                // Binary search for first departure >= effective_board
+                let start_idx = deps.partition_point(|&(t, o)| {
+                    let tr = &epoch.trips[t as usize];
+                    epoch.stop_times[(tr.stop_time_start + o) as usize].departure_s < effective_board
+                });
+                
+                for &(trip2_idx, board_off) in &deps[start_idx..] {
+                    let line_id = epoch.line_of_trip[trip2_idx as usize];
+                    if !seen_lines.insert(line_id) {
+                        continue; // already have earliest trip on this line
+                    }
+                    // Don't transfer back to same trip
+                    if trip2_idx as usize == ti {
+                        continue;
+                    }
+                    entries.push(TripTransferEntry {
+                        target_trip: trip2_idx,
+                        target_board_off: board_off,
+                        min_transfer_s: walk_dur.saturating_add(DEFAULT_TRANSFER_S),
+                        arc_flags: CellBitSet::new(num_cells),
+                    });
+                }
+            }
+            per_alight.push(entries);
+        }
+        all_transfers.push(per_alight);
+    }
+    
+    epoch.trip_transfers = all_transfers;
+}
+
+fn compute_arc_flags(epoch: &mut StaticEpoch) {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    let n_edges = epoch.walk_edges.len();
+    let num_cells = epoch.num_cells;
+    let n_stops = epoch.stops.len();
+    if num_cells == 0 || n_edges == 0 || n_stops == 0 {
+        epoch.arc_flags = Vec::new();
+        return;
+    }
+
+    epoch.arc_flags = (0..n_edges).map(|_| CellBitSet::new(num_cells)).collect();
+
+    // Build reverse adjacency graph
+    let mut rev_graph: Vec<Vec<(u32, u32)>> = vec![Vec::new(); n_stops];
+
+    for e in &epoch.walk_edges {
+        let u = e.from_stop_idx as usize;
+        let v = e.to_stop_idx as usize;
+        if u < n_stops && v < n_stops {
+            rev_graph[v].push((u as u32, e.duration_s));
+        }
+    }
+
+    for trip in &epoch.trips {
+        let start = trip.stop_time_start as usize;
+        let len = trip.stop_time_len as usize;
+        for i in 0..len.saturating_sub(1) {
+            let st_u = &epoch.stop_times[start + i];
+            let st_v = &epoch.stop_times[start + i + 1];
+            let u = st_u.stop_idx as usize;
+            let v = st_v.stop_idx as usize;
+            if u < n_stops && v < n_stops {
+                let w = st_v.departure_s.saturating_sub(st_u.departure_s).max(1);
+                rev_graph[v].push((u as u32, w));
+            }
+        }
+    }
+
+    // For each cell C, run backward Dijkstra from all stops in C
+    for cell in 0..num_cells {
+        let mut dist: Vec<u32> = vec![u32::MAX; n_stops];
+        let mut heap: BinaryHeap<(Reverse<u32>, u32)> = BinaryHeap::new();
+
+        for (si, &c) in epoch.stop_partition.iter().enumerate() {
+            if c == cell && si < n_stops {
+                dist[si] = 0;
+                heap.push((Reverse(0), si as u32));
+            }
+        }
+
+        while let Some((Reverse(d_b), b)) = heap.pop() {
+            if d_b > dist[b as usize] {
+                continue;
+            }
+            for &(a, w) in &rev_graph[b as usize] {
+                let new_d = d_b.saturating_add(w);
+                if new_d < dist[a as usize] {
+                    dist[a as usize] = new_d;
+                    heap.push((Reverse(new_d), a));
+                }
+            }
+        }
+
+        // Set arc-flags on walk edges
+        for (ei, e) in epoch.walk_edges.iter().enumerate() {
+            let a = e.from_stop_idx as usize;
+            let b = e.to_stop_idx as usize;
+            if a < n_stops && b < n_stops {
+                let cell_a = epoch.stop_partition[a];
+                let cell_b = epoch.stop_partition[b];
+                let cell_u32 = cell;
+                let d_b = dist[b];
+                if d_b != u32::MAX {
+                    if !(cell_a == cell_b && cell_u32 == cell_a) {
+                        epoch.arc_flags[ei].set_bit(cell as usize);
+                    }
+                }
+            }
+        }
+
+        // Set arc-flags on trip transfers
+        for t1 in 0..epoch.trip_transfers.len() {
+            for alight_off in 0..epoch.trip_transfers[t1].len() {
+                for entry in &mut epoch.trip_transfers[t1][alight_off] {
+                    let target_trip = &epoch.trips[entry.target_trip as usize];
+                    let board_st = &epoch.stop_times[(target_trip.stop_time_start + entry.target_board_off) as usize];
+                    let target_stop = board_st.stop_idx as usize;
+                    if target_stop < n_stops && dist[target_stop] != u32::MAX {
+                        entry.arc_flags.set_bit(cell as usize);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arc_flags_basic() {
+        // Three stops in a line: A --(10s)--> B --(10s)--> C
+        // With recursive bisection (median split by lat):
+        //   A(48.0) goes to left half, B(48.001)+C(48.010) go to right half
+        //   So cell_a != cell_b == cell_c
+        let mut epoch = StaticEpoch::empty();
+        epoch.stops = vec![
+            StopRecord {
+                id: "A".into(),
+                feed_id: "t".into(),
+                raw_id: "A".into(),
+                name: "A".into(),
+                lat: Some(48.0),
+                lon: Some(2.0),
+                parent_id: None,
+                location_type: 0,
+                platform_code: None,
+                wheelchair: 0,
+                stop_code: None,
+                stop_desc: None,
+                level_id: None,
+                zone_id: None,
+                stop_url: None,
+                stop_timezone: None,
+            },
+            StopRecord {
+                id: "B".into(),
+                feed_id: "t".into(),
+                raw_id: "B".into(),
+                name: "B".into(),
+                lat: Some(48.001),
+                lon: Some(2.0),
+                parent_id: None,
+                location_type: 0,
+                platform_code: None,
+                wheelchair: 0,
+                stop_code: None,
+                stop_desc: None,
+                level_id: None,
+                zone_id: None,
+                stop_url: None,
+                stop_timezone: None,
+            },
+            StopRecord {
+                id: "C".into(),
+                feed_id: "t".into(),
+                raw_id: "C".into(),
+                name: "C".into(),
+                lat: Some(48.010),
+                lon: Some(2.0),
+                parent_id: None,
+                location_type: 0,
+                platform_code: None,
+                wheelchair: 0,
+                stop_code: None,
+                stop_desc: None,
+                level_id: None,
+                zone_id: None,
+                stop_url: None,
+                stop_timezone: None,
+            },
+        ];
+        epoch.walk_edges = vec![
+            WalkEdge {
+                from_stop_idx: 0,
+                to_stop_idx: 1,
+                duration_s: 10,
+                distance_m: 100.0,
+                pathway_mode: None,
+            },
+            WalkEdge {
+                from_stop_idx: 1,
+                to_stop_idx: 2,
+                duration_s: 10,
+                distance_m: 100.0,
+                pathway_mode: None,
+            },
+            WalkEdge {
+                from_stop_idx: 1,
+                to_stop_idx: 0,
+                duration_s: 10,
+                distance_m: 100.0,
+                pathway_mode: None,
+            },
+            WalkEdge {
+                from_stop_idx: 2,
+                to_stop_idx: 1,
+                duration_s: 10,
+                distance_m: 100.0,
+                pathway_mode: None,
+            },
+        ];
+        epoch.walk_adj = vec![Vec::new(); 3];
+        for (i, e) in epoch.walk_edges.iter().enumerate() {
+            epoch.walk_adj[e.from_stop_idx as usize].push(i);
+        }
+
+        compute_partition(&mut epoch);
+        compute_arc_flags(&mut epoch);
+
+        let cell_a = epoch.stop_partition[0] as usize;
+        let cell_b = epoch.stop_partition[1] as usize;
+        let cell_c = epoch.stop_partition[2] as usize;
+
+        // All three stops may be in distinct cells with recursive bisection.
+        // Edge 0: A→B — targets B, which leads to C. Should flag cell_b and cell_c.
+        assert!(epoch.arc_flags[0].get_bit(cell_c), "A→B should flag cell of C (reachable via B→C)");
+        // Edge 1: B→C — targets C. Should flag cell_c (unless same cell as B).
+        if cell_b != cell_c {
+            assert!(epoch.arc_flags[1].get_bit(cell_c), "B→C should flag cell of C");
+        }
+        // Edge 2: B→A — targets A. Should flag cell_a (unless same cell as B).
+        if cell_a != cell_b {
+            assert!(epoch.arc_flags[2].get_bit(cell_a), "B→A should flag cell of A");
+        }
+        // Edge 3: C→B — targets B, which leads to A. Should flag cell_a.
+        assert!(epoch.arc_flags[3].get_bit(cell_a), "C→B should flag cell of A (reachable via B→A)");
+    }
 }
 
 /// Precompute geo point lists and place/parent indexes used on every itinerary request.

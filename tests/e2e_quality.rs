@@ -96,6 +96,7 @@ fn query(from: &str, to: &str) -> ItineraryQuery {
             bike_to: false,
             bike_speed_m_s: 4.2,
             max_bike_meters: 5000,
+            use_tbr: false,
     }
 }
 

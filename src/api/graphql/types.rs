@@ -1842,6 +1842,8 @@ pub struct ItineraryInput {
     pub bike_from: Option<bool>,
     /// Last km by bike (last stop → destination).
     pub bike_to: Option<bool>,
+    /// Use Trip-Based Public Transit Routing instead of RAPTOR.
+    pub use_tbr: Option<bool>,
 }
 
 /// Build a GraphQL error with a machine-readable `code` extension.

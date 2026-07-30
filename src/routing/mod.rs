@@ -2,6 +2,7 @@ pub mod fare;
 pub mod geometry;
 pub mod journey;
 pub mod raptor;
+pub mod tbr;
 pub mod walk;
 
 pub use fare::{apply_fare_estimate, estimate_journey_fare, FareEstimate};
@@ -12,3 +13,4 @@ pub use journey::{
     TransitLegData, WalkLegData,
 };
 pub use raptor::plan_journeys;
+pub use tbr::plan_journeys_tbr;

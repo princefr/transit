@@ -238,6 +238,12 @@ impl BanIndex {
             if !p.is_empty() {
                 prefix3.entry(p).or_default().push(i as u32);
             }
+            // City prefix: pure-city queries ("paris", "boulogne") otherwise
+            // fall back to scanning every street in the index.
+            let cp = prefix_key(&s.city_norm, 3);
+            if !cp.is_empty() {
+                prefix3.entry(cp).or_default().push(i as u32);
+            }
             // also first significant token (≥3 chars)
             if let Some(tok) = s
                 .name_norm
@@ -501,6 +507,26 @@ fn street_matches(
     sig.iter().all(|t| name_norm.contains(**t) || city_norm.contains(**t))
 }
 
+/// True if `needle` occurs in `hay` at a word boundary (space-prefixed).
+/// Allocation-free replacement for `hay.contains(&format!(" {needle}"))`.
+fn contains_word(hay: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let mut from = 0usize;
+    while let Some(pos) = hay[from..].find(needle) {
+        let idx = from + pos;
+        if idx > 0 && hay.as_bytes()[idx - 1] == b' ' {
+            return true;
+        }
+        from = idx + needle.len();
+        if from >= hay.len() {
+            break;
+        }
+    }
+    false
+}
+
 fn street_score(street: &StreetRec, q: &str, tokens: &[&str]) -> f32 {
     if q.is_empty() {
         return 1.0;
@@ -517,7 +543,7 @@ fn street_score(street: &StreetRec, q: &str, tokens: &[&str]) -> f32 {
         if t.len() < 2 || is_street_type_token(t) {
             continue;
         }
-        if street.name_norm.starts_with(t) || street.name_norm.contains(&format!(" {t}")) {
+        if street.name_norm.starts_with(t) || contains_word(&street.name_norm, t) {
             score += 15.0;
         } else if street.name_norm.contains(t) {
             score += 8.0;

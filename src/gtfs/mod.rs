@@ -1,7 +1,10 @@
 pub mod calendar;
+pub mod cell_bitset;
 pub mod pack;
 pub mod parse;
 pub mod siri_trip_map;
+
+pub use cell_bitset::CellBitSet;
 
 pub use pack::{
     build_epoch, pathway_mode_name, AgencyRecord, FareAttribute, FareRule, FeedStaticBundle,

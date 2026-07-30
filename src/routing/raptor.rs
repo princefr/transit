@@ -20,15 +20,15 @@ use std::collections::{HashMap, HashSet};
 
 use super::journey::{
     local_midnight_utc, local_seconds_since_midnight, new_journey_id, service_date_in_tz, stop_ref,
-    IntermediateStop, ItineraryQuery, ItineraryResult, Journey, Leg, Place, TransitLegData,
-    WalkLegData,
+    IntermediateStop, ItineraryQuery, ItineraryResult, Journey, Leg, Place, RtTripAdjust,
+    TransitLegData, WalkLegData,
 };
 use super::walk::AccessStop;
 use crate::gtfs::pack::{RouteMode, StaticEpoch};
 
 /// How a stop was reached in a given round.
 #[derive(Clone, Debug)]
-enum Reach {
+pub(super) enum Reach {
     /// Seeded by access walk from the query origin.
     Access {
         stop_idx: u32,
@@ -72,26 +72,128 @@ impl Reach {
     }
 }
 
-struct RaptorState {
-    /// labels[round][stop] = how we reached stop in that round (None if not improved that round).
+/// Per-query reusable scratch space shared across all `run_raptor` calls
+/// (k-best iterations + arrive-by seeds). Avoids re-allocating the full label
+/// matrix / best array per run and precomputes per-trip calendar activity and
+/// RT adjustments so the boarding inner loop is allocation-free.
+struct RaptorScratch<'a> {
+    best: Vec<u32>,
+    /// labels[round][stop] = how we reached stop in that round.
     labels: Vec<Vec<Option<Reach>>>,
+    /// Stops written since last reset — only these are cleared between runs.
+    touched: Vec<u32>,
+    boarded_gen: Vec<u32>,
+    boarded_data: Vec<(u32, u32, u32, i32)>,
+    /// Trips boarded during the current round; phase 2 scans only these
+    /// instead of the full trip list.
+    boarded_list: Vec<u32>,
+    /// Per-trip calendar activity for the query service date.
+    active: Vec<bool>,
+    /// Per-trip RT adjustment, resolved via `trip_id_to_idx` once per query.
+    rt: Vec<Option<&'a RtTripAdjust>>,
+    /// Max absolute RT delay (s); widens binary-search bounds when nonzero.
+    rt_margin_s: u32,
+    rounds: usize,
+    stamp: u32,
+}
+
+impl<'a> RaptorScratch<'a> {
+    fn new(epoch: &StaticEpoch, q: &'a ItineraryQuery, date: NaiveDate) -> Self {
+        let n = epoch.stops.len();
+        let trip_n = epoch.trips.len();
+
+        // Calendar activity per trip: memo on borrowed keys (no String allocs).
+        let mut cal_memo: HashMap<(&str, &str), bool> = HashMap::new();
+        let mut active = Vec::with_capacity(trip_n);
+        for trip in &epoch.trips {
+            let key = (trip.feed_id.as_str(), trip.service_id.as_str());
+            let a = *cal_memo.entry(key).or_insert_with(|| {
+                epoch
+                    .calendars
+                    .get(&trip.feed_id)
+                    .map(|cal| cal.is_active(&trip.service_id, date))
+                    .unwrap_or(true)
+            });
+            active.push(a);
+        }
+
+        let mut rt: Vec<Option<&RtTripAdjust>> = vec![None; trip_n];
+        let mut margin = 0u32;
+        for (id, adj) in &q.rt_adjust {
+            if let Some(&idx) = epoch.trip_id_to_idx.get(id) {
+                rt[idx as usize] = Some(adj);
+            }
+            let mut m = adj.trip_delay_s.unsigned_abs();
+            for &d in adj.dep_delay.values().chain(adj.arr_delay.values()) {
+                m = m.max(d.unsigned_abs());
+            }
+            margin = margin.max(m);
+        }
+        // Cap the binary-search widening.
+        let margin = margin.min(6 * 3600);
+
+        let rounds = raptor_max_rounds(q);
+        Self {
+            best: vec![u32::MAX; n],
+            labels: vec![vec![None; n]; rounds + 1],
+            touched: Vec::new(),
+            boarded_gen: vec![0; trip_n],
+            boarded_data: vec![(0, 0, 0, 0); trip_n],
+            boarded_list: Vec::new(),
+            active,
+            rt,
+            rt_margin_s: margin,
+            rounds,
+            stamp: 0,
+        }
+    }
+
+    /// Reset only stops written by the previous run.
+    fn reset(&mut self) {
+        for si in self.touched.drain(..) {
+            self.best[si as usize] = u32::MAX;
+            for row in self.labels.iter_mut() {
+                row[si as usize] = None;
+            }
+        }
+    }
+
+    /// Record an improvement at `si` for `round` (writes labels[round + 1]).
+    #[inline]
+    fn improve(&mut self, round: usize, si: u32, arr: u32, reach: Reach) {
+        if self.best[si as usize] == u32::MAX {
+            self.touched.push(si);
+        }
+        self.best[si as usize] = arr;
+        self.labels[round + 1][si as usize] = Some(reach);
+    }
+}
+
+fn raptor_max_rounds(q: &ItineraryQuery) -> usize {
+    // Need enough rounds for transit→walk→transit (RER then Métro). Do not starve
+    // multi-mode by min(max_transfers+1) when max_transfers is low.
+    (q.raptor_max_rounds
+        .max(q.max_transfers.saturating_add(2))
+        .max(4) as usize)
+        .min(12)
+        .max(1)
 }
 
 
 /// Cap virtual frequency departures considered per window per board opportunity.
-const MAX_FREQ_DEPS_PER_WINDOW: u32 = 32;
+pub(super) const MAX_FREQ_DEPS_PER_WINDOW: u32 = 32;
 
 /// Maximum journey duration considered when searching arrive-by (look-back window).
-const ARRIVE_BY_MAX_JOURNEY_S: u32 = 6 * 3600;
+pub(super) const ARRIVE_BY_MAX_JOURNEY_S: u32 = 6 * 3600;
 
 /// Coarse sample step when probing departures for arrive-by (seconds).
-const ARRIVE_BY_SAMPLE_STEP_S: u32 = 15 * 60;
+pub(super) const ARRIVE_BY_SAMPLE_STEP_S: u32 = 15 * 60;
 
 /// Extra candidates collected before Pareto / truncate (multiples of max_results).
-const CANDIDATE_POOL_FACTOR: usize = 3;
+pub(super) const CANDIDATE_POOL_FACTOR: usize = 3;
 
 /// Template base time for a trip: first stop_time departure (relative anchor for frequencies).
-fn trip_template_base(epoch: &StaticEpoch, trip: &crate::gtfs::pack::GlobalTrip) -> u32 {
+pub(super) fn trip_template_base(epoch: &StaticEpoch, trip: &crate::gtfs::pack::GlobalTrip) -> u32 {
     if trip.stop_time_len == 0 {
         return 0;
     }
@@ -100,7 +202,7 @@ fn trip_template_base(epoch: &StaticEpoch, trip: &crate::gtfs::pack::GlobalTrip)
 
 /// Earliest frequency-based board departure at a stop offset, if any.
 /// Returns (board_dep_s, time_shift_s) where absolute times = template + time_shift.
-fn earliest_freq_board(
+pub(super) fn earliest_freq_board(
     trip: &crate::gtfs::pack::GlobalTrip,
     template_base: u32,
     board_template_dep: u32,
@@ -163,6 +265,9 @@ fn earliest_freq_board(
 /// `[deadline − 6h, deadline)`, keep journeys with `arrival ≤ deadline`, prefer **later
 /// departures**, then McRAPTOR-lite Pareto on `(arrival, transfers, walk_distance)`.
 pub fn plan_journeys(epoch: &StaticEpoch, q: &ItineraryQuery) -> ItineraryResult {
+    if q.use_tbr {
+        return super::tbr::plan_journeys_tbr(epoch, q);
+    }
     let date = service_date_in_tz(q.departure_at, &q.timezone);
     let dep_s0 = local_seconds_since_midnight(q.departure_at, &q.timezone);
     let midnight = local_midnight_utc(date, &q.timezone);
@@ -230,11 +335,12 @@ pub fn plan_journeys(epoch: &StaticEpoch, q: &ItineraryQuery) -> ItineraryResult
         (max_k * CANDIDATE_POOL_FACTOR).max(max_k)
     };
 
+    let mut scratch = RaptorScratch::new(epoch, q, date);
+
     let mut journeys = if q.arrive_by {
         plan_arrive_by(
             epoch,
             q,
-            date,
             dep_s0,
             midnight,
             &origins,
@@ -242,12 +348,12 @@ pub fn plan_journeys(epoch: &StaticEpoch, q: &ItineraryQuery) -> ItineraryResult
             &egress,
             &origin_map,
             pool_cap,
+            &mut scratch,
         )
     } else {
         plan_depart_after(
             epoch,
             q,
-            date,
             dep_s0,
             midnight,
             &origins,
@@ -256,6 +362,7 @@ pub fn plan_journeys(epoch: &StaticEpoch, q: &ItineraryQuery) -> ItineraryResult
             &origin_map,
             pool_cap,
             None, // no arrival deadline
+            &mut scratch,
         )
     };
 
@@ -328,7 +435,6 @@ pub fn plan_journeys(epoch: &StaticEpoch, q: &ItineraryQuery) -> ItineraryResult
 fn plan_depart_after(
     epoch: &StaticEpoch,
     q: &ItineraryQuery,
-    date: NaiveDate,
     dep_s0: u32,
     midnight: DateTime<Utc>,
     origins: &[AccessStop],
@@ -337,6 +443,7 @@ fn plan_depart_after(
     origin_map: &HashMap<u32, AccessStop>,
     pool_cap: usize,
     arrive_deadline_s: Option<u32>,
+    scratch: &mut RaptorScratch,
 ) -> Vec<Journey> {
     let mut journeys = Vec::new();
 
@@ -362,8 +469,8 @@ fn plan_depart_after(
             }
         }
 
-        let Some((state, target_idx, total_arr)) =
-            run_raptor(epoch, q, date, dep_s, origins, egress)
+        let Some((total_arr, target_idx)) =
+            run_raptor(epoch, q, dep_s, origins, egress, scratch)
         else {
             break;
         };
@@ -378,7 +485,7 @@ fn plan_depart_after(
 
         let Some(mut journey) = reconstruct(
             epoch,
-            &state,
+            &scratch.labels,
             target_idx,
             &egress[&target_idx],
             total_arr,
@@ -456,7 +563,6 @@ fn plan_depart_after(
 fn plan_arrive_by(
     epoch: &StaticEpoch,
     q: &ItineraryQuery,
-    date: NaiveDate,
     deadline_s: u32,
     midnight: DateTime<Utc>,
     origins: &[AccessStop],
@@ -464,6 +570,7 @@ fn plan_arrive_by(
     egress: &HashMap<u32, AccessStop>,
     origin_map: &HashMap<u32, AccessStop>,
     pool_cap: usize,
+    scratch: &mut RaptorScratch,
 ) -> Vec<Journey> {
     let earliest = deadline_s.saturating_sub(ARRIVE_BY_MAX_JOURNEY_S);
     let mut journeys: Vec<Journey> = Vec::new();
@@ -513,7 +620,6 @@ fn plan_arrive_by(
         let batch = plan_depart_after(
             epoch,
             q,
-            date,
             seed,
             midnight,
             origins,
@@ -522,6 +628,7 @@ fn plan_arrive_by(
             origin_map,
             per_sample,
             Some(deadline_s),
+            scratch,
         );
         for j in batch {
             let key = (
@@ -551,7 +658,7 @@ fn plan_arrive_by(
 }
 
 /// Local seconds-since-midnight of journey arrival (clamped for same service day).
-fn journey_arrival_s(j: &Journey, midnight: DateTime<Utc>) -> u32 {
+pub(super) fn journey_arrival_s(j: &Journey, midnight: DateTime<Utc>) -> u32 {
     let secs = (j.arrival - midnight).num_seconds();
     if secs < 0 {
         0
@@ -565,7 +672,7 @@ fn journey_arrival_s(j: &Journey, midnight: DateTime<Utc>) -> u32 {
 /// arrival is not dropped as “dominated junk” by an earlier service (k-best diversity).
 ///
 /// Journey A dominates B if A is ≤/≥ on all criteria and strictly better on at least one.
-fn pareto_front(journeys: Vec<Journey>) -> Vec<Journey> {
+pub(super) fn pareto_front(journeys: Vec<Journey>) -> Vec<Journey> {
     if journeys.len() <= 1 {
         return journeys;
     }
@@ -596,14 +703,14 @@ fn dominates(a: &Journey, b: &Journey) -> bool {
     arr_le && tr_le && walk_le && dep_ge && strict
 }
 
-fn journey_first_departure(j: &Journey) -> Option<DateTime<Utc>> {
+pub(super) fn journey_first_departure(j: &Journey) -> Option<DateTime<Utc>> {
     match j.legs.first()? {
         Leg::Walk(_) => Some(j.departure),
         Leg::Transit(t) => Some(t.scheduled_departure),
     }
 }
 
-fn next_departure_s(journey: &Journey, midnight: DateTime<Utc>, current_dep_s: u32) -> Option<u32> {
+pub(super) fn next_departure_s(journey: &Journey, midnight: DateTime<Utc>, current_dep_s: u32) -> Option<u32> {
     // After the first transit departure (+1s), search again for a later option.
     for leg in &journey.legs {
         if let Leg::Transit(t) = leg {
@@ -618,7 +725,7 @@ fn next_departure_s(journey: &Journey, midnight: DateTime<Utc>, current_dep_s: u
     None
 }
 
-fn pure_walk_journey(
+pub(super) fn pure_walk_journey(
     epoch: &StaticEpoch,
     q: &ItineraryQuery,
     origins: &[AccessStop],
@@ -804,27 +911,23 @@ fn pure_walk_journey(
 }
 
 /// Scheduled departure + GTFS-RT delay (seconds since midnight).
-fn rt_effective_dep_s(
-    q: &ItineraryQuery,
-    trip_id: &str,
+pub(super) fn rt_effective_dep_s(
+    adj: Option<&RtTripAdjust>,
     st: &crate::gtfs::pack::PackedStopTime,
 ) -> u32 {
-    let delay = q
-        .rt_adjust
-        .get(trip_id)
+    let delay = adj
         .map(|a| a.dep_delay_for(st.stop_sequence))
         .unwrap_or(0);
     (st.departure_s as i64 + delay as i64).max(0) as u32
 }
 
 /// Alight time: prefer stop-level RT arrival delay, else propagate board `time_shift`.
-fn rt_effective_arr_s(
-    q: &ItineraryQuery,
-    trip_id: &str,
+pub(super) fn rt_effective_arr_s(
+    adj: Option<&RtTripAdjust>,
     st: &crate::gtfs::pack::PackedStopTime,
     time_shift: i32,
 ) -> u32 {
-    if let Some(a) = q.rt_adjust.get(trip_id) {
+    if let Some(a) = adj {
         if a.arr_delay.contains_key(&st.stop_sequence)
             || a.dep_delay.contains_key(&st.stop_sequence)
         {
@@ -835,27 +938,27 @@ fn rt_effective_arr_s(
     (st.arrival_s as i64 + time_shift as i64).max(0) as u32
 }
 
-/// Stop-based transit stage.
+/// Stop-based transit stage. Boards from marked stops (binary-searching the
+/// departure-sorted `stop_departures` lists) then scans only the trips that
+/// were actually boarded this round.
 fn raptor_transit_stop_based(
     epoch: &StaticEpoch,
     q: &ItineraryQuery,
     round: usize,
     round_stamp: u32,
-    date: NaiveDate,
     marked: &HashSet<u32>,
-    best: &mut [u32],
     best_dest: &mut u32,
-    labels: &mut [Vec<Option<Reach>>],
     next_marked: &mut HashSet<u32>,
     egress: &HashMap<u32, AccessStop>,
-    cal_active: &mut HashMap<(String, String, NaiveDate), bool>,
-    boarded_gen: &mut [u32],
-    boarded_data: &mut [(u32, u32, u32, i32)],
+    s: &mut RaptorScratch,
     mode_ok: &impl Fn(RouteMode) -> bool,
     trip_ok: &impl Fn(&crate::gtfs::pack::GlobalTrip) -> bool,
 ) {
+    s.boarded_list.clear();
+    let margin = s.rt_margin_s;
+
     for &stop_idx in marked {
-        let arrival_here = best[stop_idx as usize];
+        let arrival_here = s.best[stop_idx as usize];
         if arrival_here == u32::MAX {
             continue;
         }
@@ -868,52 +971,69 @@ fn raptor_transit_stop_based(
             continue;
         }
 
-        for &(trip_idx, st_off) in epoch
+        let deps = epoch
             .stop_departures
             .get(stop_idx as usize)
             .map(|v| v.as_slice())
-            .unwrap_or(&[])
-        {
-            let trip = &epoch.trips[trip_idx as usize];
+            .unwrap_or(&[]);
+        if deps.is_empty() {
+            continue;
+        }
+        // Frequency trips use template times that break the sorted-by-wall-clock
+        // invariant; on those stops scan everything without early exit.
+        let has_freq = epoch
+            .stop_has_freq
+            .get(stop_idx as usize)
+            .copied()
+            .unwrap_or_else(|| {
+                deps.iter()
+                    .any(|&(t, _)| !epoch.trips[t as usize].frequency_windows.is_empty())
+            });
+
+        // First entry whose scheduled departure could still board after
+        // `board_after` (RT delays shift effective times by at most `margin`).
+        let start = if has_freq {
+            0
+        } else {
+            let min_dep = board_after.saturating_sub(margin);
+            deps.partition_point(|&(t, off)| {
+                let trip = &epoch.trips[t as usize];
+                epoch.stop_times[(trip.stop_time_start + off) as usize].departure_s < min_dep
+            })
+        };
+
+        for &(trip_idx, st_off) in &deps[start..] {
+            let ti = trip_idx as usize;
+            let trip = &epoch.trips[ti];
+            let st_board = &epoch.stop_times[(trip.stop_time_start + st_off) as usize];
+            // Sorted by scheduled departure: beyond this every effective
+            // departure is >= best_dest even with RT shifts.
+            if !has_freq && st_board.departure_s >= best_dest.saturating_add(margin) {
+                break;
+            }
             if !mode_ok(trip.mode) || !trip_ok(trip) {
                 continue;
             }
-            let cal_key = (
-                trip.feed_id.clone(),
-                trip.service_id.clone(),
-                date,
-            );
-            let active = *cal_active.entry(cal_key).or_insert_with(|| {
-                epoch
-                    .calendars
-                    .get(&trip.feed_id)
-                    .map(|cal| cal.is_active(&trip.service_id, date))
-                    .unwrap_or(true)
-            });
-            if !active {
+            if !s.active[ti] {
                 continue;
             }
-
-            let st_board = &epoch.stop_times[(trip.stop_time_start + st_off) as usize];
             if st_board.pickup_type == 1 {
                 continue;
             }
-            if q.rt_adjust
-                .get(&trip.id)
-                .is_some_and(|a| a.is_skipped(st_board.stop_sequence))
-            {
+            let adj = s.rt[ti];
+            if adj.is_some_and(|a| a.is_skipped(st_board.stop_sequence)) {
                 continue;
             }
 
             let (board_dep, time_shift) = if !trip.frequency_windows.is_empty() {
                 let base = trip_template_base(epoch, trip);
-                let sched_dep = rt_effective_dep_s(q, &trip.id, st_board);
+                let sched_dep = rt_effective_dep_s(adj, st_board);
                 match earliest_freq_board(trip, base, sched_dep, board_after) {
                     Some(v) => v,
                     None => continue,
                 }
             } else {
-                let dep_rt = rt_effective_dep_s(q, &trip.id, st_board);
+                let dep_rt = rt_effective_dep_s(adj, st_board);
                 if dep_rt < board_after {
                     continue;
                 }
@@ -924,54 +1044,57 @@ fn raptor_transit_stop_based(
                 continue;
             }
 
-            let ti = trip_idx as usize;
-            if boarded_gen[ti] != round_stamp {
-                boarded_gen[ti] = round_stamp;
-                boarded_data[ti] = (stop_idx, st_off, board_dep, time_shift);
+            if s.boarded_gen[ti] != round_stamp {
+                s.boarded_gen[ti] = round_stamp;
+                s.boarded_data[ti] = (stop_idx, st_off, board_dep, time_shift);
+                s.boarded_list.push(trip_idx);
             } else {
-                let (_, prev_off, prev_dep, _) = boarded_data[ti];
+                let (_, prev_off, prev_dep, _) = s.boarded_data[ti];
                 if board_dep < prev_dep || (board_dep == prev_dep && st_off < prev_off) {
-                    boarded_data[ti] = (stop_idx, st_off, board_dep, time_shift);
+                    s.boarded_data[ti] = (stop_idx, st_off, board_dep, time_shift);
                 }
             }
         }
     }
 
-    for (trip_idx, trip) in epoch.trips.iter().enumerate() {
-        if boarded_gen[trip_idx] != round_stamp {
-            continue;
-        }
-        let (board_stop, board_off, _board_dep, time_shift) = boarded_data[trip_idx];
+    // Phase 2: scan only trips boarded this round (not the full trip list).
+    let boarded = std::mem::take(&mut s.boarded_list);
+    for &trip_idx in &boarded {
+        let ti = trip_idx as usize;
+        let trip = &epoch.trips[ti];
+        let adj = s.rt[ti];
+        let (board_stop, board_off, _board_dep, time_shift) = s.boarded_data[ti];
         for off in (board_off + 1)..trip.stop_time_len {
             let st = &epoch.stop_times[(trip.stop_time_start + off) as usize];
             if st.drop_off_type == 1 {
                 continue;
             }
-            if q.rt_adjust
-                .get(&trip.id)
-                .is_some_and(|a| a.is_skipped(st.stop_sequence))
-            {
+            if adj.is_some_and(|a| a.is_skipped(st.stop_sequence)) {
                 continue;
             }
-            let arr = rt_effective_arr_s(q, &trip.id, st, time_shift);
+            let arr = rt_effective_arr_s(adj, st, time_shift);
             if arr >= *best_dest {
                 break;
             }
-            let si = st.stop_idx as usize;
+            let si = st.stop_idx;
 
-            if arr < best[si] {
-                best[si] = arr;
-                labels[round + 1][si] = Some(Reach::Transit {
-                    arrival_s: arr,
-                    trip_idx: trip_idx as u32,
-                    board_stop,
-                    board_off,
-                    alight_off: off,
-                    prev_round: round as u16,
-                    time_shift_s: time_shift,
-                });
-                next_marked.insert(st.stop_idx);
-                if let Some(eg) = egress.get(&st.stop_idx) {
+            if arr < s.best[si as usize] {
+                s.improve(
+                    round,
+                    si,
+                    arr,
+                    Reach::Transit {
+                        arrival_s: arr,
+                        trip_idx,
+                        board_stop,
+                        board_off,
+                        alight_off: off,
+                        prev_round: round as u16,
+                        time_shift_s: time_shift,
+                    },
+                );
+                next_marked.insert(si);
+                if let Some(eg) = egress.get(&si) {
                     let total = arr.saturating_add(eg.duration_s);
                     if total < *best_dest {
                         *best_dest = total;
@@ -980,29 +1103,18 @@ fn raptor_transit_stop_based(
             }
         }
     }
+    s.boarded_list = boarded;
 }
 
 fn run_raptor(
     epoch: &StaticEpoch,
     q: &ItineraryQuery,
-    date: NaiveDate,
     dep_s: u32,
     origins: &[AccessStop],
     egress: &HashMap<u32, AccessStop>,
-) -> Option<(RaptorState, u32, u32)> {
-    let n = epoch.stops.len();
-    let trip_n = epoch.trips.len();
-    // Need enough rounds for transit→walk→transit (RER then Métro). Do not starve
-    // multi-mode by min(max_transfers+1) when max_transfers is low.
-    let max_rounds = (q
-        .raptor_max_rounds
-        .max(q.max_transfers.saturating_add(2))
-        .max(4) as usize)
-        .min(12)
-        .max(1);
-
-    let mut best = vec![u32::MAX; n];
-    let mut labels: Vec<Vec<Option<Reach>>> = vec![vec![None; n]; max_rounds + 1];
+    s: &mut RaptorScratch,
+) -> Option<(u32, u32)> {
+    s.reset();
     let mut best_dest = u32::MAX;
 
     // Round 0: access.
@@ -1010,9 +1122,12 @@ fn run_raptor(
     for o in origins {
         let arr = dep_s.saturating_add(o.duration_s);
         let si = o.stop_idx as usize;
-        if arr < best[si] {
-            best[si] = arr;
-            labels[0][si] = Some(Reach::Access {
+        if arr < s.best[si] {
+            if s.best[si] == u32::MAX {
+                s.touched.push(o.stop_idx);
+            }
+            s.best[si] = arr;
+            s.labels[0][si] = Some(Reach::Access {
                 stop_idx: o.stop_idx,
                 arrival_s: arr,
                 walk_duration: o.duration_s,
@@ -1049,18 +1164,13 @@ fn run_raptor(
         true
     };
 
-    // Per-run caches (hot on IDFM-sized epochs).
-    let mut cal_active: HashMap<(String, String, NaiveDate), bool> = HashMap::new();
-    let mut boarded_gen: Vec<u32> = vec![0; trip_n];
-    let mut boarded_data: Vec<(u32, u32, u32, i32)> = vec![(0, 0, 0, 0); trip_n];
-    let mut round_stamp: u32 = 0;
-
-    for round in 0..max_rounds {
+    for round in 0..s.rounds {
         if marked.is_empty() {
             break;
         }
 
-        round_stamp = round_stamp.wrapping_add(1);
+        s.stamp = s.stamp.wrapping_add(1);
+        let round_stamp = s.stamp;
         let mut next_marked: HashSet<u32> = HashSet::new();
 
         raptor_transit_stop_based(
@@ -1068,16 +1178,11 @@ fn run_raptor(
             q,
             round,
             round_stamp,
-            date,
             &marked,
-            &mut best,
             &mut best_dest,
-            &mut labels,
             &mut next_marked,
             egress,
-            &mut cal_active,
-            &mut boarded_gen,
-            &mut boarded_data,
+            s,
             &mode_ok,
             &trip_ok,
         );
@@ -1085,7 +1190,7 @@ fn run_raptor(
         // --- Walk transfer stage from stops improved by transit this round ---
         let transit_improved: Vec<u32> = next_marked.iter().copied().collect();
         for stop_idx in transit_improved {
-            let arrival_here = best[stop_idx as usize];
+            let arrival_here = s.best[stop_idx as usize];
             for &ei in epoch
                 .walk_adj
                 .get(stop_idx as usize)
@@ -1098,19 +1203,23 @@ fn run_raptor(
                 if arr >= best_dest {
                     continue;
                 }
-                let ti = e.to_stop_idx as usize;
-                if arr < best[ti] {
-                    best[ti] = arr;
-                    labels[round + 1][ti] = Some(Reach::Walk {
-                        arrival_s: arr,
-                        from_stop: stop_idx,
-                        to_stop: e.to_stop_idx,
-                        duration_s: walk_dur,
-                        distance_m: e.distance_m,
-                        prev_round: (round + 1) as u16,
-                    });
-                    next_marked.insert(e.to_stop_idx);
-                    if let Some(eg) = egress.get(&e.to_stop_idx) {
+                let ti = e.to_stop_idx;
+                if arr < s.best[ti as usize] {
+                    s.improve(
+                        round,
+                        ti,
+                        arr,
+                        Reach::Walk {
+                            arrival_s: arr,
+                            from_stop: stop_idx,
+                            to_stop: e.to_stop_idx,
+                            duration_s: walk_dur,
+                            distance_m: e.distance_m,
+                            prev_round: (round + 1) as u16,
+                        },
+                    );
+                    next_marked.insert(ti);
+                    if let Some(eg) = egress.get(&ti) {
                         let total = arr.saturating_add(eg.duration_s);
                         if total < best_dest {
                             best_dest = total;
@@ -1124,26 +1233,24 @@ fn run_raptor(
     }
 
     // Best target
-    let mut best_target: Option<(u32, u32, u32)> = None; // total, stop_idx, arr_at_stop
+    let mut best_target: Option<(u32, u32)> = None; // total, stop_idx
     for (t_idx, eg) in egress {
-        let arr_at_stop = best[*t_idx as usize];
+        let arr_at_stop = s.best[*t_idx as usize];
         if arr_at_stop == u32::MAX {
             continue;
         }
         let total = arr_at_stop.saturating_add(eg.duration_s);
         if best_target.map(|b| total < b.0).unwrap_or(true) {
-            best_target = Some((total, *t_idx, arr_at_stop));
+            best_target = Some((total, *t_idx));
         }
     }
 
-    let (total_arr, target_idx, _) = best_target?;
-    let _ = best; // consumed during search only
-    Some((RaptorState { labels }, target_idx, total_arr))
+    best_target
 }
 
-fn reconstruct(
+pub(super) fn reconstruct(
     epoch: &StaticEpoch,
-    state: &RaptorState,
+    labels: &[Vec<Option<Reach>>],
     target_idx: u32,
     egress: &AccessStop,
     total_arr: u32,
@@ -1155,8 +1262,8 @@ fn reconstruct(
     // Find latest round with a label at target (prefer earliest arrival among labels).
     let mut best_round: Option<usize> = None;
     let mut best_arr = u32::MAX;
-    for r in 0..state.labels.len() {
-        if let Some(lab) = &state.labels[r][target_idx as usize] {
+    for r in 0..labels.len() {
+        if let Some(lab) = &labels[r][target_idx as usize] {
             let a = lab.arrival_s();
             if a < best_arr || (a == best_arr && best_round.map(|br| r > br).unwrap_or(true)) {
                 // Prefer fewer rounds for same arrival (fewer transfers).
@@ -1178,12 +1285,12 @@ fn reconstruct(
     let mut chain: Vec<Reach> = Vec::new();
 
     while round >= 0 {
-        let lab = state.labels[round as usize][stop as usize]
+        let lab = labels[round as usize][stop as usize]
             .clone()
             .or_else(|| {
                 // Search earlier rounds for a label at this stop with same best arrival.
                 for r in (0..=round as usize).rev() {
-                    if let Some(l) = &state.labels[r][stop as usize] {
+                    if let Some(l) = &labels[r][stop as usize] {
                         return Some(l.clone());
                     }
                 }
@@ -1503,7 +1610,7 @@ fn reconstruct(
     })
 }
 
-fn place_from_query_from(epoch: &StaticEpoch, q: &ItineraryQuery) -> Place {
+pub(super) fn place_from_query_from(epoch: &StaticEpoch, q: &ItineraryQuery) -> Place {
     if let Some(ref id) = q.from_stop_id {
         if let Some(s) = epoch.get_stop(id) {
             return Place {
@@ -1522,7 +1629,7 @@ fn place_from_query_from(epoch: &StaticEpoch, q: &ItineraryQuery) -> Place {
     }
 }
 
-fn place_from_query_to(epoch: &StaticEpoch, q: &ItineraryQuery) -> Place {
+pub(super) fn place_from_query_to(epoch: &StaticEpoch, q: &ItineraryQuery) -> Place {
     if let Some(ref id) = q.to_stop_id {
         if let Some(s) = epoch.get_stop(id) {
             return Place {
@@ -1541,7 +1648,7 @@ fn place_from_query_to(epoch: &StaticEpoch, q: &ItineraryQuery) -> Place {
     }
 }
 
-fn empty_result(epoch: &StaticEpoch, q: &ItineraryQuery) -> ItineraryResult {
+pub(super) fn empty_result(epoch: &StaticEpoch, q: &ItineraryQuery) -> ItineraryResult {
     ItineraryResult {
         from: place_from_query_from(epoch, q),
         to: place_from_query_to(epoch, q),
@@ -1822,6 +1929,7 @@ mod tests {
             bike_to: false,
             bike_speed_m_s: 4.2,
             max_bike_meters: 5000,
+            use_tbr: false,
         }
     }
 

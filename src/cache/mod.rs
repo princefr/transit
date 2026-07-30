@@ -258,6 +258,7 @@ impl TransitCache {
             input.wheelchair.unwrap_or(false).to_string(),
             input.bike_from.unwrap_or(false).to_string(),
             input.bike_to.unwrap_or(false).to_string(),
+            input.use_tbr.unwrap_or(false).to_string(),
             routing.timezone.clone(),
             routing.max_transfers.to_string(),
             routing.raptor_max_rounds.to_string(),
@@ -623,6 +624,7 @@ mod tests {
             wheelchair: None,
             bike_from: None,
             bike_to: None,
+            use_tbr: None,
         };
         let routing = crate::config::RoutingConfig {
             timezone: "Europe/Paris".into(),

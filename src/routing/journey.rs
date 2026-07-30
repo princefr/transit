@@ -159,6 +159,11 @@ pub struct ItineraryQuery {
     pub bike_speed_m_s: f64,
     /// Max bike access distance (m) for first/last mile.
     pub max_bike_meters: u32,
+    /// When true, use Trip-Based Public Transit Routing (TBR) instead of RAPTOR.
+    /// TBR is a round-based alternative that operates on trips directly and can
+    /// be more efficient when the number of trips is large but stops-per-trip
+    /// is small.  Produces equivalent results to RAPTOR.
+    pub use_tbr: bool,
     /// Trip ids (namespaced) to skip at boarding time, e.g. RT cancellations.
     /// Routing does not import the RT layer; callers pass the set.
     pub excluded_trip_ids: HashSet<String>,

@@ -139,14 +139,23 @@ mod tests {
         assert!(links.is_empty());
     }
 
+    /// Above the station cap we still build links: the cap is advisory only —
+    /// completeness of the walk graph is required for multi-mode RAPTOR.
+    /// (Stations spread ~1.1km apart so the grid stays cheap; only the first
+    /// two are within link radius.)
     #[test]
-    fn cap_skips() {
+    fn cap_still_links_above_threshold() {
         let mut stops = Vec::new();
         for i in 0..HUB_LINK_STATION_CAP + 1 {
-            let lat = 48.0 + (i as f64) * 0.0001;
+            let lat = 48.0 + (i as f64) * 0.01;
             stops.push((Some(lat), Some(2.0), true));
         }
+        stops[1] = (Some(48.0005), Some(2.0), true); // ~55m from stops[0]
         let edges = link_epoch_stops_safe(&stops, 250.0, 1.2, 180);
-        assert!(edges.is_empty());
+        assert_eq!(
+            edges.len(),
+            2,
+            "one bidirectional hub link pair expected above the cap"
+        );
     }
 }

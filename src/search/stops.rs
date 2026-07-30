@@ -50,8 +50,37 @@ pub fn strip_accents(s: &str) -> String {
     out
 }
 
-fn normalize_query(s: &str) -> String {
+pub fn normalize_query(s: &str) -> String {
     strip_accents(s).to_lowercase()
+}
+
+/// Per-stop precomputed search data (built at pack time) so autocomplete does
+/// not re-normalize every stop name/id on each keystroke.
+#[derive(Debug, Clone)]
+pub struct StopSearchEntry {
+    pub name_norm: String,
+    pub id_norm: String,
+    pub place_kind: i32,
+    pub has_dep: bool,
+}
+
+/// Build the search index for an epoch (called from `pack::build_epoch`).
+pub fn build_stop_search_index(epoch: &StaticEpoch) -> Vec<StopSearchEntry> {
+    epoch
+        .stops
+        .iter()
+        .enumerate()
+        .map(|(i, s)| StopSearchEntry {
+            name_norm: normalize_query(&s.name),
+            id_norm: normalize_query(&s.raw_id),
+            place_kind: place_kind_score(s),
+            has_dep: epoch
+                .stop_departures
+                .get(i)
+                .map(|v| !v.is_empty())
+                .unwrap_or(false),
+        })
+        .collect()
 }
 
 /// Match quality for ranking (higher is better).
@@ -175,15 +204,41 @@ pub fn search_stops_filtered(
     if q.len() < 2 {
         return vec![];
     }
+    // Packed epochs carry a precomputed search index (zero per-query allocs);
+    // unit-test epochs fall back to on-the-fly normalization.
+    let pre = if epoch.stop_search.len() == epoch.stops.len() {
+        Some(epoch.stop_search.as_slice())
+    } else {
+        None
+    };
     let mut scored: Vec<(i32, &StopRecord)> = Vec::new();
-    for s in &epoch.stops {
+    for (i, s) in epoch.stops.iter().enumerate() {
         if is_station_only && !s.is_station() {
             continue;
         }
-        let name_n = normalize_query(&s.name);
-        let id_n = normalize_query(&s.raw_id);
-        let kind_name = best_match_kind(&name_n, &q);
-        let kind_id = best_match_kind(&id_n, &q);
+        let name_store;
+        let id_store;
+        let (name_n, id_n, place_kind, has_dep) = if let Some(pre) = pre {
+            let e = &pre[i];
+            (
+                e.name_norm.as_str(),
+                e.id_norm.as_str(),
+                e.place_kind,
+                e.has_dep,
+            )
+        } else {
+            name_store = normalize_query(&s.name);
+            id_store = normalize_query(&s.raw_id);
+            let pk = place_kind_score(s);
+            let hd = epoch
+                .stop_departures
+                .get(i)
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+            (name_store.as_str(), id_store.as_str(), pk, hd)
+        };
+        let kind_name = best_match_kind(name_n, &q);
+        let kind_id = best_match_kind(id_n, &q);
         let kind = kind_name.max(kind_id);
         if kind == MatchKind::None {
             continue;
@@ -200,21 +255,14 @@ pub fn search_stops_filtered(
             score += 30;
         }
         // IDFM: monomodal / multimodal stop places beat numeric quays
-        score += place_kind_score(s);
+        score += place_kind;
         // Prefer shorter names on equal match quality
         score -= (name_n.len() as i32).min(40);
         // Prefer boardable monomodals; demote empty place shells (no departures)
-        if let Some(&idx) = epoch.stop_id_to_idx.get(&s.id) {
-            let has_dep = epoch
-                .stop_departures
-                .get(idx as usize)
-                .map(|v| !v.is_empty())
-                .unwrap_or(false);
-            if has_dep {
-                score += 80;
-            } else if place_kind_score(s) >= 300 {
-                score -= 350; // empty monomodal (e.g. wrong Nation shell)
-            }
+        if has_dep {
+            score += 80;
+        } else if place_kind >= 300 {
+            score -= 350; // empty monomodal (e.g. wrong Nation shell)
         }
         let _ = modes; // mode filter needs route↔stop index; reserved
         scored.push((score, s));
@@ -388,7 +436,10 @@ mod tests {
             stop_url: None,
             stop_timezone: None,
         };
-        let e = epoch_with(vec![quay, mono]);
+        let mut e = epoch_with(vec![quay, mono]);
+        // Real epochs have departures; without them the "empty place shell"
+        // penalty intentionally demotes the monomodal below the quay.
+        e.stop_departures = vec![vec![(0, 0)], vec![(0, 0)]];
         let aul = search_stops(&e, "aulnay-sous-bois", None, 10);
         assert_eq!(
             aul.len(),
