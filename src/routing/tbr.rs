@@ -119,6 +119,9 @@ struct TbrScratch<'a> {
     stop_stamp: Vec<u32>,
     /// Stamp for "line already boarded in this round".
     line_stamp: Vec<u32>,
+    /// Stamp for deduplicating lines during inline trip-transfer discovery.
+    xfer_line_stamp: Vec<u32>,
+    xfer_stamp: u32,
     /// Per-trip calendar activity for the query service date.
     active: Vec<bool>,
     /// Per-trip RT adjustment.
@@ -173,6 +176,8 @@ impl<'a> TbrScratch<'a> {
             reached: Vec::new(),
             stop_stamp: vec![0; n],
             line_stamp: vec![0; epoch.line_trips.len().max(1)],
+            xfer_line_stamp: vec![0; epoch.line_trips.len().max(1)],
+            xfer_stamp: 0,
             active,
             rt,
             rt_margin_s: margin,
@@ -951,51 +956,132 @@ fn scan_trip_forward(
         }
     }
 
-    // FLASH-TB: precomputed trip-to-trip transfers with arc-flag pruning
+    // FLASH-TB: trip-to-trip transfers (discovered at query time to save RAM).
     if use_arc_flags {
         for off in (board_off + 1)..trip.stop_time_len {
             let st = &epoch.stop_times[(trip.stop_time_start + off) as usize];
-            if st.drop_off_type == 1 { continue; }
+            if st.drop_off_type == 1 {
+                continue;
+            }
             let arr = rt_effective_arr_s(adj, st, time_shift);
-            if arr >= *best_dest { break; }
-            
-            if let Some(transfers) = epoch.trip_transfers.get(ti).and_then(|v| v.get(off as usize)) {
-                for entry in transfers {
-                    if !entry.arc_flags.intersects(target_cells) {
-                        continue; // arc-flag prune this trip transfer
-                    }
-                    let t2 = entry.target_trip as usize;
-                    if t2 >= s.active.len() || !s.active[t2] { continue; }
-                    
-                    let trip2 = &epoch.trips[t2];
-                    let board_st = &epoch.stop_times[(trip2.stop_time_start + entry.target_board_off) as usize];
-                    let effective_board = arr.saturating_add(entry.min_transfer_s);
-                    if board_st.departure_s < effective_board { continue; }
-                    if board_st.departure_s >= *best_dest { continue; }
-                    
-                    let si2 = board_st.stop_idx;
-                    if board_st.departure_s < s.earliest[si2 as usize] {
-                        s.improve(
-                            round, si2, board_st.departure_s,
-                            TbrReach::Walk {
-                                arrival_s: board_st.departure_s,
-                                from_stop: st.stop_idx,
-                                to_stop: si2,
-                                duration_s: entry.min_transfer_s,
-                                distance_m: 0.0,
-                                prev_round: (round + 1) as u16,
-                            },
-                        );
-                        if s.stop_stamp[si2 as usize] != round_stamp {
-                            s.stop_stamp[si2 as usize] = round_stamp;
-                            next_reached.push(si2);
-                        }
-                        if let Some(eg) = egress.get(&si2) {
-                            let total = board_st.departure_s.saturating_add(eg.duration_s);
-                            if total < *best_dest {
-                                *best_dest = total;
-                            }
-                        }
+            if arr >= *best_dest {
+                break;
+            }
+            probe_trip_transfers(
+                epoch,
+                ti,
+                st.stop_idx,
+                arr,
+                best_dest,
+                egress,
+                s,
+                round,
+                round_stamp,
+                next_reached,
+            );
+        }
+    }
+}
+
+/// At an alight stop, board the earliest trip on each reachable line (same
+/// logic as pack-time precompute, but without storing O(trips×stops) tables).
+fn probe_trip_transfers(
+    epoch: &StaticEpoch,
+    from_trip: usize,
+    alight_stop: u32,
+    alight_arr: u32,
+    best_dest: &mut u32,
+    egress: &HashMap<u32, AccessStop>,
+    s: &mut TbrScratch,
+    round: usize,
+    round_stamp: u32,
+    next_reached: &mut Vec<u32>,
+) {
+    const DEFAULT_TRANSFER_S: u32 = 120;
+    let board_after = alight_arr.saturating_add(DEFAULT_TRANSFER_S);
+    let alight_stop = alight_stop as usize;
+
+    s.xfer_stamp = s.xfer_stamp.wrapping_add(1);
+    let stamp = s.xfer_stamp;
+
+    let adj = epoch
+        .walk_adj
+        .get(alight_stop)
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+
+    let mut target_stops: Vec<(u32, u32)> = Vec::with_capacity(adj.len() + 1);
+    target_stops.push((alight_stop as u32, 0));
+    for &ei in adj {
+        let e = &epoch.walk_edges[ei];
+        target_stops.push((e.to_stop_idx, e.duration_s));
+    }
+
+    for (target_stop, walk_dur) in target_stops {
+        let effective_board = board_after.saturating_add(walk_dur);
+        let deps = match epoch.stop_departures.get(target_stop as usize) {
+            Some(d) => d,
+            None => continue,
+        };
+        if deps.is_empty() {
+            continue;
+        }
+
+        let start_idx = deps.partition_point(|&(t, o)| {
+            let tr = &epoch.trips[t as usize];
+            epoch.stop_times[(tr.stop_time_start + o) as usize].departure_s < effective_board
+        });
+
+        for &(trip2_idx, board_off) in &deps[start_idx..] {
+            let line_id = epoch.line_of_trip[trip2_idx as usize] as usize;
+            if line_id < s.xfer_line_stamp.len() && s.xfer_line_stamp[line_id] == stamp {
+                continue;
+            }
+            if line_id < s.xfer_line_stamp.len() {
+                s.xfer_line_stamp[line_id] = stamp;
+            }
+            if trip2_idx as usize == from_trip {
+                continue;
+            }
+            let t2 = trip2_idx as usize;
+            if t2 >= s.active.len() || !s.active[t2] {
+                continue;
+            }
+
+            let trip2 = &epoch.trips[t2];
+            let board_st =
+                &epoch.stop_times[(trip2.stop_time_start + board_off) as usize];
+            if board_st.departure_s < effective_board {
+                continue;
+            }
+            if board_st.departure_s >= *best_dest {
+                continue;
+            }
+
+            let si2 = board_st.stop_idx;
+            let min_transfer_s = walk_dur.saturating_add(DEFAULT_TRANSFER_S);
+            if board_st.departure_s < s.earliest[si2 as usize] {
+                s.improve(
+                    round,
+                    si2,
+                    board_st.departure_s,
+                    TbrReach::Walk {
+                        arrival_s: board_st.departure_s,
+                        from_stop: alight_stop as u32,
+                        to_stop: si2,
+                        duration_s: min_transfer_s,
+                        distance_m: 0.0,
+                        prev_round: (round + 1) as u16,
+                    },
+                );
+                if s.stop_stamp[si2 as usize] != round_stamp {
+                    s.stop_stamp[si2 as usize] = round_stamp;
+                    next_reached.push(si2);
+                }
+                if let Some(eg) = egress.get(&si2) {
+                    let total = board_st.departure_s.saturating_add(eg.duration_s);
+                    if total < *best_dest {
+                        *best_dest = total;
                     }
                 }
             }

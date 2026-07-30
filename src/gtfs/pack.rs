@@ -746,7 +746,6 @@ pub fn build_epoch(bundles: Vec<Arc<FeedStaticBundle>>, extra_walk: Vec<WalkEdge
     sort_stop_departures(&mut epoch);
     compute_line_groups(&mut epoch);
     compute_partition(&mut epoch);
-    compute_trip_transfers(&mut epoch);
     compute_arc_flags(&mut epoch);
     epoch.stop_search = crate::search::build_stop_search_index(&epoch);
     build_geo_and_place_indexes(&mut epoch);
@@ -824,7 +823,7 @@ fn compute_partition(epoch: &mut StaticEpoch) {
         return;
     }
 
-    const TARGET_DEPTH: u32 = 8; // 2^8 = 256 cells
+    const TARGET_DEPTH: u32 = 6; // 2^6 = 64 cells (balance arc-flag precision vs RAM)
     let num_cells = 1u32 << TARGET_DEPTH;
 
     // Collect (index, lat, lon) for stops with coordinates
@@ -874,85 +873,6 @@ fn compute_partition(epoch: &mut StaticEpoch) {
 
     bisect(&mut coords, 0, 0, TARGET_DEPTH, &mut epoch.stop_partition);
     epoch.num_cells = num_cells;
-}
-
-/// Precompute trip-to-trip transfers for FLASH-TB.
-/// trip_transfers[t1][alight_off] = Vec<TripTransferEntry> listing the
-/// earliest boardable trip on each reachable line from each alight stop.
-fn compute_trip_transfers(epoch: &mut StaticEpoch) {
-    const DEFAULT_TRANSFER_S: u32 = 120;
-    
-    let n_trips = epoch.trips.len();
-    let num_cells = epoch.num_cells;
-    let mut all_transfers: Vec<Vec<Vec<TripTransferEntry>>> = Vec::with_capacity(n_trips);
-    
-    for ti in 0..n_trips {
-        let trip = &epoch.trips[ti];
-        let start = trip.stop_time_start as usize;
-        let len = trip.stop_time_len as usize;
-        let mut per_alight: Vec<Vec<TripTransferEntry>> = Vec::with_capacity(len);
-        
-        for off in 0..len {
-            let st = &epoch.stop_times[start + off];
-            if st.drop_off_type == 1 {
-                per_alight.push(Vec::new());
-                continue;
-            }
-            let alight_stop = st.stop_idx as usize;
-            let alight_arr = st.arrival_s;
-            let board_after = alight_arr.saturating_add(DEFAULT_TRANSFER_S);
-            
-            let mut entries: Vec<TripTransferEntry> = Vec::new();
-            let mut seen_lines: std::collections::HashSet<u32> = std::collections::HashSet::new();
-            
-            // Walk to neighboring stops (including self-transfer at same stop)
-            let adj = epoch.walk_adj.get(alight_stop).cloned().unwrap_or_default();
-            
-            // Also consider the alight stop itself (same-stop transfer)
-            let target_stops: Vec<(u32, u32)> = std::iter::once((alight_stop as u32, 0u32))
-                .chain(adj.iter().map(|&ei| {
-                    let e = &epoch.walk_edges[ei];
-                    (e.to_stop_idx, e.duration_s)
-                }))
-                .collect();
-            
-            for (target_stop, walk_dur) in target_stops {
-                let effective_board = board_after.saturating_add(walk_dur);
-                let deps = match epoch.stop_departures.get(target_stop as usize) {
-                    Some(d) => d,
-                    None => continue,
-                };
-                if deps.is_empty() { continue; }
-                
-                // Binary search for first departure >= effective_board
-                let start_idx = deps.partition_point(|&(t, o)| {
-                    let tr = &epoch.trips[t as usize];
-                    epoch.stop_times[(tr.stop_time_start + o) as usize].departure_s < effective_board
-                });
-                
-                for &(trip2_idx, board_off) in &deps[start_idx..] {
-                    let line_id = epoch.line_of_trip[trip2_idx as usize];
-                    if !seen_lines.insert(line_id) {
-                        continue; // already have earliest trip on this line
-                    }
-                    // Don't transfer back to same trip
-                    if trip2_idx as usize == ti {
-                        continue;
-                    }
-                    entries.push(TripTransferEntry {
-                        target_trip: trip2_idx,
-                        target_board_off: board_off,
-                        min_transfer_s: walk_dur.saturating_add(DEFAULT_TRANSFER_S),
-                        arc_flags: CellBitSet::new(num_cells),
-                    });
-                }
-            }
-            per_alight.push(entries);
-        }
-        all_transfers.push(per_alight);
-    }
-    
-    epoch.trip_transfers = all_transfers;
 }
 
 fn compute_arc_flags(epoch: &mut StaticEpoch) {
@@ -1032,20 +952,6 @@ fn compute_arc_flags(epoch: &mut StaticEpoch) {
                 if d_b != u32::MAX {
                     if !(cell_a == cell_b && cell_u32 == cell_a) {
                         epoch.arc_flags[ei].set_bit(cell as usize);
-                    }
-                }
-            }
-        }
-
-        // Set arc-flags on trip transfers
-        for t1 in 0..epoch.trip_transfers.len() {
-            for alight_off in 0..epoch.trip_transfers[t1].len() {
-                for entry in &mut epoch.trip_transfers[t1][alight_off] {
-                    let target_trip = &epoch.trips[entry.target_trip as usize];
-                    let board_st = &epoch.stop_times[(target_trip.stop_time_start + entry.target_board_off) as usize];
-                    let target_stop = board_st.stop_idx as usize;
-                    if target_stop < n_stops && dist[target_stop] != u32::MAX {
-                        entry.arc_flags.set_bit(cell as usize);
                     }
                 }
             }
