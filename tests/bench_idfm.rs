@@ -3,7 +3,7 @@
 //! Run with: cargo test --release --test bench_idfm -- --nocapture --ignored
 
 use chrono::{TimeZone, Utc};
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use transit::gtfs::pack::build_epoch;
@@ -11,8 +11,8 @@ use transit::gtfs::parse::load_gtfs_zip;
 use transit::routing::{plan_journeys, ItineraryQuery};
 use transit::search::search_stops;
 
-fn idfm_zip() -> &'static Path {
-    Path::new("/home/ondonda/rust/transit/data/idfm/current.zip")
+fn idfm_zip() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/idfm/current.zip")
 }
 
 fn make_query_geo(
@@ -73,7 +73,7 @@ fn bench_idfm_raptor_vs_tbr() {
 
     eprintln!("Loading IDFM GTFS...");
     let t0 = Instant::now();
-    let bundle = load_gtfs_zip("idfm", zip_path).expect("failed to load IDFM GTFS");
+    let bundle = load_gtfs_zip("idfm", &zip_path).expect("failed to load IDFM GTFS");
     eprintln!("  loaded in {:.1}s", t0.elapsed().as_secs_f64());
 
     eprintln!("Building epoch (includes 64-cell partition + Arc-Flags)...");
