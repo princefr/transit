@@ -1097,11 +1097,121 @@
     moveEndHandlers.push(handler);
   }
 
+  // --- Isochrone layer -------------------------------------------------
+  let isochroneLayer = null;
+
+  function clearIsochrone() {
+    if (isochroneLayer) {
+      map.removeLayer(isochroneLayer);
+      isochroneLayer = null;
+    }
+  }
+
+  /** Monotone-chain convex hull over [lat, lon] points. */
+  function convexHull(points) {
+    if (points.length < 3) return points;
+    const pts = points.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+    const cross = (o, a, b) =>
+      (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+    const lower = [];
+    for (const p of pts) {
+      while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0)
+        lower.pop();
+      lower.push(p);
+    }
+    const upper = [];
+    for (let i = pts.length - 1; i >= 0; i--) {
+      const p = pts[i];
+      while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0)
+        upper.pop();
+      upper.push(p);
+    }
+    lower.pop();
+    upper.pop();
+    return lower.concat(upper);
+  }
+
+  /**
+   * Draw an isochrone: JSON string {
+   *   origin?: {lat, lon},
+   *   stops: [{lat, lon, name, travelSeconds, legs}]
+   * }. Stops colored by leg count; translucent hull shows the reach area.
+   */
+  function drawIsochrone(payload) {
+    clearIsochrone();
+    ensureMap();
+    let data;
+    try {
+      data = typeof payload === "string" ? JSON.parse(payload) : payload;
+    } catch (e) {
+      console.error("drawIsochrone: bad payload", e);
+      return;
+    }
+    const stops = data.stops || [];
+    if (!stops.length) return;
+
+    isochroneLayer = L.layerGroup();
+    const legColors = ["#16a34a", "#2563eb", "#9333ea", "#dc2626"];
+
+    if (data.origin && Number.isFinite(data.origin.lat)) {
+      L.circleMarker([data.origin.lat, data.origin.lon], {
+        radius: 7,
+        color: "#111827",
+        fillColor: "#fbbf24",
+        fillOpacity: 1,
+        weight: 2,
+      })
+        .bindTooltip("Départ")
+        .addTo(isochroneLayer);
+    }
+
+    const pts = stops.map((s) => [s.lat, s.lon]);
+    if (pts.length >= 3) {
+      const hull = convexHull(pts);
+      if (hull.length >= 3) {
+        L.polygon(hull, {
+          color: "#2563eb",
+          weight: 1,
+          opacity: 0.5,
+          fillOpacity: 0.07,
+          dashArray: "6 6",
+          interactive: false,
+        }).addTo(isochroneLayer);
+      }
+    }
+
+    for (const s of stops) {
+      const color = legColors[Math.min(s.legs || 0, legColors.length - 1)];
+      const mins = Math.round((s.travelSeconds || 0) / 60);
+      const legsTxt = s.legs === 0 ? "à pied" : `${s.legs} correspondance${s.legs > 1 ? "s" : ""}`;
+      L.circleMarker([s.lat, s.lon], {
+        radius: 4.5,
+        color,
+        fillColor: color,
+        fillOpacity: 0.85,
+        weight: 1,
+      })
+        .bindPopup(
+          `<strong>${s.name}</strong><br>${mins} min · ${legsTxt}`
+        )
+        .addTo(isochroneLayer);
+    }
+
+    isochroneLayer.addTo(map);
+    const bounds = L.latLngBounds(pts);
+    if (data.origin && Number.isFinite(data.origin.lat)) {
+      bounds.extend([data.origin.lat, data.origin.lon]);
+    }
+    map.fitBounds(bounds, { padding: [30, 30], maxZoom: 14 });
+  }
+
   window.TransitMap = {
     init: ensureMap,
     clearJourney,
     clearJourneyAndFocus,
     drawJourney,
+    drawIsochrone,
+    clearIsochrone,
     setItineraryFocus,
     focusStop,
     setView,

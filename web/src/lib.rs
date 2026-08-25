@@ -26,7 +26,10 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use web_sys::{Document, Element, HtmlElement, HtmlInputElement, KeyboardEvent, WebSocket};
+use web_sys::{
+    Document, Element, HtmlElement, HtmlInputElement, HtmlSelectElement, KeyboardEvent,
+    WebSocket,
+};
 
 /// Poll interval for journey-scoped vehicle positions (ms).
 const LIVE_POLL_MS: u32 = 12_000;
@@ -150,7 +153,6 @@ struct FeedHealth {
     static_trips: Option<i32>,
 }
 
-#[derive(Clone, Debug)]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DatasetLoading {
@@ -4053,6 +4055,107 @@ fn feed_loading_label(feed: &FeedHealth) -> String {
     }
 }
 
+// --- Isochrone -----------------------------------------------------------
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct IsochroneStopUi {
+    #[serde(rename = "stop")]
+    stop: Stop,
+    #[serde(rename = "travelSeconds")]
+    travel_seconds: i64,
+    legs: i32,
+}
+
+async fn fetch_isochrone(
+    origin: &PlacePick,
+    minutes: i32,
+) -> Result<Vec<IsochroneStopUi>, String> {
+    let origin_val = if origin.kind == "stop" {
+        json!({ "stopId": origin.stop.id })
+    } else {
+        json!({
+            "lat": origin.stop.lat,
+            "lon": origin.stop.lon,
+            "name": origin.stop.name,
+        })
+    };
+    let q = r#"
+      query($origin: IsochroneInput!, $minutes: Int!) {
+        isochrone(input: { origin: $origin, maxMinutes: $minutes }) {
+          stop { name lat lon }
+          arrivalAt
+          travelSeconds
+          legs
+        }
+      }
+    "#;
+    let data = gql(q, json!({ "origin": origin_val, "minutes": minutes })).await?;
+    let nodes = data
+        .pointer("/isochrone")
+        .and_then(|n| n.as_array())
+        .cloned()
+        .unwrap_or_default();
+    Ok(serde_json::from_value(Value::Array(nodes))
+        .map_err(|e| format!("isochrone parse: {e}"))?)
+}
+
+fn isochrone_clicked() {
+    let origin = APP.with(|app| app.borrow().origin.clone());
+    let Some(origin) = origin else {
+        set_status(
+            "Choisissez un départ (gare ou adresse) pour calculer la zone accessible.",
+            true,
+        );
+        return;
+    };
+    let minutes = el("isochrone-minutes")
+        .and_then(|e| e.dyn_into::<HtmlSelectElement>().ok())
+        .and_then(|s| s.value().parse::<i32>().ok())
+        .unwrap_or(30);
+
+    set_status(&format!(
+        "Calcul de la zone accessible ({minutes} min)…"
+    ), false);
+    if let Some(btn) = el("isochrone-btn") {
+        let _ = btn.set_attribute("disabled", "true");
+    }
+
+    wasm_bindgen_futures::spawn_local(async move {
+        let result = fetch_isochrone(&origin, minutes).await;
+        if let Some(btn) = el("isochrone-btn") {
+            let _ = btn.remove_attribute("disabled");
+        }
+        match result {
+            Ok(stops) => {
+                if stops.is_empty() {
+                    set_status("Aucune station accessible dans ce budget de temps.", true);
+                    return;
+                }
+                set_status(&format!(
+                    "{} stations accessibles en {} min.",
+                    stops.len(),
+                    minutes
+                ), false);
+                let payload = json!({
+                    "origin": { "lat": origin.stop.lat, "lon": origin.stop.lon },
+                    "stops": stops.iter().map(|s| json!({
+                        "lat": s.stop.lat,
+                        "lon": s.stop.lon,
+                        "name": s.stop.name,
+                        "travelSeconds": s.travel_seconds,
+                        "legs": s.legs,
+                    })).collect::<Vec<_>>(),
+                });
+                call_map(
+                    "drawIsochrone",
+                    Some(&serde_json::to_string(&payload).unwrap_or_default()),
+                );
+            }
+            Err(e) => set_status(&format!("Échec isochrone : {e}"), true),
+        }
+    });
+}
+
 /// French human ETA: "2 min 30 s" / "1 h 05".
 fn format_eta_fr(secs: u64) -> String {
     if secs >= 3600 {
@@ -4352,6 +4455,23 @@ pub fn start() {
     if let Some(btn) = el("plan-btn") {
         let closure = Closure::wrap(Box::new(move |_e: web_sys::MouseEvent| {
             plan_clicked();
+        }) as Box<dyn FnMut(_)>);
+        let _ = btn.add_event_listener_with_callback("click", closure.as_ref().unchecked_ref());
+        closure.forget();
+    }
+
+    if let Some(btn) = el("isochrone-btn") {
+        let closure = Closure::wrap(Box::new(move |_e: web_sys::MouseEvent| {
+            isochrone_clicked();
+        }) as Box<dyn FnMut(_)>);
+        let _ = btn.add_event_listener_with_callback("click", closure.as_ref().unchecked_ref());
+        closure.forget();
+    }
+
+    if let Some(btn) = el("isochrone-clear") {
+        let closure = Closure::wrap(Box::new(move |_e: web_sys::MouseEvent| {
+            call_map("clearIsochrone", None);
+            set_status("Zone accessible effacée.", false);
         }) as Box<dyn FnMut(_)>);
         let _ = btn.add_event_listener_with_callback("click", closure.as_ref().unchecked_ref());
         closure.forget();

@@ -105,6 +105,18 @@
               <span>Fauteuil roulant</span>
             </label>
           </div>
+          <div class="isochrone-row">
+            <select id="isochrone-minutes" class="input" aria-label="Budget de temps">
+              <option value="15">15 min</option>
+              <option value="30" selected>30 min</option>
+              <option value="45">45 min</option>
+              <option value="60">60 min</option>
+            </select>
+            <button id="isochrone-btn" class="btn" type="button" title="Stations accessibles depuis le départ">
+              Zone accessible
+            </button>
+            <button id="isochrone-clear" class="btn btn-ghost" type="button" title="Effacer la zone accessible">✕</button>
+          </div>
           <button id="plan-btn" class="btn btn-primary" type="button" disabled title="En attente du chargement des horaires GTFS">
             <span id="plan-btn-spinner" class="btn-spinner" hidden></span>
             <span id="plan-btn-label">Calculer l’itinéraire</span>
