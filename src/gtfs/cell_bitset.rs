@@ -16,6 +16,14 @@ impl CellBitSet {
         }
     }
 
+    /// Grow to hold `num_cells` bits when currently empty (lazy init after pack).
+    pub fn ensure_sized(&mut self, num_cells: u32) {
+        let n_words = (num_cells as usize + 63) / 64;
+        if self.words.len() < n_words {
+            self.words.resize(n_words, 0);
+        }
+    }
+
     pub fn set_bit(&mut self, c: usize) {
         let word_idx = c / 64;
         let bit_idx = c % 64;

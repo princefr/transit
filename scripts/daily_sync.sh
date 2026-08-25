@@ -41,13 +41,19 @@ BUILD_LINES="${BUILD_LINES:-0}"
 LOCK="/tmp/transit-daily-sync-${FEED_ID}.lock"
 
 CURL_EXTRA=()
-if [[ -n "${PRIM_DATASET_KEY:-}" ]]; then
-  CURL_EXTRA+=(-H "X-API-KEY: ${PRIM_DATASET_KEY}")
-elif [[ -n "${DATASETS_API_KEY:-}" ]]; then
-  CURL_EXTRA+=(-H "X-API-KEY: ${DATASETS_API_KEY}")
-elif [[ -n "${DATAGOUV_API_KEY:-}" ]]; then
-  CURL_EXTRA+=(-H "X-API-KEY: ${DATAGOUV_API_KEY}")
-fi
+# Public data.gouv.fr permanent resources redirect to OpenDataSoft and reject
+# X-API-KEY (401). Only attach dataset auth for PRIM Datahub / gated URLs.
+case "$GTFS_URL" in
+  *prim.iledefrance-mobilites.fr*|*transport.data.gouv.fr*)
+    if [[ -n "${PRIM_DATASET_KEY:-}" ]]; then
+      CURL_EXTRA+=(-H "X-API-KEY: ${PRIM_DATASET_KEY}")
+    elif [[ -n "${DATASETS_API_KEY:-}" ]]; then
+      CURL_EXTRA+=(-H "X-API-KEY: ${DATASETS_API_KEY}")
+    elif [[ -n "${DATAGOUV_API_KEY:-}" ]]; then
+      CURL_EXTRA+=(-H "X-API-KEY: ${DATAGOUV_API_KEY}")
+    fi
+    ;;
+esac
 
 mkdir -p "$INCOMING" "$FEED_DIR" "$LOG_DIR"
 touch "$LOG" "$FEED_LOG"
