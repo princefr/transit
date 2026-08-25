@@ -65,6 +65,7 @@ fn build_health_json(
             "alerts": rt_stats.alert_count,
         },
         "feeds": feeds,
+        "dataset_loading": crate::gtfs::load_progress::snapshot_json(),
         "cache": {
             "redis_enabled": state.cache.enabled(),
             "redis_connected": state.cache.connected(),

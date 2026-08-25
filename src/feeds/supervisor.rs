@@ -3,7 +3,7 @@ use crate::config::{Config, FeedConfig};
 use crate::feeds::hub_link::link_epoch_stops_safe;
 use crate::feeds::rt_poller::{run_rt_poller, RtKind};
 use crate::feeds::static_watcher::run_static_watcher;
-use crate::gtfs::pack::{build_epoch, FeedStaticBundle, StaticEpoch};
+use crate::gtfs::pack::{build_epoch_with_flash, FeedStaticBundle, StaticEpoch};
 use crate::prim::{spawn_prim_pollers, PrimClient};
 use crate::rt::overlay::{FeedRtState, RealtimeOverlay};
 use arc_swap::ArcSwap;
@@ -160,6 +160,7 @@ pub fn spawn_feed_supervisor(
     }
 
     let routing = config.routing.clone();
+    let flash_dir = data_dir.join("flash");
     let coord_cancel = child.clone();
     tokio::spawn(async move {
         let mut bundles: HashMap<String, Arc<FeedStaticBundle>> = HashMap::new();
@@ -190,7 +191,7 @@ pub fn spawn_feed_supervisor(
                             });
                             bundles.insert(feed_id, bundle);
                             let old_epoch_id = epoch.load().id.clone();
-                            rebuild_epoch(&bundles, &routing, &epoch);
+                            rebuild_epoch(&bundles, &routing, &flash_dir, &epoch);
                             let new_epoch_id = epoch.load().id.clone();
                             if old_epoch_id != new_epoch_id {
                                 cache.invalidate_epoch(&old_epoch_id).await;
@@ -391,13 +392,20 @@ fn spawn_feed_workers(
 fn rebuild_epoch(
     bundles: &HashMap<String, Arc<FeedStaticBundle>>,
     routing: &crate::config::RoutingConfig,
+    flash_dir: &std::path::Path,
     epoch_slot: &ArcSwap<StaticEpoch>,
 ) {
     let list: Vec<Arc<FeedStaticBundle>> = bundles.values().cloned().collect();
     if list.is_empty() {
         return;
     }
-    let preliminary = build_epoch(list.clone(), vec![]);
+    // Preliminary epoch only provides coordinates for hub linking — skip the
+    // expensive flag preprocessing entirely.
+    let preliminary = build_epoch_with_flash(
+        list.clone(),
+        vec![],
+        crate::gtfs::pack::FlashMode::Skip,
+    );
     // Hub-link stations **and** monomodal/boardable places so the walk graph is complete
     // (IDFM monomodals are often location_type=0 with trips — still transfer nodes).
     let stop_coords: Vec<(Option<f64>, Option<f64>, bool)> = preliminary
@@ -441,7 +449,12 @@ fn rebuild_epoch(
     } else {
         hub
     };
-    let epoch = build_epoch(list, hub);
+    let epoch = build_epoch_with_flash(
+        list,
+        hub,
+        crate::gtfs::pack::FlashMode::Persist(flash_dir),
+    );
+    crate::gtfs::load_progress::set_phase(crate::gtfs::load_progress::PHASE_READY);
     info!(
         epoch_id = %epoch.id,
         stops = epoch.stop_count(),

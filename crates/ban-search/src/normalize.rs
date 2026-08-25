@@ -108,6 +108,33 @@ pub fn split_number_prefix(q: &str) -> (Option<(String, String)>, String) {
     (Some((num, rep)), street)
 }
 
+/// Bounded Levenshtein distance check: true if `a` and `b` differ by at most
+/// `max_d` edits (insert / delete / substitute). Early-exits once the budget is
+/// exceeded so autocomplete stays cheap.
+pub fn edit_distance_leq(a: &str, b: &str, max_d: usize) -> bool {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.len().abs_diff(b.len()) > max_d {
+        return false;
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        let mut row_min = cur[0];
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1);
+            row_min = row_min.min(cur[j + 1]);
+        }
+        if row_min > max_d {
+            return false;
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()] <= max_d
+}
+
 fn split_num_rep(tok: &str) -> (String, String) {
     let bytes = tok.as_bytes();
     let mut i = 0;
@@ -133,5 +160,15 @@ mod tests {
     #[test]
     fn expands_bd() {
         assert_eq!(expand_street_abbrev("bd haussmann"), "boulevard haussmann");
+    }
+
+    #[test]
+    fn edit_distance_budget() {
+        assert!(edit_distance_leq("rivolli", "rivoli", 1));
+        assert!(edit_distance_leq("elysees", "elysee", 1));
+        assert!(!edit_distance_leq("elysees", "rivoli", 2));
+        assert!(edit_distance_leq("champs", "champ", 2));
+        assert!(!edit_distance_leq("abc", "abcd", 0));
+        assert!(edit_distance_leq("", "", 0));
     }
 }

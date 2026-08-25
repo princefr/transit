@@ -6,7 +6,8 @@ use std::path::PathBuf;
 pub struct BanConfig {
     /// Root directory (e.g. `./data/ban`).
     pub data_dir: PathBuf,
-    /// Département codes to index (`"75"`, …).
+    /// Département codes to index (`"75"`, …). **Empty = all of France**
+    /// (see [`crate::FRANCE_DEPARTMENTS`]).
     pub departments: Vec<String>,
     /// BAN CSV base URL (no trailing slash).
     pub base_url: String,
@@ -22,6 +23,16 @@ impl BanConfig {
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
+            base_url: crate::DEFAULT_BASE_URL.to_string(),
+            max_addresses: 0,
+        }
+    }
+
+    /// Whole of France (all available département dumps; ~25M addresses).
+    pub fn france_default(data_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            data_dir: data_dir.into(),
+            departments: Vec::new(), // empty = all
             base_url: crate::DEFAULT_BASE_URL.to_string(),
             max_addresses: 0,
         }

@@ -102,10 +102,19 @@ ban-index-paris: ## Faster: BAN 75 only
 	cd $(ROOT) && $(CARGO) run -p ban-search --bin ban-index -- \
 		--data-dir $(ROOT)/data/ban --dept 75 --download --build
 
+.PHONY: ban-index-fr
+ban-index-fr: ## Whole of France (~102 départements, ~25M addresses, needs ~2GB RAM)
+	cd $(ROOT) && $(CARGO) run --release -p ban-search --bin ban-index -- \
+		--data-dir $(ROOT)/data/ban --all --download --build
+
 .PHONY: ban-suggest
 ban-suggest: ## Test BAN suggest (QUERY="12 rue de rivoli")
 	cd $(ROOT) && $(CARGO) run -p ban-search --bin ban-index -- \
 		--data-dir $(ROOT)/data/ban --suggest "$(or $(QUERY),12 rue de rivoli paris)"
+
+.PHONY: ban-bench
+ban-bench: ## Benchmark BAN suggest latency (needs make ban-index first)
+	cd $(ROOT) && $(CARGO) test --release -p ban-search --test bench_suggest -- --nocapture --ignored
 
 # ─── Run ─────────────────────────────────────────────────────────────────────
 

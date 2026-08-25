@@ -28,6 +28,15 @@ pub fn download_departments_force(
     force: bool,
 ) -> Result<Vec<std::path::PathBuf>, BanError> {
     cfg.ensure_dirs()?;
+    // Empty department list = all of France.
+    let depts: Vec<String> = if cfg.departments.is_empty() {
+        crate::FRANCE_DEPARTMENTS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    } else {
+        cfg.departments.clone()
+    };
     let client = reqwest::blocking::Client::builder()
         .user_agent("transit-ban-search/0.1 (+https://github.com/local/transit; BAN open data)")
         .timeout(std::time::Duration::from_secs(900))
@@ -36,7 +45,7 @@ pub fn download_departments_force(
         .build()?;
 
     let mut out = Vec::new();
-    for dept in &cfg.departments {
+    for dept in &depts {
         let dest = cfg.csv_dir().join(format!("adresses-{dept}.csv"));
         if dest.exists() && !force {
             info!(%dept, path = %dest.display(), "BAN CSV already present — skip download");

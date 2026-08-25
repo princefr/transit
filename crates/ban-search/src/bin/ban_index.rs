@@ -29,6 +29,7 @@ fn main() -> ExitCode {
     let mut depts: Option<Vec<String>> = None;
     let mut do_download = false;
     let mut force = false;
+    let mut all = false;
     let mut do_build = false;
     let mut suggest: Option<String> = None;
 
@@ -52,7 +53,7 @@ fn main() -> ExitCode {
             }
             "--download" => do_download = true,
             "--force" => force = true,
-            "--build" => do_build = true,
+            "--all" => all = true,
             "--suggest" => {
                 i += 1;
                 suggest = Some(args.get(i).expect("--suggest value").clone());
@@ -67,7 +68,15 @@ fn main() -> ExitCode {
 
     let mut cfg = BanConfig::idf_default(&data_dir);
     if let Some(d) = depts {
-        cfg.departments = d;
+        // "all" (or an empty list) = every French département.
+        if d.len() == 1 && d[0].eq_ignore_ascii_case("all") {
+            cfg.departments = Vec::new();
+        } else {
+            cfg.departments = d;
+        }
+    }
+    if all {
+        cfg.departments = Vec::new();
     }
 
     if let Err(e) = cfg.ensure_dirs() {

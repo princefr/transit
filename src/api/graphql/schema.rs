@@ -860,6 +860,7 @@ impl QueryRoot {
             bike_to: input.bike_to.unwrap_or(false),
             bike_speed_m_s: cfg.bike_speed_m_s,
             max_bike_meters: cfg.max_bike_meters,
+            use_tbr: input.use_tbr.unwrap_or(true), // FLASH-TB is the default router
         };
 
         let timeout = std::time::Duration::from_secs(state.config.graphql.itinerary_timeout_secs);

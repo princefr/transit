@@ -32,16 +32,13 @@ pub struct BanConfigSection {
     /// Directory with `index.bin` and optional `csv/` (default `{data_dir}/ban`).
     #[serde(default)]
     pub data_dir: PathBuf,
-    /// Comma-separated or list of département codes (default IDF).
-    #[serde(default = "default_ban_depts")]
+    /// Département codes; `["all"]` or empty list = whole of France (default).
+    #[serde(default)]
     pub departments: Vec<String>,
-}
-
-fn default_ban_depts() -> Vec<String> {
-    ban_search::IDF_DEPARTMENTS
-        .iter()
-        .map(|s| (*s).to_string())
-        .collect()
+    /// Download + build the index in the background at startup when
+    /// `index.bin` is missing (default true).
+    #[serde(default = "default_true")]
+    pub auto_download: bool,
 }
 
 impl Default for BanConfigSection {
@@ -49,7 +46,8 @@ impl Default for BanConfigSection {
         Self {
             enabled: true,
             data_dir: PathBuf::new(),
-            departments: default_ban_depts(),
+            departments: Vec::new(),
+            auto_download: true,
         }
     }
 }
@@ -61,6 +59,20 @@ impl BanConfigSection {
             runtime_data_dir.join("ban")
         } else {
             self.data_dir.clone()
+        }
+    }
+
+    /// Department codes for ban-search, where an empty list means "all".
+    /// `["all"]` (or case variants) is normalized to the empty list.
+    pub fn resolved_departments(&self) -> Vec<String> {
+        let all = self
+            .departments
+            .iter()
+            .any(|d| d.eq_ignore_ascii_case("all"));
+        if all || self.departments.is_empty() {
+            Vec::new()
+        } else {
+            self.departments.clone()
         }
     }
 }

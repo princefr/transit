@@ -10,7 +10,10 @@ CSV dumps: `https://adresse.data.gouv.fr/data/ban/adresses/latest/csv/adresses-{
 From the `transit` workspace root:
 
 ```bash
-# Île-de-France (default departments)
+# Whole of France (~102 départements, ~25M addresses, needs ~2GB RAM)
+make ban-index-fr
+
+# Île-de-France only
 make ban-index
 
 # Paris only (faster)
@@ -27,13 +30,24 @@ cargo run -p ban-search --bin ban-index -- \
   --data-dir ./data/ban --download --build
 
 cargo run -p ban-search --bin ban-index -- \
-  --data-dir ./data/ban --suggest "bd haussmann"
+  --data-dir ./data/ban --all --download --build   # all France
+cargo run -p ban-search --bin ban-index -- \
+  --data-dir ./data/ban --dept 75,92 --download --build
+
+# Benchmark suggest latency against data/ban/index.bin
+make ban-bench
 ```
 
 Produces:
 
 - `data/ban/csv/adresses-XX.csv` — raw département dumps  
 - `data/ban/index.bin` — bincode snapshot loaded by the transit API at startup  
+
+The transit server also **auto-provisions** at startup: when `[ban] enabled`
+and `index.bin` is missing (`[ban] auto_download = true`, the default), it
+downloads the configured départements (`departments = ["all"]` = whole of
+France) and builds the index in the background, then hot-swaps it into the
+running API — no restart needed.
 
 ## Library
 

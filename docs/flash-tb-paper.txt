@@ -1,0 +1,2693 @@
+FLASH-TB: Integrating Arc-Flags and Trip-Based
+Public Transit Routing
+Ernestine Großmann # 
+Heidelberg University, Heidelberg, Germany
+
+Jonas Sauer1 # 
+University of Bonn, Bonn, Germany
+
+Christian Schulz # 
+Heidelberg University, Heidelberg, Germany
+
+Patrick Steil # 
+
+arXiv:2312.13146v4 [cs.DS] 9 Oct 2025
+
+Karlsruhe Institute of Technology, Karlsruhe, Germany
+
+Sascha Witt # 
+Karlsruhe Institute of Technology, Karlsruhe, Germany
+
+Abstract
+We present FLASH-TB, a journey planning algorithm for public transit networks that combines
+Trip-Based Public Transit Routing (TB) with the Arc-Flags speedup technique. The basic idea
+is simple: The network is partitioned into a configurable number of cells. For each cell and each
+possible transfer between two vehicles, the algorithm precomputes a flag that indicates whether
+the transfer is required to reach the cell. During a query, only flagged transfers are explored. Our
+algorithm improves upon previous attempts to apply Arc-Flags to public transit networks, which
+saw limited success due to conflicting rules for pruning the search space. We show that these rules
+can be reconciled while still producing correct results. Because the number of cells is configurable,
+FLASH-TB offers a tradeoff between query time and memory consumption. It is significantly
+more space-efficient than existing techniques with a comparable preprocessing time, which store
+generalized shortest-path trees: to match their query performance, it requires up to two orders of
+magnitude less memory. The fastest configuration of FLASH-TB achieves a speedup of more than
+two orders of magnitude over TB, offering sub-millisecond query times even on large countrywide
+networks.
+2012 ACM Subject Classification Theory of computation → Shortest paths; Mathematics of
+computing → Graph algorithms; Applied computing → Transportation
+Keywords and phrases Public transit routing; graph algorithms; algorithm engineering
+Related Version This publication is partially based on an extended abstract that appeared at
+the 21st International Symposium on Experimental Algorithms [16].
+Supplementary Material Software (Code): https://github.com/TransitRouting/FLASH-TB
+Acknowledgements We thank Patrick Brosi for providing us with the Germany dataset. We also
+thank our anonymous reviewers for their extensive feedback, which allowed us to identify and fix
+critical flaws in the proofs. This publication is partially based on an extended abstract that appeared
+at the 21st International Symposium on Experimental Algorithms [16].
+
+1
+
+Introduction
+
+Journey-planning applications that provide real-time routing information have become a part
+of our daily lives. To allow for interactive use, the employed routing algorithms must be very
+
+1
+
+Corresponding author
+
+2
+
+FLASH-TB: Integrating Arc-Flags and Trip-Based Public Transit Routing
+
+fast. Although Dijkstra’s algorithm [14] finds shortest paths in quasi-linear time, it still takes
+several seconds on continental-sized networks. Practical applications therefore rely on speedup
+techniques, which compute auxiliary data in a preprocessing phase to accelerate the query
+phase. For road networks, many speedup techniques have been developed in recent decades [3].
+These achieve sub-millisecond query times with only moderate preprocessing time and space
+consumption. For public transit networks, the situation is less satisfactory. Although some
+techniques offer sub-millisecond query times on networks representing large countries, these
+require auxiliary data in the tens to hundreds of gigabytes. This discrepancy has been
+explained by the fact that road networks exhibit beneficial structural properties that are less
+pronounced in public transit networks [1]. Another challenge is that passengers typically
+consider multiple criteria when choosing between journeys. Therefore, most algorithms
+Pareto-optimize at least two criteria: the arrival time and the number of used trips. This
+increases the solution size and thereby slows down the algorithms even further. For these
+reasons, a speedup technique that achieves very low query times with a moderate amount of
+precomputed data has remained elusive.
+
+1.1
+
+Related Work
+
+For this work, we consider public transit journey planning algorithms that Pareto-optimize
+arrival time and number of trips. For a more general overview, we refer to a survey by [3].
+Classical approaches model the public transit timetable as a graph and apply a multicriteria
+variant of Dijkstra’s algorithm [20, 15]. In the time-dependent graph model [9, 21], nodes
+represent stops in the network and edges are weighted with functions that map departure
+time to arrival time. This yields a compact graph but requires a time-dependent version of
+Dijkstra’s algorithm. By contrast, the time-expanded model [20, 21] introduces nodes for
+each event in the timetable (e.g., a vehicle arriving at or departing from a stop). Edges
+connect consecutive events of the same trip and events between which a transfer is possible.
+This results in a larger graph, but Dijkstra’s algorithm can be applied directly.
+Graph-based models can be combined with speedup techniques for Dijkstra’s algorithm. A
+notable example is Arc-Flags [17, 18, 19], which partitions the graph into cells and computes
+a boolean flag for each combination of edge and cell. The flag indicates whether the edge
+is required to reach the cell. Arc-Flags has been applied to both time-dependent [8] and
+time-expanded [12] graphs, although only the arrival time was optimized in the latter case.
+However, this has only produced speedups of 3–4, compared to over 5 000 [3] for road
+networks.
+More recent algorithms do not model the timetable as a graph. Instead, they use
+tailor-made data structures that allow for cache-efficient queries. Notable examples are
+RAPTOR [13] and Trip-Based Routing (TB) [24]. The latter employs a lightweight preprocessing phase that computes relevant transfers between pairs of trips. This yields query times
+below 100 ms, even on large networks, significantly improving upon graph-based techniques.
+Algorithms that offer query times in the sub-millisecond range do so by precomputing auxiliary data whose size is quadratic in the size of the network. Public Transit Labeling (PTL) [11]
+adapts the ideas of Hub Labeling [10] to time-expanded graphs. On metropolitan networks,
+PTL achieves query times of a few microseconds but requires tens of gigabytes of space.
+Additional space in the hundreds of gigabytes would be required to support journey unpacking,
+i.e., retrieving full descriptions of the optimal journeys. Transfer Patterns (TP) [2] is a
+technique that, in its most basic form, answers all possible queries during the preprocessing
+phase. The journey descriptions are then condensed into transfer patterns, i.e., sequences of
+stops at which transfers between vehicles occur. This yields a search graph for each possible
+
+E. Großmann, J. Sauer, C. Schulz, P. Steil and S. Witt
+
+source stop, which is explored during the query phase. On the network of Germany, TP
+answers queries in less than 1 ms but requires hundreds of hours of preprocessing time and
+over 100 GB of space [4].
+To make the preprocessing phase more practical, [2] split the transfer patterns into global
+components between a small set of important hub stations and local components that lead
+to and from the hub stations. This significantly reduces the memory consumption, but the
+preprocessing time is improved only when applying a heuristic that causes a small percentage
+of queries to be answered incorrectly. A similar approach that answers all queries correctly is
+Scalable Transfer Patterns [4], which employs graph clustering to split the patterns into local
+and global components. However, when these are recombined during a query, the search
+space increases drastically. Thus, the resulting query times are only barely competitive with
+TB. Trip-Based Routing Using Condensed Search Trees (TB-CST) [25] re-engineers the
+ideas of TP with a faster, TB-based preprocessing algorithm. To save space, shared suffixes
+are extracted from the search graphs and re-attached by the query algorithm. TB-CST
+offers faster query times than TP on country-scale networks, although it is less successful on
+metropolitan areas.
+
+1.2
+
+Contribution
+
+We present FLASH-TB (TB with FLAgged SHortcuts), a speedup technique for TB that
+exceeds the query performance of TP and TB-CST with a much smaller memory footprint.
+Like those techniques, FLASH-TB answers all possible queries in advance, but it condenses
+the journey descriptions in a different manner. Instead of computing transfer patterns,
+FLASH-TB stores and annotates the individual transfers. The simplest variant stores a flag
+for every combination of transfer and target stop pt that indicates whether the transfer is
+needed to reach pt . Because transfers connect events rather than stops, this approach retains
+fine-grained information that is lost in the transfer patterns. The memory consumption can
+be reduced by leveraging Arc-Flags: the stops are partitioned into k cells and a combined
+flag is stored for each pair of transfer and target cell. Thus, FLASH-TB is conceptually
+simpler than previous space-saving techniques for TP. Furthermore, because k is configurable,
+it offers a tradeoff between query performance and space consumption.
+Our approach is similar to applying Arc-Flags to the time-expanded graph, but there are
+crucial differences that allow it to overcome the issues observed by [12]. In particular, we
+observe that the low speedups that were previously reported are caused by a conflict between
+different pruning rules in the preprocessing and query phases. We resolve this conflict with
+a redesigned preprocessing step and show that this vastly reduces the search space. We
+perform an experimental evaluation on four real-world datasets representing metropolitan and
+country-scale public transit networks. With less than 1 GB of precomputed data, FLASH-TB
+achieves query times of 500 µs on the network of Germany and well below 100 µs on smaller
+country-scale networks. This corresponds to a speedup of two orders of magnitude over TB.
+The metropolitan network of Paris requires 8 GB to achieve a similar speedup. When allowed
+to use as much space as TB-CST, FLASH-TB is faster by a factor of two to nine.
+
+1.3
+
+Outline
+
+This paper is structured as follows: Section 2 introduces the necessary notation. Section 3
+outlines the algorithms upon which our work is based, including TB, TB-CST, and Arc-Flags.
+In Section 4, we discuss challenges that arise when using TB in the preprocessing step, which
+is done by both TB-CST and FLASH-TB, and how they can be overcome while keeping
+
+3
+
+4
+
+FLASH-TB: Integrating Arc-Flags and Trip-Based Public Transit Routing
+
+the search space small. Based on this, we present FLASH-TB in Section 5 and prove its
+correctness. We discuss similarities and differences to existing speedup techniques in Section 6.
+Section 7 evaluates the performance of FLASH-TB on real-world networks and compares it
+with state-of-the-art algorithms. Finally, we summarize our findings and discuss potential
+areas for future research in Section 8.
+
+2
+
+Preliminaries
+
+Our definitions and notation are partially based on [24] and [7].
+
+2.1
+
+Public Transit Network
+
+A public transit network is a 5-tuple (S, E, T , L, F) consisting of a set of stops S, a set of
+stop events E, a set of trips T , a set of lines L, and a set of footpaths F ⊆ S × S. A stop
+p ∈ S is a location visited by a vehicle at which passengers can embark or disembark. A stop
+event ε ∈ E represents a visit of a vehicle at the stop p(ε) ∈ S with the arrival time τarr (ε)
+and the departure time τdep (ε) ≥ τarr (ε). A trip is a sequence T = ⟨ε0 , ε1 , . . . ⟩ of stop events
+performed by the same vehicle. We denote the i-th stop event of T as T [i] and the number
+of stop events in T as |T |. The stop sequence of T is given by ⟨p(ε0 ), p(ε1 ), . . . ⟩. We say that
+a trip Ta overtakes another trip Tb with the same stop sequence if τarr (Ta [0]) ≥ τarr (Tb [0])
+and if there is an index i such that τarr (Ta [i]) ≤ τarr (Tb [i]) or τdep (Ta [i]) ≤ τdep (Tb [i]). A
+line L ∈ L is a set of trips with the same stop sequence such that no trip overtakes another.
+Every trip T is included in exactly one line, which is denoted by L(T ). We define a total
+order on trips Ta , Tb of the same line L(Ta ) = L(Tb ):
+Ta ≺ Tb ⇐⇒ τarr (Ta [0]) < τarr (Tb [0]),
+Ta ⪯ Tb ⇐⇒ Ta = Tb ∨ Ta ≺ Tb .
+If Ta ≺ Tb , it follows from the non-overtaking property that τarr (Ta [i]) < τarr (Tb [i]) and
+τdep (Ta [i]) < τdep (Tb [i]) for 0 ≤ i < |T |. Furthermore, if two trips with the same stop
+sequence have the same arrival or departure time at any point along the sequence, our
+definition of overtaking forces them to be in different lines. For a trip T , its predecessor
+according to ≺ is denoted by pred (T ). If T is the first trip of its line, we write pred (T ) = ⊥.
+A partial order of stop events Ta [i], Tb [j] is given by
+Ta [i] ⪯ Tb [j] ⇐⇒ L(Ta ) = L(Tb ) ∧ Ta ⪯ Tb ∧ i ≤ j,
+Ta [i] ≺ Tb [j] ⇐⇒ Ta [i] ⪯ Tb [j] ∧ (Ta ≺ Tb ∨ i < j).
+A footpath (p, q) ∈ F allows passengers to transfer between stops p and q, which requires
+the time ∆τfp (p, q). If no footpath between p and q exists, we define ∆τfp (p, q) = ∞. For
+each stop p ∈ S, we require that a footpath (p, p) ∈ F exists with ∆τfp (p, p) = 0; we call
+this an empty footpath. We require that the set of footpaths is transitively closed and fulfills
+the triangle inequality, i.e., if there are stops p, q, r ∈ S with (p, q) ∈ F and (q, r) ∈ F, then
+there must be a footpath (p, r) ∈ F with ∆τfp (p, r) ≤ ∆τfp (p, q) + ∆τfp (q, r).
+
+2.2
+
+Journeys
+
+A trip segment T [i, j] is the subsequence of the trip T between the two stop events T [i] and
+T [j]. A transfer is a tuple (Ta [i], Tb [j]) ∈ E × E with τarr (Ta [i]) + ∆τfp (p(Ta [i]), p(Tb [j])) ≤
+τdep (Tb [j]). It represents a passenger changing from trip Ta to Tb at the respective stop events.
+
+E. Großmann, J. Sauer, C. Schulz, P. Steil and S. Witt
+
+For a source stop ps and target stop pt , a ps -pt -journey J = ⟨f0 , T1 [i1 , j1 ], . . . , Tk [ik , jk ], fk+1 ⟩
+is a sequence of trip segments such that a transfer connects every pair of consecutive trip
+segments. In addition, the journey contains the initial footpath f0 = (ps , p(T1 [i1 ])) ∈ F, which
+connects ps to the first trip, and the final footpath fk+1 = (p(Tk [jk ]), pt ) ∈ F connecting
+the last trip to pt . For the sake of brevity, we omit empty footpaths from the notation.
+We denote the source stop of J by ps (J) and the target stop by pt (J). The number of
+trips used by J is denoted as |J| = k. The arrival time of J at pt is given by τarr (J) =
+τarr (Tk [jk ]) + ∆τfp (p(Tk [jk ]), pt ). The departure time of J is the latest possible departure
+time at ps such that T1 can still be entered, i.e., τdep (J) = τdep (T1 [i1 ]) − ∆τfp (ps , p(T1 [i1 ])).
+The stop sequence S(J) of J is obtained by removing every stop from the sequence
+e
+S(J)
+= ⟨ps , p(T1 [i1 ]), p(T1 [j1 ]), . . . , p(Tk [ik ]), p(Tk [jk ]), pt ⟩ that is identical to its predecessor.
+Note that if a stop p appears twice in S(J), then there is a corresponding journey J ′ that
+waits at p instead of taking the loop. For the criteria considered in this work (arrival time
+and number of trips), J ′ is always preferable to J. Hence, we assume throughout this
+work that each stop in S(J) appears only once. For two stops p, q ∈ S(J), the subjourney
+J[p, q] is the p-q-journey whose trip segments form a subsequence of J. A partial journey
+Jp = ⟨f0 , T1 [i1 , j1 ], . . . , Tk [ik , jk ], Tk+1 [ik+1 ]⟩ differs from a journey in that the final footpath
+is replaced by a transfer to the target event εt (Jp ) = Tk+1 [ik+1 ]. The trip Tk+1 , which is
+entered but not exited, is still counted as a used trip, i.e., |Jp | = k + 1.
+We define three types of prefixes of a journey J = ⟨f0 , T1 [i1 , j1 ], . . . , Tk [ik , jk ], fk+1 ⟩:
+For 0 < ℓ ≤ k, the ps -p(Tℓ [jℓ ])-journey ⟨f0 , T1 [i1 , j1 ], . . . , Tℓ [iℓ , jℓ ]⟩ is an exit prefix.
+For 1 ≤ ℓ < k, the ps -p(Tℓ+1 [iℓ+1 ])-journey ⟨f0 , T1 [i1 , j1 ], . . . , Tℓ [iℓ , jℓ ], fℓ+1 ⟩ with final
+footpath fℓ+1 = (p(Tℓ [jℓ ]), p(Tℓ+1 [iℓ+1 ])) ∈ F is a footpath prefix. For ℓ = 0, the ps p(T1 [i1 ])-journey ⟨f0 ⟩ is also a footpath prefix.
+For 0 ≤ ℓ < k, the partial journey ⟨f0 , T1 [i1 , j1 ], . . . , Tℓ [iℓ , jℓ ], Tℓ+1 [iℓ+1 ]⟩ is called a partial
+prefix.
+Exit and footpath prefixes are called proper prefixes to distinguish them from the partial
+prefix.
+
+2.3
+
+Journey Planning Problem
+
+A query Q = (ps , pt , τdep ) consists of source and target stops ps , pt ∈ S and a departure
+time τdep . The set J (Q) of feasible journeys for Q consists of all ps -pt -journeys J with
+τdep (J) ≥ τdep . A partial query Qp = (ps , εt , τdep ) has a target event εt ∈ E instead of a
+target stop. The set Jp (Qp ) of feasible partial journeys consists of all partial ps -ε′t -journeys
+Jp with τdep (Jp ) ≥ τdep and ε′t ⪯ εt .
+Let J denote a set of feasible (partial) journeys. A cost function c : J → C maps (partial)
+journeys to a cost space C. A (2D) cost system C = ((c1 , ⪯1 ), (c2 , ⪯2 )) is formed by cost
+functions c1 : J → C1 and c2 : J → C2 with partial orders ⪯1 , ⪯2 on C1 and C2 , respectively.
+The cost vector of a (partial) journey J is the tuple c(J) = (c1 (J), c2 (J)) in the 2D cost
+space C1 × C2 . We call J a representative of c(J). Two (partial) journeys J, J ′ are equivalent
+if c(J) = c(J ′ ). The dominance relation of C is a partial order on C1 × C2 that is defined as
+follows for cost vectors c = (c1 , c2 ) and c′ = (c′1 , c′2 ):
+c ⪯ c′ ⇐⇒ c1 ⪯1 c′1 ∧ c2 ⪯2 c′2 ,
+c ≺ c′ ⇐⇒ c ⪯ c′ ∧ c ̸= c′ .
+We say that c weakly dominates c′ if c ⪯ c′ and c strictly dominates c′ if c ≺ c′ . The
+dominance relation carries over to (partial) journeys: we say J weakly dominates J ′ (J ⪯ J ′ )
+
+5
+
+6
+
+FLASH-TB: Integrating Arc-Flags and Trip-Based Public Transit Routing
+
+if c(J) ⪯ c(J ′ ) and J strictly dominates J ′ (J ≺ J ′ ) if c(J) ≺ c(J ′ ). A (partial) journey
+J ∈ J and its cost vector c(J) are called Pareto-optimal if there is no (partial) journey
+J ′ ∈ J with c(J ′ ) ≺ c(J). The Pareto front is the set of all cost vectors c(J) for J ∈ J such
+that c(J) is Pareto-optimal. A representative set is a subset of J that consists of exactly
+one representative for every Pareto-optimal cost vector. This set is not necessarily unique
+because there may be multiple representatives for the same cost vector. Note that journeys
+with a non-empty final footpath may dominate journeys with an empty final footpath; this
+requires that the footpath set is transitively closed.
+Unless otherwise noted, we use the cost system C = ((τarr , ≤), (|·| , ≤)) to evaluate
+journeys and Cp = ((εt , ⪯), (|·| , ≤)) to evaluate partial journeys. A journey is Pareto-optimal
+for a query Q = (ps , pt , τdep ) if it is Pareto-optimal among the feasible journeys J (Q).
+Likewise, a partial journey is Pareto-optimal for a partial query Qp = (ps , εt , τdep ) if it
+is Pareto-optimal among the feasible partial journeys Jp (Qp ). We call J exit-optimal for
+Q if every exit prefix J ′ of J is Pareto-optimal for the query (ps , pt (J ′ ), τdep ). We call
+J prefix-optimal if every proper prefix J ′ is Pareto-optimal for (ps , pt (J ′ ), τdep ) and every
+partial prefix Jp for (ps , εt (Jp ), τdep ).
+We consider several variants of the journey planning problem in a public transit network
+(S, E, T , L, F). Given a query Q = (ps , pt , τdep ), the (one-to-one) fixed departure time problem
+asks for the Pareto front (according to C) and a representative set. For the profile problem,
+we are given an interval [τ1 , τ2 ] , τ1 ≤ τ2 of possible departure times in addition to ps and pt .
+Here, the objective is to find the union of the Pareto fronts for each query (ps , pt , τ) with
+τ ∈ [τ1 , τ2 ], as well as a representative for each Pareto-optimal cost vector. In the full-range
+profile problem, the departure time interval spans the entire service duration of the network.
+In an one-to-all query, no target stop is given. Instead, the objective is to solve the fixed
+departure time or profile problem for every possible target stop pt ∈ S. Finally, an all-to-all
+query asks for a solution to the journey planning problem for each possible pair of source
+and target stops.
+
+2.4
+
+Graph
+
+A directed, weighted graph G = (V, E, c) consists of a set of nodes V , a set of edges E ⊆ V ×V ,
+and an edge weight function c : E → R. A path P = ⟨v1 , v2 , . . . , vk ⟩ is a sequence of nodes
+between v1 and vk such that an edge connects each pair of consecutive nodes. The weight of
+a path is the sum of the weights of all edges in the path. A path P = ⟨vs , . . . , vt ⟩ between a
+source node vs and a target node vt is called a shortest path if there is no path between vs
+and vt with a smaller weight.
+Given a value k ∈ N and a graph G = (V, E, c), a (k-way) partition of G is a function
+r : V → {1, . . . , k} that partitions the node set V into k cells. The set of nodes in cell i
+is denoted as Vi := r−1 (i). An edge (u, v) ∈ E is called a cut edge if u and v belong to
+different cells. A node is called a boundary node if it is incident to a cut edge. The partition
+is called balanced for an imbalance parameter ε > 0 if the size of each cell Vi is bounded by
+|Vi | ≤ (1 + ε) ⌈|V | /k⌉. The graph partitioning problem asks for a balanced partition that
+minimizes the weighted sum of all cut edges.
+
+3
+
+Basic Algorithms
+
+In this section, we discuss the algorithms upon which our work is based. We outline the
+basic TB algorithm in Section 3.1, extensions for profile and one-to-all search in Section 3.2,
+the TB-CST speedup technique in Section 3.3, and Arc-Flags in Section 3.4.
+
+E. Großmann, J. Sauer, C. Schulz, P. Steil and S. Witt
+
+Algorithm 1 TB trip scanning operation (for target stop pt ).
+
+Procedure Scan(n, τmin )
+2
+Qn+1 ← ∅
+3
+for each T [j, k] ∈ Qn do
+4
+for i from j to k do
+5
+if τarr (T [i]) ≥ τmin then break
+// target pruning
+6
+if τarr (T [i]) + ∆τfp (p(T [i]), pt ) < τmin then
+// create cost vector
+7
+τmin ← τarr (T [i]) + ∆τfp (p(T [i]), pt )
+8
+P ← P ∪ {(τmin , n)}, removing dominated entries
+9
+for each T [j, k] ∈ Qn do
+10
+for i from j to k do
+11
+if τarr (T [i]) ≥ τmin then break
+// target pruning
+12
+for each (T [i], T ′ [i′ ]) ∈ T do
+// scan transfers
+13
+Enqueue (T ′ , i′ + 1, n + 1)
+1
+
+3.1
+
+Trip-Based Routing
+
+The TB [24] algorithm is split into two phases: a precomputation step generates a set
+T ⊆ E × E of transfers between stop events, which is used in the query phase.
+Transfer Precomputation. The preprocessing step begins by generating possible transfers
+between pairs of stop events. Then, pruning rules are applied to discard some transfers
+that are not required to answer queries. These pruning rules are not exhaustive, so T may
+still contain transfers that do not occur in any Pareto-optimal journey. The generation
+step creates all transfers t = (Ta [i], Tb [j]) with i > 0, j < |Tb | − 1 and Ta [i] ̸⪯ Tb [j] such
+that Tb is the earliest trip of its line that can be entered at p(Tb [j]) when arriving at
+τarr (Ta [i]) + ∆τfp (p(Ta [i]), p(Tb [j])). The U-turn reduction rule removes a transfer t =
+(Ta [i], Tb [j]) if p(Ta [i − 1]) = p(Tb [j + 1]) and τarr (Ta [i − 1]) ≤ τarr (Tb [j + 1]). A second
+reduction rule, which we call the latest-exit rule, removes transfers that can be replaced with
+another transfer from the same trip. For every journey of the form J = ⟨Ta [k, i], Tb [j, ℓ]⟩
+that uses the transfer t, the algorithm checks whether there is a journey of the form
+J ′ = ⟨Ta [k, i′ ], Tc [j ′ , ℓ′ ], f ⟩ with i < i′ , f = (p(Tc [ℓ′ ]), p(Tb [ℓ])) and J ′ ⪯ J. Note that J ′ is
+required to start with the same trip as J and must exit it at a later stop event. This means
+that many possible journeys that might dominate J are not considered.
+Query Algorithm. The TB query algorithm resembles a breadth-first search on a graph
+with the trips as nodes and the precomputed transfers as edges. The algorithm tracks which
+parts of the network have already been explored by maintaining a reached index R (T ) for
+each trip T . This is the index of the first reached stop event of T , or |T | if none have been
+reached yet. Additionally, the algorithm maintains the Pareto front P among the cost vectors
+of all journeys to pt found so far. The search operates in rounds, where round n finds the
+journeys in the representative set with n trips. Each round n maintains a first-in-first-out
+(FIFO) queue Qn of newly reached trip segments, which are scanned during the round.
+Before the first round, the queue Q1 is filled by examining the lines that visit the source
+stop ps or a stop that is reachable from ps with an initial footpath. For each line visiting
+a reachable stop p with index i, the algorithm identifies the earliest trip T of the line that
+can be entered at p when arriving there at τdep + ∆τfp (ps , p). The Enqueue operation is
+
+7
+
+8
+
+FLASH-TB: Integrating Arc-Flags and Trip-Based Public Transit Routing
+
+Algorithm 2 TB enqueuing operation.
+
+Procedure Enqueue(T, j, n)
+if R (T ) ≤ j then return
+3
+Qn ← Qn ∪ {T [j, R(T ) − 1]}
+4
+for each T ′ ⪰ T do
+5
+if R (T ′ ) ≤ j then break
+6
+R (T ′ ) ← j
+1
+2
+
+// trip segment already reached
+// update reached index
+
+then called to test whether a new trip segment starting at T [i + 1] needs to be enqueued.
+Algorithm 2 depicts the Enqueue operation of a stop event T [j]. If j < R(T ), then the trip
+segment T [j, R(T ) − 1] is added to the queue for the next round. Additionally, for every
+succeeding trip T ′ ⪰ T of the same line, the reached index R (T ′ ) is set to min (R(T ′ ), j).
+This ensures that the search only enters the earliest reachable trip of each line, a principle
+we call line pruning.
+Pseudocode for the trip scanning operation is given in Algorithm 1. It omits steps that
+are needed to retrieve the representative set of journeys; these are discussed below. A trip
+segment T [j, k] is scanned by iterating over the stop events T [i] with j ≤ i ≤ k. For each stop
+event T [i], the loop in lines 4–8 creates a new journey J by exiting the trip and (if necessary)
+taking a final footpath to pt . To discard dominated journeys, the algorithm maintains the
+earliest arrival time τmin at the target stop found so far. If J arrives at or after τmin , then
+it is weakly dominated by another journey, so it is discarded. Otherwise, the cost vector
+c(J) is added to the Pareto front P, dominated cost vectors are removed, and τmin is set to
+τarr (J). If the arrival time of T [i] is not earlier than τmin , then all following stop events can
+be skipped because they cannot be extended to journeys that improve τmin (see line 5). This
+principle is known as target pruning. The loop in lines 10–13 scans the outgoing transfers of
+T [i] to find newly reachable trip segments. Again, target pruning is applied in line 11. A
+transfer (T [i], T ′ [i′ ]) ∈ T is scanned by calling the Enqueue operation for T ′ [i′ + 1].
+Note that Algorithm 1 loops over the trip segments in Qn twice: once to create cost
+vectors and update τmin , and then again to scan transfers. Using two loops instead of one
+improves the cache efficiency [24]. It also makes the target pruning check in line 11 more
+effective because the value of τmin is final for this round after this first loop.
+
+Journey Unpacking. As presented thus far, the query algorithm only computes the Pareto
+front P. To retrieve the representative set of journeys, the trip segments in the FIFO queues
+and the cost vectors additionally store parent pointers. For each trip segment Tn [jn , kn ] inside
+a queue Qn , the algorithm stores a pointer to the preceding trip segment Tn−1 [jn−1 , kn−1 ],
+which is located in the previous queue Qn−1 . Additionally, it stores the index in−1 with
+jn−1 ≤ in−1 ≤ kn−1 at which Tn−1 is exited when the transfer (Tn−1 [in−1 ], Tn [jn − 1]) is
+used. These two values are set during the Enqueue operation for Tn [jn ]. Similarly, each cost
+vector (τ, n) ∈ P is associated with a pointer to the last trip segment of the corresponding
+journey, which is located in Qn , and the index at which the trip segment is exited. Note
+that this scheme requires that the FIFO queue Qn for each round n is kept in memory after
+the round is done, because it will be accessed again during journey unpacking. See [24] for
+details on how to implement the queues efficiently.
+
+E. Großmann, J. Sauer, C. Schulz, P. Steil and S. Witt
+
+3.2
+
+TB Extensions
+
+Profile Search. Profile-TB extends TB to solve the profile problem. It collects all possible
+departure times at ps within the departure time interval [τ1 , τ2 ] and processes them in
+descending order. A departure time τdep is possible if there is a stop event T [i] such that
+τdep +∆τfp (ps , p(T [i])) = τdep (p[i]). For each departure time, a run of the TB query algorithm
+is performed. All data structures, including reached indices, are not reset between runs. This
+exploits the fact that journeys found in a run with departure time τdep are still feasible for all
+departure times before τdep , so they can be used to prune suboptimal results in subsequent
+runs. This principle is called self-pruning. To obtain correct results, the definition of reached
+indices must be modified slightly. For each trip T and each number of trips n, the algorithm
+now maintains a reached index Rn (T ), which is the index of the first stop event in T that
+was reached with n or fewer trips. Whenever Rn (T ) is updated to min(Rn (T ), k) for some
+value k, the same is done for the reached indices Rm (T ) with m ≥ n.
+One-to-All Search. A one-to-all extension of Profile-TB was briefly outlined by [25]. The
+same extension can also be applied to the original TB algorithm for fixed departure time
+queries. We give a more detailed description. The earliest arrival time τmin and the Pareto
+front P are replaced with an earliest arrival time τarr (p, n) for each stop p and number of
+trips n. This is the minimum arrival time among feasible journeys for the query (ps , p, τdep )
+with at most n trips found so far, or ∞ if none have been found (yet). The representative
+set of journeys with target stop p is maintained implicitly: the cost vector (τarr (p, n), n) is
+Pareto-optimal if τarr (p, n) < τarr (p, n − 1), where we define τarr (p, −1) = ∞ for the sake of
+simplicity. To unpack the journeys, the algorithm stores a trip segment pointer and exit
+index along with each earliest arrival time τarr (p, n), in the same manner as the one-to-one
+algorithm. As with the reached indices, the profile query does not reset the earliest arrival
+times between runs.
+The trip scanning operation for a round n (cf. Algorithm 1) is modified as follows: When a
+stop event T [k] is scanned during the first loop (lines 3–8), the algorithm iterates over all stops
+p with ∆τfp (p(T [k]), p) < ∞ and computes the arrival time τarr = τarr (T [k])+∆τfp (p(T [k]), p)
+at p. If τarr < τarr (p, n), then τarr (p, m) is set to min(τarr , τarr (p, m)) for all m ≥ n. The
+target pruning rule, which is no longer applicable, is replaced with a local pruning rule:
+When a stop event T [k] is scanned during the second loop (lines 9–13), the algorithm checks
+whether τarr (T [k]) > τarr (p(T [k]), n). If so, the outgoing transfers of T [k] are not scanned.
+Similar rules are also employed in other algorithms, such as RAPTOR [13].
+
+3.3
+
+Condensed Search Trees
+
+Trip-Based Routing Using Condensed Search Trees (TB-CST) [25] uses TB to precompute
+search graphs in a similar manner to TP. The preprocessing phase solves the all-to-all
+full-range profile problem by running one-to-all Profile-TB from every stop. Consider the
+Profile-TB search for a source stop ps . After each TB run, all newly found representative
+journeys are unpacked. This yields a breadth-first search tree with ps as the root, trip
+segments as inner nodes, the reached target stops as leaves, and footpaths and transfers as
+edges. The search trees of all runs are combined into the prefix tree of ps . Here, each trip
+segment T [i, j] is replaced with a tuple (L(T ), i) consisting of the corresponding line L(T )
+and the stop index i where the line is entered.
+To answer a query (ps , pt , τdep ), TB-CST builds a query graph from the prefix tree of ps by
+extracting all paths that lead to a leaf representing pt . Then a variant of Dijkstra’s algorithm
+
+9
+
+10
+
+FLASH-TB: Integrating Arc-Flags and Trip-Based Public Transit Routing
+
+is run on the query graph. Because the prefix tree only provides information about lines, the
+used trips are reconstructed during the query. When exploring an edge from ps to a tuple
+(L, i), the algorithm computes the earliest trip of L that can be entered at the i-th stop. When
+exploring an edge between tuples (L, i) and (L′ , j), the used trip T of L is already known, so the
+algorithm scans the outgoing transfers of T [i] in T to find the earliest reachable trip T ′ of L′ .
+The space required to store all prefix trees can be reduced by extracting postfix trees.
+Consider the prefix tree for a source stop ps . For each path from the root to a leaf representing
+a target stop pt , a cut node is chosen. The subpath from the cut node to the leaf is then
+removed from the prefix tree of ps and added to the postfix tree of pt . Because many of these
+extracted subpaths occur in multiple prefix trees, moving them into a shared postfix tree
+considerably reduces memory consumption. To construct the query graph for a source stop
+ps and target stop pt , the prefix tree ps and the postfix tree of pt are spliced back together
+at the cut nodes.
+
+3.4
+
+Arc-Flags
+
+Arc-Flags [17, 18, 19] is a speedup technique for Dijkstra’s algorithm in road networks. Given
+a weighted graph G = (V, E, c), the preprocessing phase of Arc-Flags performs two steps:
+First, it computes a partition r : V → {1, . . . , k} of the node set into k cells, where k is a
+freely chosen parameter. Then, a flags function b : E × {1, . . . , k} → {0, 1} is computed. For
+an edge e and a cell i, the value b(e, i) is called a flag, and we say that e is flagged for cell i if
+b(e, i) = 1. The flags function must have the following property: for each pair of source node
+vs and target node vt , there is at least one shortest path P from vs to vt such that every edge
+e along P is flagged for the cell r(vt ) containing the target node. With this precomputed
+information, a shortest path query between vs and vt can be answered by running Dijkstra’s
+algorithm but only scanning edges that are flagged for r(vt ). The parameter k imposes a
+tradeoff between query speed and memory consumption. The space required to store the
+flags is in Θ (k |E|), which is manageable for k ≪ |V |. On the other hand, the search space
+of the query decreases for larger values of k because fewer edges will be flagged if the target
+cell is smaller.
+Flags can be computed naively by computing a shortest-path tree from every node. This
+can be improved by exploiting the observation that every shortest path that leads into a
+cell i must pass through a boundary node of i. Thus, it is sufficient to compute backward
+shortest-path trees from all boundary nodes. For more details, we refer to [17].
+
+4
+
+Precomputing Auxiliary Data with TB
+
+TB-CST precomputes its auxiliary data by solving the all-to-all full-range profile problem with
+Profile-TB. Our own approach, which we present in Section 5, uses the same precomputation
+scheme but extracts a different set of data from the computed journeys. In this section, we
+discuss challenges that arise when using Profile-TB for this computation and how they can
+be overcome.
+
+4.1
+
+Issues
+
+If one-to-all TB with local pruning (see Section 3.2) is combined with the original TB transfer
+precomputation, it may answer some queries incorrectly. This is because local pruning
+is incompatible with the latest-exit reduction rule employed by the preprocessing. Local
+pruning ensures that the journeys found by one-to-all TB are exit-optimal, i.e., a trip is only
+
+E. Großmann, J. Sauer, C. Schulz, P. Steil and S. Witt
+
+11
+
+Figure 1 An example network in which local pruning conflicts with the latest-exit rule. Gray
+boxes represent stops. Nodes within the boxes represent stop events and are labeled with their
+indices along the respective trip. Colored edges represent trips, which are labeled with the departure
+and arrival times of the respective stop events. Gray edges represent footpaths (between stops)
+and transfers (between stop events). In this example, it is faster to exit Ta at Ta [1] and take the
+footpath to p(Ta [2]) than to stay seated until Ta [2]. Therefore, local pruning prevents the one-to-all
+TB query from scanning the transfer (Ta [2], Tb [0]). However, the latest-exit rule discards the transfer
+(Ta [1], Tb [0]).
+0 → 10
+Ta
+
+0
+
+10 → 20
+1
+
+20 → 30
+2
+
+3
+2
+
+5
+
+25 → 35
+Tb
+
+0
+
+1
+
+exited if the resulting arrival time at the stop is optimal. By contrast, the latest-exit rule
+prefers journeys that exit a trip at the latest possible stop. As shown in Figure 1, these two
+choices can conflict. In this example, exiting the trip Ta at Ta [1] and walking to p(Ta [2]) is
+faster than exiting at Ta [2]. Therefore, local pruning prevents the transfer (Ta [2], Tb [0]) from
+being scanned. However, the latest-exit rule discards the transfer (Ta [1], Tb [0]) in favor of
+(Ta [2], Tb [0]). As a result, one-to-all TB will not find any journeys from p(Ta [0]) to p(Tb [1]).
+A similar issue can also occur in circle lines that visit the same stop twice. Due to local
+pruning, transfers will only be scanned for the first visit. However, the latest-exit rule will
+only keep the outgoing transfers for the second visit. Note that this issue does not occur in
+one-to-one variants of TB, which do not use local pruning. The TB-CST preprocessing as
+originally implemented by [24] also avoids this issue because it does not apply local pruning.
+Another issue that does occur in TB-CST but previously went unnoticed is caused by
+a conflict between the line pruning rule employed in the query phase and the self-pruning
+rule used by Profile-TB. As discussed in Section 3.3, the query algorithm only explores the
+earliest reachable trip of each line; later trips of the same line are not explored. This creates
+a problem in the example shown in Figure 2. The one-to-all Profile-TB precomputation
+from ps will add an edge from (L(Ta ), 1) to (L(Tc ), 0) to the prefix tree of ps , but due to
+self-pruning, it will not add an edge from (L(Ta ), 1) to (L(Td ), 0). During a query from ps for
+the departure time 0, the algorithm explores the edge from (L(Ta ), 1) to (L(Tc ), 0). However,
+it only searches for outgoing transfers from the earliest reachable trip of the line, which
+is Tb . No corresponding transfer exists and the transfer from the later trip Ta is ignored.
+Hence, the algorithm fails to find any journey to pt . A simple workaround is to disable line
+pruning in the query algorithm: in addition to scanning the outgoing transfers of the earliest
+reachable trip of a line, those of all later trips are scanned as well. In the example from
+Figure 2, this ensures that the transfer (Ta [1], Tc [0]) is scanned and Tc is reached.
+
+4.2
+
+Property-Preserving Transfer Sets
+
+Both issues are caused by the fact that the different phases of the algorithm make inconsistent
+choices between representatives of the same cost vector. Although this can be avoided by
+disabling certain pruning rules, doing so increases the query search space. Instead, we modify
+the transfer generation and profile search phases to make them compatible with each other
+and the query phase.
+To formalize the notion of compatibility, we study whether a transfer set preserves certain
+
+12
+
+FLASH-TB: Integrating Arc-Flags and Trip-Based Public Transit Routing
+
+Figure 2 An example network showing the conflict between line pruning and self-pruning. The
+trips Ta and Tb belong to the same line. For a query from ps to pt with departure time 0, a query
+algorithm with line pruning finds the journey ⟨Tb [0, 1], Td [0, 1]⟩. The later trip Ta is not entered. A
+Profile-TB query, however, only finds the journey ⟨Ta [0, 1], Tc [0, 1]⟩ due to self-pruning.
+ps
+
+5 → 10
+
+0
+
+1
+
+Ta
+
+Tb
+
+pt
+1
+
+Tc
+0→5
+
+0
+
+15 → 20
+
+0
+
+1
+
+10 → 20
+
+0
+
+1
+
+Td
+
+journey properties. For a transfer set T ⊆ E × E and a query Q, let J (Q, T) ⊆ J (Q) denote
+the set of feasible journeys whose transfers are all included in T. Let x denote a property
+of journeys, such as exit optimality. The transfer set T is called x-preserving for Q if there
+exists a representative set JR for Q such that every journey J ∈ JR has the property x
+and is contained in J (Q, T). If T is x-preserving for all possible queries, we simply call it
+x-preserving overall.
+We show that one-to-all TB with local pruning is correct when using an exit-optimalitypreserving (EOP) transfer set. Note that while the set of all possible transfers is EOP, it is
+extremely large and will lead to slow queries. In Section 4.3, we present an algorithm that
+computes a sufficiently small EOP transfer set. First, we show that for each Pareto-optimal
+cost vector, there is an exit-optimal representative whose stop events are all scanned by the
+search. Note that this is not necessarily the journey returned by the algorithm.
+▶ Lemma 1. Let T be a transfer set and J = ⟨f0 , T1 [i1 , j1 ], . . . , Tk [ik , jk ], fk+1 ⟩ ∈ J (Q, T)
+an exit-optimal journey for a query Q = (ps , pt , τdep ). Consider a one-to-all TB search for
+Q using T as the transfer set. For 1 ≤ n ≤ k, round n scans the stop event Tn [jn ].
+Proof. Because the exit prefix ⟨f0 , T1 [i1 , j1 ], . . . , Tn [in , jn ]⟩ is Pareto-optimal, τarr (p(Tn [jn ]), n−
+1) > τarr (p(Tn [jn ]), n) = τarr (Tn [jn ]) must hold after round n. For a trip T , let Rn (T ) denote
+the reached index of T at the start of round n. The trip scanning operation ensures that
+τarr (p(T [i]), n) ≤ τarr (T [i]) holds after round n for every Rn (T ) ≤ i < |T |. Together, this
+implies Rn−1 (Tn ) > jn . Additionally, because τarr (T ′ [jn ]) < τarr (Tn [jn ]) holds for every
+preceding trip T ′ ≺ Tn , it follows that Rn (T ′ ) > jn . Hence, the only way that Rn (Tn ) ≤ jn
+can hold is if round n − 1 adds a trip segment containing Tn [jn ] to Qn and round n scans it.
+We show by induction over n that round n − 1 calls the Enqueue operation (see Algorithm 2)
+for Tn [in + 1]. This ensures that Rn (Tn ) ≤ in + 1 ≤ jn holds afterwards, from which it
+follows that round n scans Tn [jn ].
+Base case (n = 1): Because the exit prefix ⟨f0 , T1 [i1 , j1 ]⟩ is optimal, T1 is the earliest trip
+of its line that can be entered at p(T1 [i1 ]). Hence, round 0 calls the Enqueue operation
+for T1 [i1 + 1].
+Inductive step (n → n + 1): Because the exit prefix ⟨f0 , T1 [i1 , j1 ], . . . , Tn [in , jn ]⟩ is optimal, it follows that τarr (p(Tn [jn ]), n) ≥ τarr (Tn [jn ]). Hence, the trip scanning operation of round n does not apply local pruning at Tn [jn ]. When the outgoing transfer
+(Tn [jn ], Tn+1 [in+1 ]) ∈ T is scanned, the Enqueue operation is called for Tn+1 [in+1 + 1].
+◀
+From this, it follows that one-to-all TB computes the Pareto front.
+
+E. Großmann, J. Sauer, C. Schulz, P. Steil and S. Witt
+
+▶ Theorem 2. Let T be an EOP transfer set for a query Q = (ps , pt , τdep ). A one-to-all TB
+search for Q using T as the transfer set computes the Pareto front.
+Proof. Because T is EOP for Q, there is a representative set JR ⊆ J (Q, T) of exit-optimal
+journeys. Consider a journey J ∈ JR with |J| = k. For 1 ≤ n ≤ k, let Tn [in , jn ] denote
+the n-th trip segment of J. By Lemma 1, round n of the one-to-all TB search scans the
+stop event Tn [jn ]. When the outgoing footpaths of Tk [jk ] are scanned, it ensures that
+τarr (pt , k) = τarr (J).
+◀
+▶ Corollary 3. Let T be an EOP transfer set for a query Q = (ps , pt , τdep ). A one-to-one
+TB search for Q using T as the transfer set computes the Pareto front.
+Proof. Analogous to Theorem 2. Note that the inductive step in Lemma 1 still holds for
+one-to-one TB because it does not apply local pruning.
+◀
+Theorem 2 carries over in a straightforward manner to one-to-all Profile-TB. However, it
+only makes a claim about the Pareto front, not the computed representative set of journeys.
+Even with an EOP transfer set, the journeys computed by one-to-all Profile-TB are not
+necessarily exit-optimal. This is due to the self-pruning rule, as outlined in Section 4.1.
+
+4.3
+
+Transitive ULTRA
+
+An alternative transfer generation algorithm for TB was previously presented in the context
+of multimodal journey planning. Here, the transitively closed set of footpaths is replaced with
+an unrestricted transfer graph that may represent one or several road-based transportation
+modes. ULTRA (UnLimited TRAnsfers) [7] is a technique that enables TB to handle
+multimodal networks by condensing the transfer graph into a set of edges between pairs of
+stop events, i.e., a transfer set. The method for generating this transfer set is substantially
+different from the TB transfer precomputation and does not employ the latest-exit rule. We
+propose Trans-ULTRA, a variant of ULTRA for transitively closed footpaths. We show
+that the computed transfer set preserves a journey property called canonicity, which is
+stronger than exit optimality. Because Trans-ULTRA is identical to ULTRA expect for minor
+differences in the exploration of footpaths, we only give details that are necessary to prove
+the canonicity-preserving property. For a full overview of ULTRA, including algorithmic
+details and the original proofs, we refer to [7].
+Canonical Journeys. We call a journey with exactly two trips and empty initial and
+final footpaths a candidate. For example, the candidates contained in the journey J =
+⟨f0 , T1 [i1 , j1 ], . . . , Tk [ik , jk ], fk+1 ⟩ are ⟨Tℓ [iℓ , jℓ ], Tℓ+1 [iℓ+1 , jℓ+1 ]⟩ for 1 ≤ ℓ < k. ULTRA
+exploits the observation that a set of transfers that is sufficient for answering all queries can
+be found by only inspecting candidates. Formally, the set of transfers that occur in at least
+one Pareto-optimal candidate for at least one possible query is Pareto-optimality-preserving.
+However, this set is unnecessarily large: it covers all Pareto-optimal journeys, but one
+representative for every Pareto-optimal cost vector is sufficient.
+To choose the representative, ULTRA defines a unique tiebreaking sequence for each
+journey. For Trans-ULTRA, we modify this sequence slightly to account for the fact that
+footpaths consist of single edges. Let idL : L → N and idS : S → N be total orderings on
+the sets of lines and stops. Let idE : E → N be a total ordering of the stop events such that
+idE (T [i]) < idE (T ′ [j]) if and only if ⟨idL (L(T )), τarr (T [0]), i⟩ <lex ⟨idL (L(T ′ )), τarr (T ′ [0]), j⟩,
+where <lex denotes the lexicographical order. Note that this ordering is consistent with
+
+13
+
+14
+
+FLASH-TB: Integrating Arc-Flags and Trip-Based Public Transit Routing
+
+the partial order ≺ on stop events, i.e., L(T ) = L(T ′ ) and T [i] ≺ T ′ [j] implies idE (T [i]) <
+idE (T ′ [j]).
+For a journey J = ⟨f0 , . . . , T [i, j], (p, q)⟩, the tiebreakers are given by
+(
+⟨idE (T [i]), ∞
+⟩ if p = q,
+Xb (J) :=
+⟨∞
+, idE (T [j])⟩ otherwise.
+The local tiebreaking sequence Xℓ (J) := ⟨τarr (J)⟩ ◦ Xb (J) consists of the arrival time followed
+by the tiebreakers. The global tiebreaking sequence of a journey J with stop sequence
+S(J) = ⟨p1 , . . . , pk ⟩ concatenates the local tiebreaking sequences in reverse order:
+X(J) := Xℓ (J[p1 , pk ]) ◦ · · · ◦ Xℓ (J[p1 , p2 ]).
+Sequences are compared via the lexicographical order <lex . If one sequence is shorter
+than the other, it is padded by adding entries with value −∞ at the end. A journey
+J is called canonical for a query Q if it is Pareto-optimal under the cost system CX =
+((X, <lex ), (|·| , ≤)). Because the tiebreaking sequences of all feasible journeys for Q are
+unique and totally ordered, no two journeys are equivalent under CX . Accordingly, the only
+representative set for the query is the canonical representative set, which consists solely of
+canonical journeys. A crucial property is that the set of all canonical journeys for all possible
+queries is closed under subjourney decomposition:
+▶ Lemma 4. Let J be a canonical journey for a query Q and let J[p, q] be a subjourney of J
+for p, q ∈ S(J). Then J[p, q] is canonical for the query (p, q, τdep (J[p, q])).
+Proof. This follows from the fact that adding a common prefix or suffix to two journeys
+does not change the relative order of their tiebreaking sequences.
+◀
+Hence, the set of transfers that occur in at least one canonical candidate is canonicitypreserving (CP). Furthermore, Lemma 5 shows that canonical journeys are prefix-optimal
+and therefore also exit-optimal. Hence, the set is EOP and can be used for one-to-all-TB by
+Theorem 2
+▶ Lemma 5. Every canonical journey J for a query Q is prefix-optimal for Q.
+Proof. Let S(J) = ⟨p1 , . . . , pk ⟩ be the stop sequence of J. For each proper prefix J[p1 , pn ],
+the local tiebreaking sequence Xℓ (J[p1 , pn ]) begins with τarr (J[p1 , pn ]), so J[p1 , pn ] is Paretooptimal under C. Let T [i, j] denote the last trip segment of J[p1 , pn ]. Assume that the
+partial prefix of J that ends with T [i] is not Pareto-optimal under Cp . Because J[p1 , pn ] is
+Pareto-optimal, there must be a journey J ′ [p1 , pn ] with c(J ′ [p1 , pn ]) = c(J[p1 , pn ]) that ends
+with a trip segment T ′ [i′ , j] such that T ′ [i′ ] ≺ T [i]. Because trips of the same line do not
+overtake each other, this requires that T ′ = T and i′ < i and therefore idE (T ′ [i′ ]) < idE (T [i]).
+However, then it follows that Xb (J ′ [p1 , pn ]) <lex Xb (J[p1 , pn ]), which contradicts the fact
+that J is canonical.
+◀
+Canonical representative sets can be computed with a slight modification of RAPTOR [13]
+called canonical RAPTOR. Like TB, RAPTOR operates in rounds. Each round first explores
+the outgoing lines and then the outgoing footpaths of previously reached stops. To ensure that
+canonical journeys are found, canonical RAPTOR makes two modifications: The collected
+lines are sorted according to idL before they are explored. For each stop p reached directly
+via a trip, the algorithm maintains the stop event ε(p) at which the trip was exited. The
+collected stops are then sorted according to idE (ε(p)) before their outgoing footpaths are
+explored.
+
+E. Großmann, J. Sauer, C. Schulz, P. Steil and S. Witt
+
+Repairing Self-Pruning. Enumerating all canonical candidates requires solving the all-to-all
+full-range profile problem, restricted to journeys with at most two trips. Trans-ULTRA does
+this with rRAPTOR, an extension of RAPTOR for profile queries. In the same manner as
+Profile-TB, rRAPTOR performs a canonical RAPTOR run for each possible departure time
+in decreasing order. Because candidates have two trips, each run can be stopped after two
+rounds. As we saw in Section 4.1, the self-pruning rule cannot be applied directly because it
+conflicts with exit optimality.
+This issue can be solved by exploiting the following insight: If a journey J is canonical
+for a query (ps , pt , τdep ), then it is also canonical for the query (ps , pt , τdep (J)). If the
+objective is to enumerate all canonical journeys (or candidates), then we only need to ensure
+that J is chosen as the representative during the run for τdep (J). In subsequent runs (for
+earlier departure times), J may still be canonical, but because it is already included in the
+algorithm’s output, it is safe to replace it with a different journey.
+This insight leads to a variant of rRAPTOR called canonical rRAPTOR. Each RAPTOR
+run is done with canonical RAPTOR. Additionally, the self-pruning rule is relaxed to ensure
+that exit-optimal journeys are not discarded if they are dominated by an equivalent journey
+(under C) with a later departure time. The run in which a journey J is found is the one for
+τdep (J). Let J ′ the journey with the earliest arrival time among those with at most |J| trips
+that were previously found at pt (J). Usually, RAPTOR discards J if J ′ ⪯ J holds under C.
+Otherwise, J replaces J ′ . Canonical rRAPTOR instead discards J if one of the two ULTRA
+conditions holds under C:
+(U1) J ′ ⪯ J and τdep (J ′ ) = τdep (J).
+(U2) J ′ ≺ J.
+With these conditions, we show canonical rRAPTOR returns every canonical journey:
+▶ Lemma 6. Let J be a canonical journey for a query Q = (ps , pt , τdep ). After the run
+for τdep (J) in the canonical rRAPTOR search from ps , the representative for c(J) at pt is J.
+Proof. Note that the ULTRA conditions do not affect the computed cost vectors, only the
+parent pointers (and thereby the representative). Hence, it follows from the correctness of
+canonical RAPTOR and rRAPTOR that canonical rRAPTOR returns the Pareto front, which
+includes c(J). Let J ′ be the corresponding representative found by canonical rRAPTOR.
+We show that J ′ = J. If τdep (J ′ ) = τdep (J), then it follows from the correctness of canonical
+RAPTOR that J ′ is the journey with the smallest tiebreaking sequence among those in
+J (Q) with cost vector c(J) and departure time τdep (J), which is J. Assume therefore that
+τdep (J ′ ) > τdep (J). We prove the claim by induction over the proper prefixes of J. Because
+every proper prefix of J is canonical by Lemma 5, the algorithm returns it as a representative
+by the induction hypothesis. We therefore know that the run for τdep (J) finds J and compares
+it to J ′ . Condition (U1) is not fulfilled by our assumption that τdep (J ′ ) > τdep (J), whereas
+condition (U2) is not fulfilled because J is Pareto-optimal. Hence, J is not discarded and
+replaces J ′ , a contradiction.
+◀
+Trans-ULTRA. Trans-ULTRA performs a canonical rRAPTOR search from each possible
+source stop, restricted to the first two rounds. For each candidate in this set, its transfer is
+added to the transfer set T. We show that T is canonicity-preserving.
+▶ Theorem 7. The transfer set T generated by Trans-ULTRA is canonicity-preserving.
+Proof. Consider a canonical representative J = ⟨T1 [i1 , j1 ], . . . , Tk [ik , jk ]⟩ for some query
+Q and, for each 1 ≤ n < k, the candidate subjourney Jn = ⟨Tn [in , jn ], Tn+1 [in+1 , jn+1 ]⟩.
+
+15
+
+16
+
+FLASH-TB: Integrating Arc-Flags and Trip-Based Public Transit Routing
+
+By Lemma 4, Jn is canonical for the query (ps (Jn ), pt (Jn ), τdep (Jn )). Hence, the transfer
+(Tn [jn ], Tn+1 [in+1 ]) is included in T by Lemma 6.
+◀
+Note that the proof of Theorem 7 only requires a weaker version of Lemma 6: it is
+sufficient to find and unpack the canonical representatives that are candidates. ULTRA
+exploits this with several performance optimizations that prevent irrelevant non-candidate
+journeys from being explored [7]. These optimizations carry over to Trans-ULTRA; see
+Appendix A.
+
+4.4
+
+Canonical Profile-TB
+
+We now return to the task of precomputing auxiliary data to speed up TB. The precomputation
+scheme is as follows: Using the Trans-ULTRA transfer set, the all-to-all full-range profile
+problem is solved by running one-to-all Profile-TB from every source stop. For every run
+and every target stop, the representative journeys are unpacked and the auxiliary data is
+computed from them. It follows from Theorems 2 and 7 that each profile search computes
+the Pareto front, but as outlined in Section 4.1, the representatives are not necessarily
+compatible with the pruning rules of the query algorithm. Therefore, we perform the profile
+searches with canonical Profile-TB, a variant of one-to-all Profile-TB that computes all
+canonical representatives when it is used with a CP transfer set (such as the one computed
+by Trans-ULTRA).
+Whereas RAPTOR always finds prefix-optimal representatives, TB in its original form
+only guarantees exit optimality via the local pruning rule. We add a new pruning rule
+to ensure that Pareto-optimal footpath prefixes are selected. Furthermore, although the
+reached index data structure ensures that the algorithm finds optimal partial prefixes, they
+are not necessarily selected during journey unpacking. To change this, we redesign the
+parent pointers used for journey unpacking. We also adjust the order in which trip segments,
+footpaths and transfers are scanned within each round to match the order given by the
+tiebreakers. This ensures that each run finds the canonical representative first and therefore
+discards all others. Finally, we relax self-pruning by incorporating the ULTRA conditions.
+Pseudocode for the modified parts is given in Algorithm 3.
+Relaxing-Self Pruning. Like RAPTOR, one-to-all TB represents found journeys implicitly
+via the earliest arrival time τarr (p, n) for each stop p and round n. We incorporate the ULTRA
+conditions in the procedure AddArrival, which updates this value. Unlike RAPTOR, TB
+also represents partial journeys implicitly via the reached index Rn (T ) for each trip T and
+round n. When this is updated in Enqueue, a version of the ULTRA conditions also needs
+to be incorporated.
+We represent the run of a partial journey implicitly by maintaining a secondary reached
+index Rr (·), which is reset after every run. Consider a call to Enqueue for a stop event T [j]
+in round n. Let J denote the corresponding partial journey up to T [j]. Condition (U1)
+becomes condition (E1), which is evaluated in line 34: if Rr (T ) ≤ j, then the algorithm
+has already found a partial journey J ′ with J ′ ⪯ J and τdep (J ′ ) = τdep (J). Condition (U2)
+can be tested by evaluating the reached index Rn (T ). To check whether the algorithm has
+already found a partial journey J ′ ≺ J, the algorithm evaluates three sub-conditions:
+(E2a) If J ′ ends with a stop event T [ℓ] such that ℓ < j, then Rn (T ) < j must hold (see
+line 35).
+(E2b) If |J ′ | < |J|, then Rn−1 (T ) ≤ j must hold (see line 36).
+
+E. Großmann, J. Sauer, C. Schulz, P. Steil and S. Witt
+
+(E2c) If J ′ ends with a stop event T ′ [ℓ] such that T ′ ≺ T and ℓ ≤ j, then Rn (T ′ ) ≤ j must
+hold. Then it follows that pred (T ) ̸= ⊥ and Rn (pred (T )) ≤ j (see line 37).
+Consider now an AddArrival call for a stop p with arrival time τarr in round n of the run
+with departure time τdep . Besides the earliest found arrival time τarr (p, n) at p in round n,
+the algorithm maintains the departure time of the run in which τarr (p, n) was last updated,
+which we denote by τdep (p, n). The new arrival is discarded if one of the following conditions
+holds:
+(T1) τarr (p, n) = τarr and τdep (p, n) = τdep ,
+(T2a) τarr (p, n) < τarr ,
+(T2b) τarr (p, n − 1) ≤ τarr .
+Otherwise, τarr (p, n) is set to τarr and τdep (p, n) to τdep .
+Reordering the Trip Scanning Phase. At the start of the trip scanning phase of round
+n, the trip segments T [j, k] in the queue Qn are sorted in ascending order of idE (T [j]) (see
+line 3). This ensures that all stop events are scanned in ascending order according to idE .
+Normally, one-to-all TB loops over the trip segments twice: once to update the earliest arrival
+times (done here via AddArrival) and then again to scan outgoing transfers. Canonical
+Profile-TB splits each of these loops into two parts, resulting in four loops in total. The
+first loop only calls AddArrival for the stops at which the trips are exited. The second loop
+explores the outgoing footpaths and calls AddArrival for the stops reached in this manner.
+This ensures that journeys with empty final footpaths, which have smaller tiebreakers than
+those with non-empty ones, are found first. To achieve the same exploration order for the
+transfers, the transfer set T is split into two sets: the set T0 contains the transfers between
+stop events at the same stop, whereas Tfp contains those that involve a non-empty footpath.
+The third loop explores the transfers in T0 , whereas the fourth loop explores those in Tfp .
+Along with the sorting of the trip segments, these changes ensure that within each run, the
+first found representative for each Pareto-optimal cost vector is the canonical one.
+Local Pruning. The loops that explore outgoing transfers retain the local pruning rule
+from one-to-all TB (see lines 14 and 19), which ensures that journeys with non-optimal
+exit prefixes are discarded. A similar pruning rule is added in line 22. When exploring a
+transfer (T [i], T ′ [i′ ]) that involves a non-empty footpath, the algorithm needs to ensure that
+the resulting journey ending at p(T ′ [i′ ]) is optimal. This is done by calculating its arrival
+time τarr in line 21 and comparing it to the earliest found arrival time τarr (p(T ′ [i′ ]), n). If it
+is greater, then the journey is not Pareto-optimal, so Enqueue is not called. Note that this
+pruning rule is not necessary when exploring the transfers T0 that do not involve a footpath.
+Also note that the arrival time τarr calculated in line 21 depends only on the transfer, so it
+can be calculated and stored in advance for each transfer.
+Journey Unpacking. Another modification is required to ensure that the unpacked journeys
+enter each trip at the earliest possible stop. When Enqueue is called for a stop event T [i], a
+trip segment T [j, k] with j > k may have already been enqueued earlier. In this case, the
+algorithm enqueues the segment T [i, j − 1] as well, so the queue contains two consecutive
+trip segments of the same trip. This means that for every journey that exits T at some stop
+event T [ℓ] with j < ℓ ≤ k, there is a journey that uses the trip segment T [i, ℓ] and one that
+uses T [j, ℓ]. The former must be chosen because the partial prefix ending in T [i] strictly
+dominates the one ending in T [j]. However, TB will normally choose the latter because it
+maintains a parent pointer per enqueued trip segment.
+
+17
+
+18
+
+FLASH-TB: Integrating Arc-Flags and Trip-Based Public Transit Routing
+
+Canonical Profile-TB instead maintains a parent pointer parent(T, n) for each trip T and
+round n. If T [i] is the earliest reachable stop event of T [i] and (p, p(T [i])) is the (possibly
+empty) footpath from which it was reached, then parent(T, n) stores p. If n = 1, this is the
+source stop; otherwise, it is the stop at which the previous trip was exited. If an Enqueue
+call for the stop event T [j] is successful (i.e., none of the ULTRA conditions hold), the parent
+pointer is updated because T [j] is now the earliest reachable stop event. Additionally, a
+pointer parent(p, n) is stored for each stop p and round n, which stores the last trip segment
+in the journey that was used to reach p. Consider a call to AddArrival during the scan
+of a trip segment T [j, k] in line 6 or 11. The currently scanned stop event T [i] is passed
+to AddArrival as the stop event at which the trip segment is exited. The stop event at
+which it is entered is not necessarily T [j], but rather the stop event T [ℓ] at which the earliest
+enqueued trip segment of T starts. At this point during the execution of the algorithm, ℓ is
+given by Rr (T ) − 1.
+After each run with departure time τdep , journey unpacking is performed for each
+combination of stop p and round n for which τdep (p, n) = τdep . To unpack the journey,
+the algorithm retrieves the trip segment T [j, k] stored in parent(p, n). Then it looks up the
+stop q stored in parent(T, n) and repeats the process recursively with q and n − 1. This is
+repeated until n reaches 0. To avoid looping over all stops and rounds after every run, all
+pairs of p and round n for which τdep (p, n) is updated are marked during the run.
+Proof of Correctness. We now show that canonical Profile-TB with a CP transfer set finds
+and unpacks all canonical journeys.
+▶ Theorem 8. Let Q = (ps , pt , τdep ) be a query, T a CP transfer set and J = ⟨f0 , T1 [i1 , j1 ], . . . , Tk [ik , jk ], fk+1 ⟩ ∈
+J (Q, T) a canonical journey for Q. In the canonical Profile-TB search from ps , the run for
+τdep (J) unpacks J.
+out
+Proof. To simplify the notation, we define pin
+n := p(Tn [in ]) and pn := p(Tn [jn ]) for 1 ≤ n ≤
+k. Additionally, we define pout
+:= ps and pin
+0
+k+1 := pt . We show that after the run for τdep (J)
+has finished, the following holds for all 1 ≤ n ≤ k:
+The run has called Enqueue(Tn , in + 1, n, pout
+n−1 ) and it was the first call of the form
+Enqueue(Tn , in + 1, n, ·) in this run.
+in
+τdep (pout
+n , n) = τdep (pn+1 , n) = τdep (J),
+out
+parent(pn , n) = parent(pin
+n+1 , n) = Tn [in , jn ],
+parent(Tn , n) = pout
+.
+n−1
+Then it follows that the algorithm unpacks J. We prove these claims by induction over n. In
+round 0, the algorithm explores the outgoing footpaths of ps , so all Enqueue calls have the
+parent stop pout
+= ps . When the initial footpath f0 is explored, the call Enqueue(T1 , i1 +
+0
+1, 1, pout
+0 ) is made.
+Assume now that the claims hold for n − 1. In particular, Enqueue(Tn , in + 1, n, pout
+n−1 )
+was called in round n − 1 and it was the first call of the form Enqueue(Tn , in + 1, n, ·) in
+this run. Consider what happens during this call. Let Jpn denote the partial prefix of J
+that ends with Tn [in ]. Because Jpn is Pareto-optimal, no call Enqueue(T ′ , i′ + 1, n′ , ·) with
+T ′ [i′ ] ≺ Tn [in ] and n′ ≤ n is made by the algorithm. This implies that Rr (Tn ) > in + 1 holds
+at the beginning of the current call, so pruning condition (E1) is not fulfilled. Conditions (E2)
+are not fulfilled because Jpn is Pareto-optimal. It follows that parent(Tn , n) is set to pout
+n−1 .
+During any subsequent call of the form Enqueue(Tn , in , n, ·), condition (E1) is fulfilled, so
+parent(Tn , n) is not overwritten.
+Because J[ps , pout
+n ] is Pareto-optimal, Rr (Tn ) > jn must hold before the start of round
+n − 1. However, Rr (Tn ) = in + 1 ≤ jn holds after the call Enqueue(Tn , in + 1, n, pout
+n−1 ),
+
+E. Großmann, J. Sauer, C. Schulz, P. Steil and S. Witt
+
+19
+
+Algorithm 3 Trip scanning operation of DC-Profile-TB.
+
+Procedure Scan(n, τdep )
+Qn+1 ← ∅
+3
+Sort trip segments T [j, k] in Qn by idE (T [j])
+4
+for each T [j, k] ∈ Qn do
+5
+for i from j to k do
+6
+AddArrival(p(T [i]), n, τarr (T [i]), τdep , T, i)
+7
+for each T [j, k] ∈ Qn do
+8
+for i from j to k do
+9
+for each p ∈ S \ {p(T [i])} with ∆τfp (p(T [i]), p) < ∞ do
+10
+τarr ← τarr (T [i]) + ∆τfp (p(T [i]), p)
+11
+AddArrival(p, n, τarr , τdep , T, i)
+12
+for each T [j, k] ∈ Qn do
+13
+for i from j to k do
+14
+if τarr (T [i]) > τarr (p(T [i]), n) then continue
+// local pruning
+15
+for each (T [i], T ′ [i′ ]) ∈ T0 do
+// scan transfers
+16
+Enqueue (T ′ , i′ + 1, n + 1, p(T [i]))
+17
+for each T [j, k] ∈ Qn do
+18
+for i from j to k do
+19
+if τarr (T [i]) > τarr (p(T [i]), n) then continue
+// local pruning
+′ ′
+20
+for each (T [i], T [i ]) ∈ Tfp do
+// scan transfers
+21
+τarr ← τarr (T [i]) + ∆τfp (p(T [i]), p(T ′ [i′ ]))
+22
+if τarr > τarr (p(T ′ [i′ ]), n) then continue
+// local pruning
+23
+Enqueue (T ′ , i′ + 1, n + 1, p(T [i]))
+1
+2
+
+Procedure AddArrival(p, n, τarr , τdep , T, i)
+25
+if τarr (p, n) = τarr and τdep (p, n) = τdep then return
+26
+if τarr (p, n) < τarr then return
+27
+if τarr (p, n − 1) ≤ τarr then return
+28
+for each m ≥ n do
+29
+if τarr (p, m) ≤ τarr then break
+30
+τarr (p, m) ← τarr
+31
+τdep (p, m) ← τdep
+32
+parent(p, n) ← T [Rr (T ) − 1, i]
+24
+
+Procedure Enqueue(T, j, n, p)
+34
+if Rr (T ) ≤ j then return
+35
+if Rn (T ) < j then return
+36
+if n > 1 ∧ Rn−1 (T ) ≤ j then return
+37
+if pred (T ) ̸= ⊥ ∧ Rn (pred (T )) ≤ j then return
+38
+Qn ← Qn ∪ {T [j, Rr (T ) − 1]}
+39
+for each T ′ ⪰ T do
+40
+Rr (T ′ ) ← min {j, Rr (T ′ )}
+41
+for each m ≥ n do Rm (T ′ ) ← min {j, Rm (T ′ )}
+42
+parent(T ′ , n) ← p
+
+// (T1)
+// (T2a)
+// (T2b)
+
+33
+
+// (E1)
+// (E2a)
+// (E2b)
+// (E2c)
+
+20
+
+FLASH-TB: Integrating Arc-Flags and Trip-Based Public Transit Routing
+
+so a trip segment containing Tn [jn ] is enqueued and then scanned in round n. Let
+in
+p ∈ {pout
+n , pn+1 }. When Tn [jn ] is scanned, AddArrival(p, n, τarr (J[ps , p]), τdep (J), Tn , jn )
+is called. The pruning conditions (T2) are not fulfilled in this call because J[ps , p] is
+Pareto-optimal. We show that (T1) is not fulfilled either. Assume that a previous
+call AddArrival(p, n, τarr (J[ps , p]), τdep (J), T ′ , j ′ ) was made during this run. Then there
+is a ps -p-journey J ′ with departure time τdep (J) and arrival time τarr (J ′ ) = τarr (J[ps , p])
+that ends with a trip segment T ′ [i′ , j ′ ]. If p ̸= pout
+n , then the order in which the enqueued trip segments are scanned implies that p(T ′ [j ′ ]) = p or idE (T ′ [j ′ ]) < idE (Tn [jn ]).
+′
+If p = pout
+n , then both must hold. Both cases imply X(J ) <lex X(J[ps , p]), which contradicts the canonicity of J by Lemma 4. Hence, τdep (p, n) is set to τdep (J) and will
+retain this value for the remainder of the run. Similarly, τarr (p, n) is set to τarr (J, p)
+and parent(p, n) is set to Tn [Rr (Tn ) − 1, jn ] = Tn [in , jn ]. No subsequent call of the form
+AddArrival(p, n, τarr , τdep (J), ·, ·) is able to overwrite the parent pointer: Because J[ps , p] is
+Pareto-optimal, τarr ≥ τarr (J, p) must hold. If τarr > τarr (J, p) holds, then condition (T2a)
+applies. If τarr = τarr (J, p) holds, then condition (T1) applies.
+During the scan of Tn [jn ] in round n < k, the outgoing transfer (Tn [jn ], Tn+1 [in+1 ]) ∈ T is
+in
+scanned. Because J[ps , pout
+n ] and J[ps , pn+1 ] are Pareto-optimal, the local pruning conditions
+are not fulfilled, so Enqueue(Tn+1 , in+1 + 1, n + 1, pout
+n ) is called. If this is not the first call
+′
+of the form Enqueue(Tn+1 , in+1 + 1, n + 1, ·) in this run, then there is a ps -pin
+n+1 -journey J
+′ ′ ′
+′ ′
+with departure time τdep (J) and final trip segment T [i , j ] such that (T [j ], Tn+1 [in+1 ]) is
+scanned before (Tn [jn ], Tn+1 [in+1 ]). Because the transfer is only scanned if the local pruning
+out
+in
+condition is not fulfilled, τarr (J ′ ) ≥ τarr (J[ps , pin
+n+1 ]) must hold. If pn = pn+1 , this implies
+′ ′
+′ ′
+in
+′ ′
+T [j ] ≺ Tn [jn ]. Otherwise, it implies p(T [j ]) = pn+1 or T [j ] ≺ Tn [jn ]. In either case,
+X(J ′ ) <lex X(J[ps , pin
+◀
+n+1 ]) follows, which contradicts the canonicity of J by Lemma 4.
+
+5
+
+FLASH-TB
+
+We now present our new algorithm FLASH-TB (TB with FLAgged SHortcuts), which applies
+the main idea of Arc-Flags to TB.
+
+5.1
+
+Overview
+
+The first preprocessing step partitions the set S of stops into k cells, which yields a partition
+function r : S → {1, . . . , k}. To represent the topology of the network without its time
+dependency, we define the layout graph GL . The set of links between a pair p, q of stops is
+given by
+
+
+C(p, q) := T [i, i + 1] | T ∈ T , p(T [i]) = p, p(T [i + 1]) = q ∪ (p, q) | (p, q) ∈ F .
+Thus, a link is either a trip segment between two consecutive stops or a footpath. The layout
+graph (see Figure 3) condenses all links between the same pair of stops into a single edge.
+Formally, it is a graph GL = (S, EL , cL ) with the edge set EL := {(p, q) | C(p, q) ̸= ∅} and
+the edge weight function cL ((p, q)) := |C(p, q)|. The stop partition r is obtained by running
+a graph partitioning algorithm on GL . Because the edges are weighted by the number of
+corresponding links, the partitioner is guided to avoid separating stops with many direct
+connections between them.
+After the partition has been computed, the transfer set T is computed with TransULTRA. Then, the algorithm computes a flag for each transfer t ∈ T and cell i, which
+indicates whether t is required to reach any target stops in cell i. Formally, this yields
+
+E. Großmann, J. Sauer, C. Schulz, P. Steil and S. Witt
+
+21
+
+Figure 3 Left: An example network with stops as nodes, trips as colored edges and footpaths as
+gray edges. Right: The corresponding layout graph with edges weighted by the number of links.
+Node groupings indicate a possible 3-way partition of the graph.
+
+1
+1
+
+1
+
+1
+
+1
+2
+
+2
+
+1
+
+a flags function b : T × {1, . . . , k} → {0, 1} with the following property: for each query
+Q = (ps , pt , τdep ), there is a representative set JR such that b(t, r(pt )) = 1 for every transfer
+t = (Ta [i], Tb [j]) that occurs in a journey J ∈ JR . The flags are computed by solving the
+all-to-all full-range profile problem. As outlined in Section 4, this is done by running canonical
+Profile-TB from every possible source stop. After each TB run, all newly found journeys
+are unpacked. For each found journey J to a target stop pt and each transfer t in J, the
+flag b(t, r(pt )) is set to 1. Transfers for which no flags are set to 1 can be removed from T.
+Afterwards, a query with target stop pt is answered by running the TB query algorithm but
+only scanning transfers that are flagged for the target cell r(pt ).
+▶ Theorem 9. FLASH-TB is correct.
+Proof. Let T be the (CP) transfer set computed by Trans-ULTRA and b(·, ·) the computed
+flags function. For a cell i of the stop partition, let T(i) = {t ∈ T | b(t, i) = 1} be the set
+of flagged transfers. For a query Q = (ps , pt , τdep ), the search space of FLASH-TB with
+the transfer set T is equal to that of TB with T(r(pt )). We show that T(r(pt )) is CP for
+Q, which proves the claim by Corollary 3. Consider a canonical journey J for Q and the
+canonical Profile-TB search from ps performed during the preprocessing. By Theorem 8, the
+run for τdep (J) unpacks J. For each transfer in J, the flag of the target cell r(pt ) is set to 1,
+so it is included in T(r(pt )).
+◀
+
+5.2
+
+Optimizations
+
+Flag Representation. For an edge e, we call the sequence ⟨b(e, 1), . . . , b(e, k)⟩ its flag pattern.
+[6] observe for Arc-Flags on road networks that many edges in the graph share the same flag
+pattern. They exploit this with the following compression technique: All flag patterns that
+occur in the graph are stored in a global array A. For each edge e, the algorithm does not
+store the flag pattern of e directly, but rather the index i for which A[i] contains the pattern.
+This saves space at the cost of additional pointer accesses whenever an edge is explored. We
+apply this compression technique in FLASH-TB and sort the flag pattern array in decreasing
+order of occurrence. This ensures that the most commonly accessed flag patterns are stored
+close together in memory, which increases the likelihood of cache hits. If flag compression
+is not used, the flags are stored in an array A of size k |T|. To improve cache efficiency, we
+store the flags for each cell consecutively. Thus, the flag b(t, i) for a transfer t and cell i is
+stored at position A[i |T| + t]. This ensures that flags for irrelevant target cells do not occupy
+space in the cache.
+Reached Index Timestamping. Usually, TB resets the reached index of every trip T to |T |
+after each query. However, the search space of FLASH-TB is so small that the vast majority
+of reached indices are not modified during a typical query. To prevent unnecessary overhead,
+we store a 16-bit timestamp η(T ) for each trip T , which indicates last query in which R(T )
+
+22
+
+FLASH-TB: Integrating Arc-Flags and Trip-Based Public Transit Routing
+
+was modified. When R(T ) is accessed during the i-th query and η (T ) ̸= i, R(T ) is reset to
+|T | and η(T ) is set to i. Every 216 queries, the timestamp overflows, so all reached indices
+are reset.
+
+6
+
+Comparison with Other Algorithms
+
+In this section, we outline the similarities and differences of FLASH-TB to other algorithms.
+In particular, we explain why FLASH-TB reduces the search space compared to TP, TB-CST,
+and previous applications of Arc-Flags in public transit networks.
+
+6.1
+
+Transfer Patterns and TB-CST
+
+Both TP and TB-CST (without split trees) store a generalized shortest-path tree for every
+possible source stop. This offers a near-perfect reduction in the query search space but at
+2
+the expense of a memory consumption of Ω(|S| ). By contrast, the memory consumption of
+FLASH-TB is in Θ (k |T|), where k is the number of cells. Although |T| is theoretically in
+Ω(|E| |T |), it is comparable to |E| in practice. Thus, FLASH-TB can be seen as a way to
+interpolate between TB and TP regarding query search space and memory consumption. For
+k = 1, every non-superfluous transfer is flagged, so the search space is identical to that of
+TB with a filtered set of transfers. For k = |S|, transfers are only flagged if they occur in a
+Pareto-optimal journey to the target stop that was selected as a representative by canonical
+Profile-TB. An advantage of our approach is that the transfer flags provide information
+about which specific trips should be entered. By contrast, the search graphs of TB-CST
+and TP only provide information about lines and stop sequences, respectively. This means
+that FLASH-TB does not have to invest additional effort during the query phase to find the
+earliest reachable trip of each line.
+
+6.2
+
+Arc-Flags on Public Transit Networks
+
+Conceptually, FLASH-TB is similar to Arc-Flags on a time-expanded graph, albeit with TB
+as a query algorithm instead of Dijkstra’s algorithm. [8] and [12] observe low speedups when
+applying Arc-Flags to public transit networks. We analyze the issues causing this and how
+FLASH-TB overcomes them.
+Issues with Existing Approaches. [8] apply Arc-Flags to a time-dependent graph model in
+a problem setting that asks for all Pareto-optimal paths, i.e., all representatives for every
+Pareto-optimal cost vector. They observe that for nearly every combination of edge e and cell
+i, there is at least one point in time for which e occurs on a Pareto-optimal path to a node
+in cell i. To solve this problem, the authors divide the service period of the network into
+two-hour intervals and compute a flag for each combination of edge, cell and time interval.
+However, this merely yields a speedup of three over Dijkstra’s algorithm.
+Time resolution is not an issue in the time-expanded graph, where each node is associated
+with a specific point in time. Each stop event is modeled with three nodes: an arrival node,
+a transfer node and a departure node. The edges in the graph can be divided into trip edges,
+which connect the arrival and departure nodes of the same trip, and transfer edges, which
+are incident to transfer nodes. The transfer nodes of each stop are connected by a “chain” of
+transfer edges leading from earlier to later nodes. An example is shown in Figure 4. A trip
+segment corresponds to a path between a departure node and an arrival node consisting only
+
+E. Großmann, J. Sauer, C. Schulz, P. Steil and S. Witt
+
+23
+
+Figure 4 Two example stops in a time-expanded graph. Arrival nodes in lilac, transfer nodes in
+dark gray, and departure nodes in yellow. Trip edges are thick and colored, while transfer edges are
+thin and gray. Edge weights have been omitted for clarity.
+
+t
+a
+
+d
+t
+
+a
+
+d
+t
+
+a
+
+d
+
+t
+
+Ta
+
+a
+
+Tb
+
+a
+
+Tc
+
+a
+
+d
+t
+d
+t
+d
+
+of trip edges. By contrast, a transfer corresponds to a path of transfer edges between an
+arrival node and a departure node.
+In principle, applying Arc-Flags to the time-expanded graph should yield much more
+fine-grained information than in the time-dependent model. However, [12] still only report a
+speedup of four over Dijkstra’s algorithm, even when optimizing only the arrival time. One
+reason for this is noted by the authors: in a time-expanded graph, every path is optimal
+because its arrival time depends only on the time of the target event. To solve this problem,
+the authors employ strategies for breaking ties between paths. Moreover, they propose
+a pruning technique called node-blocking, which applies the principle of line pruning to
+Dijkstra’s algorithm in time-expanded graphs. They observe that node-blocking conflicts
+with their tiebreaking choices for Arc-Flags, leading to incorrectly answered queries. Hence,
+they disable node-blocking when evaluating Arc-Flags, which increases the search space.
+A second reason is that their approach computes flags that are sufficient to find a shortest
+path between any pair of nodes. However, the public transit journey planning problem has
+two crucial differences to the shortest path problem in the time-expanded graph: Firstly,
+the source node may only be a transfer node. Secondly, no target node is supplied, only a
+target stop. The actual target node is the earliest reachable transfer node of the target stop,
+which only becomes known during the search. For these reasons, not every pair of source
+and target node occurs in an optimal journey. Thus, the approach by Delling, Pajor, and
+Wagner flags more edges than necessary.
+Improvements in FLASH-TB. Arc-Flags on the time-expanded graph flags both trip and
+transfer edges, whereas FLASH-TB flags only transfers. Flagging an entire TB transfer
+provides more information than flagging all the transfer edges it consists of. Consider an
+example with four stop events T1 [i1 ], T2 [i2 ], T3 [i3 ], T4 [i4 ] at the same stop p such that their
+arrival and departure times are increasing in this order. Let v1 , v2 , v3 , v4 be the corresponding
+transfer nodes. Then the “transfer chain” of p includes the path P = ⟨v1 , v2 , v3 , v4 ⟩. Assume
+that FLASH-TB flags the transfers (T1 [i1 ], T3 [i3 ]) and (T2 [i2 ], T4 [i4 ]). In Arc-Flags, this
+corresponds to flagging the entire path P . However, this creates flagged paths from T [i1 ] to
+T4 [i4 ] and from T2 [i2 ] and T3 [i3 ], which are akin to also flagging the transfers (T1 [i1 ], T4 [i4 ])
+and (T2 [i2 ], T3 [i3 ]). Thus, Arc-Flags on the time-expanded graph always explores these
+transfers, whereas FLASH-TB only does so if they are flagged.
+We refrain from flagging trip segments in FLASH-TB because it would not provide any
+benefit beyond the first round of a FLASH-TB query: If a trip segment is not flagged for
+
+24
+
+FLASH-TB: Integrating Arc-Flags and Trip-Based Public Transit Routing
+
+the target cell, then neither are its incoming or outgoing transfers. Thus, an unflagged
+trip segment can only be entered during the first round, and no further trip segments are
+reachable from there. It would be possible to compute a flag for each trip T and cell i that
+indicates whether T is used for the first trip segment of a required journey to cell i. However,
+preliminary experiments have shown that this barely improves query times at the cost of
+additional memory consumption.
+The other crucial difference between FLASH-TB and Arc-Flags on time-expanded graphs
+is how the flags are computed. Arc-Flags is typically employed for solving the shortest path
+problem on a graph, where any node can occur as the source or target node of a query. In this
+scenario, it is sufficient to compute a backward shortest-path tree from each boundary node.
+Because every edge in the tree is required to answer at least one query, it is not wasteful
+to flag all of them. However, as explained above, not all optimal paths between all pairs of
+nodes in the time-expanded graph occur in an optimal journey. Computing and flagging a
+backward shortest-path tree from every boundary node vt is wasteful for two reasons: If vt
+is a departure or arrival node, optimal paths to vt correspond to partial journeys, which
+may not occur in any optimal journey. If vt is a transfer node, it is not necessarily the
+earliest reachable node of its stop for every leaf in the tree. FLASH-TB solves both issues
+by computing the flags with forward Profile-TB searches from every stop in the network.
+Because this approach is independent of the network partition, it does not need to run
+searches from boundary nodes that are departure or arrival nodes. Secondly, because it uses
+forward searches, it can easily discard journeys with a suboptimal arrival time at the target
+stop. The downside of this approach is that the preprocessing effort becomes quadratic in
+the number of stops and no longer scales with the partition size.
+Finding a suitable preprocessing algorithm based on backward searches from the boundary
+nodes remains an open problem. Such an algorithm would need to discard enough irrelevant
+paths to keep the search space small while being compatible with the pruning rules of the
+query algorithm. As observed by [12], achieving compatibility with line pruning (or their
+implementation of it, node-blocking) is particularly challenging. Line pruning prefers journeys
+that use the earliest trip of each line that is still reachable from the source node. However,
+this trip is difficult to determine during a backward search from the target node. Delling,
+Pajor, and Wagner were only able to avoid this issue by disabling node-blocking altogether.
+As seen in Section 4.1, a naive implementation of FLASH-TB would run into a similar issue
+due to the conflict between self-pruning and line pruning. However, we resolved this by
+adjusting the preprocessing algorithm, allowing FLASH-TB to benefit from both pruning
+rules simultaneously.
+
+7
+
+Experimental Evaluation
+
+We evaluate the performance of FLASH-TB on four real-world public transit networks. Our
+experimental setup is outlined in Section 7.1. Afterwards, we evaluate the partitioning step
+and the transfer generation algorithms in Section 7.2. This is followed by the performance
+of FLASH-TB in Section 7.3. Finally, we compare our algorithm to the state of the art in
+Section 7.4.
+
+7.1
+
+Setup
+
+Our datasets are taken from GTFS feeds of the public transit networks of Germany (https://
+gtfs.de/), Paris (https://navitia.io/), Sweden (https://trafiklab.se/) and Switzerland (https://opentransportdata.swiss/). Details are listed in Table 1. For each network,
+
+E. Großmann, J. Sauer, C. Schulz, P. Steil and S. Witt
+
+25
+
+Table 1 An overview of the networks on which we performed our experiments. Stops, stop events,
+lines, trips, and footpaths are taken from the GTFS datasets. For the footpaths, we build the
+transitive closure. Also listed are the results of the TB and Trans-ULTRA transfer precomputations.
+Preprocessing times are formatted as [hh:mm:ss].
+
+Germany
+
+Paris
+
+Sweden
+
+Switzerland
+
+Stops
+Stop events
+Lines
+Trips
+Footpaths
+
+441 465
+30 995 609
+207 801
+1 559 118
+1 172 464
+
+41 757
+4 636 238
+9 558
+215 526
+445 912
+
+48 007
+5 647 754
+15 627
+248 977
+2 118
+
+30 510
+5 197 469
+17 895
+336 765
+20 468
+
+TB transfers
+TB prepro.
+
+60 919 879
+00:02:08
+
+23 284 123
+00:00:36
+
+14 771 466
+00:00:24
+
+8 481 315
+00:00:16
+
+Trans-ULTRA transfers
+Trans-ULTRA prepro.
+
+49 339 366
+00:11:34
+
+15 388 877
+00:00:39
+
+11 960 527
+00:00:35
+
+6 420 392
+00:00:28
+
+we extracted the timetable of two consecutive (non-holiday) weekdays to allow for overnight
+journeys. A grouping of the trips into a minimal set of lines can be computed in polynomial
+time [23]. However, a greedy approach [7] produced the same (optimal) grouping on all
+four datasets. All precomputations were run on a machine with two 64-core AMD Epyc
+Rome 7742 CPUs clocked at 2.25 GHz, with a boost frequency of 3.4 GHz, 1024 GB of
+DDR4-3200 RAM, and 256 MiB of L3 cache. All queries were performed on a machine with
+two 8-core Intel Xeon Skylake SP Gold 6144 CPUs clocked at 3.5 GHz, with a boost frequency
+of 4.2 GHz, 192 GiB of DDR4-2666 RAM, and 24.75 MiB of L3 cache. The source code
+for TB and FLASH-TB (https://github.com/TransitRouting/FLASH-TB) was written
+in C++ and compiled using GCC with optimizations enabled (-march=native -O3). For
+the comparison to TB-CST, we used the original source code by [24], with the additional
+fixes discussed in Section 4.1. The preprocessing phases of TB-CST and FLASH-TB, which
+run one-to-all Profile-TB from each stop, were parallelized with 128 threads. The queries
+were not parallelized.
+
+7.2
+
+Partitioning and Transfer Generation
+
+We use the KaHIP graph partitioning framework [22] (https://github.com/KaHIP/KaHIP)
+to partition our networks. KaHIP follows the multilevel paradigm, i.e., the input graph is
+coarsened, initially partitioned, and locally improved during uncoarsening. In our experiments,
+better results are obtained when the coarsening is done using clustering rather than edge
+matching, which is the default setting. More specifically, we use the memetic algorithm
+KaFFPaE with the strong social setting and an imbalance parameter of 5%. As a time
+limit, we set ten minutes for all networks regardless of the number k of desired cells. In our
+experiments, higher time limits did not significantly improve the total number of flags set or
+the average query times.
+Results for the TB and Trans-ULTRA transfer generation steps are listed in Table 1.
+Trans-ULTRA reduces the number of transfers by around 20–30%. This comes at the cost
+of a higher running time, especially on the Germany network. However, compared to the
+overall preprocessing time of FLASH-TB, the difference is negligible.
+
+FLASH-TB: Integrating Arc-Flags and Trip-Based Public Transit Routing
+
+Figure 5 Average speedup over TB and memory consumption of FLASH-TB (with and without
+flag compression) on the Paris and Switzerland networks, depending on the number of cells k. The
+partition of Switzerland with k = |S|, in which each stop has its own cell, was computed directly
+without the use of KaHIP.
+
+Paris – Speedup
+
+Paris – Memory
+30
+
+Memory [GB]
+
+Speedup
+
+100
+
+50
+
+21
+
+23
+
+25
+
+27
+
+10
+
+21
+
+29 211 213 215
+
+23
+
+25
+
+27
+
+29 211 213 215
+
+k
+
+k
+
+Switzerland – Speedup
+
+Switzerland – Memory
+15
+
+Memory [GB]
+
+300
+
+200
+
+100
+
+0
+
+10
+
+5
+
+0
+21
+
+23
+
+25
+
+27
+
+29 211 213 |S|
+k
+
+FLASH-TB (without flag compression)
+
+7.3
+
+20
+
+0
+
+0
+
+Speedup
+
+26
+
+21
+
+23
+
+25
+
+27
+
+29 211 213 |S|
+k
+
+FLASH-TB (with flag compression)
+
+FLASH-TB Performance
+
+Performance measurements for FLASH-TB, including the impact of flag compression and
+the number k of cells, are shown in Table 2. For each configuration, we ran 10 000 queries
+with the source and target stops chosen uniformly at random and the departure time chosen
+uniformly at random within the first day covered in the network. Values for k that do not
+substantially improve the memory consumption or the query time compared to other values
+are omitted from Table 2. For the Germany network, we suspect that there would be further
+performance gains with k = 16 384 cells, but the machine ran out of memory during the
+precomputation with 128 threads. Additionally, for the Paris and Switzerland networks,
+Figure 5 plots the speedup over TB (for the fixed-departure time query) and the memory
+consumption, with and without flag compression, depending on k.
+The reported query times exclude the time required to unpack the journeys. For TB,
+
+E. Großmann, J. Sauer, C. Schulz, P. Steil and S. Witt
+
+27
+
+Table 2 Performance of FLASH-TB depending on the number k of cells. Values for k = 1 are for
+the original TB algorithm. Memory consumption and query times and are measured with (Comp.)
+and without (Uncomp.) flag compression. Query times and scanned trips are averaged over 10 000
+random fixed departure time queries. Also reported are profile query times, averaged over 1 000
+random queries with the departure time range spanning the first 24 hours in the timetable. The
+preprocessing time excludes the partitioning, which is limited to ten minutes in all configurations,
+and the preprocessing time of Trans-ULTRA (see Table 1).
+Prepro.
+
+Memory [MB]
+
+Query time [µs] Scanned Profile time [µs]
+trips
+
+Uncomp.
+
+Comp.
+
+Germany
+
+Comp.
+
+1
+64
+128
+256
+512
+1 024
+2 048
+4 096
+8 192
+
+–
+30:41:41
+29:13:44
+28:40:21
+28:28:33
+28:19:22
+28:29:21
+28:40:08
+32:36:15
+
+–
+1 843
+2 150
+2 662
+2 686
+5 734
+9 830
+19 251
+34 816
+
+–
+280
+307
+359
+473
+720
+1 384
+2 716
+5 788
+
+63 687
+1 555
+902
+547
+355
+234
+168
+130
+127
+
+– 280 586 383 747
+2 026 4 912
+8 164
+1 314 2 769
+4 858
+888 1 598
+3 076
+635
+976
+2 052
+468
+608
+1 383
+372
+409
+1 052
+321
+291
+840
+419
+218
+861
+
+–
+10 641
+6 996
+4 961
+3 702
+2 800
+2 329
+2 839
+2 590
+
+Paris
+
+Uncomp. Comp. Uncomp.
+
+1
+64
+128
+256
+512
+1 024
+2 048
+4 096
+8 192
+16 384
+
+–
+00:18:41
+00:18:42
+00:18:43
+00:18:44
+00:18:46
+00:18:49
+00:18:52
+00:18:54
+00:19:01
+
+–
+408
+465
+579
+808
+1 331
+2 253
+4 096
+7 680
+15 360
+
+–
+88
+121
+174
+266
+447
+806
+1 594
+3 232
+6 612
+
+2 804
+314
+204
+139
+93
+67
+47
+36
+29
+25
+
+– 17 619
+535
+796
+403
+493
+327
+316
+241
+203
+199
+140
+155
+96
+132
+72
+116
+57
+110
+48
+
+44 197
+6 854
+4 733
+3 302
+2 299
+1 784
+1 330
+1 111
+930
+920
+
+–
+14 529
+11 878
+9 760
+8 035
+6 424
+5 069
+4 219
+4 225
+5 053
+
+Sweden
+
+k [hh:mm:ss]
+
+1
+64
+128
+256
+512
+1 024
+2 048
+4 096
+8 192
+16 384
+
+–
+00:12:35
+00:12:18
+00:12:07
+00:10:50
+00:10:19
+00:10:08
+00:10:09
+00:10:11
+00:10:14
+
+–
+403
+460
+573
+799
+1 331
+2 253
+3 994
+7 680
+15 360
+
+–
+63
+70
+81
+105
+160
+287
+579
+1 286
+2 719
+
+4 926
+106
+62
+41
+28
+21
+17
+14
+13
+11
+
+– 26 850
+133
+444
+85
+244
+61
+142
+48
+87
+42
+58
+40
+42
+41
+34
+44
+28
+45
+25
+
+39 281
+829
+503
+376
+289
+247
+204
+184
+174
+167
+
+–
+1 166
+728
+591
+501
+463
+453
+459
+468
+546
+
+Switzerland
+
+Network
+
+1
+64
+128
+256
+512
+1 024
+2 048
+4 096
+8 192
+16 384
+
+–
+00:11:29
+00:09:45
+00:08:12
+00:07:18
+00:06:52
+00:06:44
+00:06:42
+00:06:43
+00:06:47
+
+–
+204
+233
+290
+404
+633
+1 126
+2 048
+3 891
+7 578
+
+–
+31
+34
+42
+58
+96
+183
+388
+832
+1 872
+
+5 005
+92
+58
+39
+28
+23
+19
+17
+15
+15
+
+– 35 951
+106
+475
+71
+278
+50
+165
+40
+111
+36
+83
+34
+66
+33
+55
+32
+49
+33
+46
+
+36 368
+907
+617
+439
+346
+298
+264
+243
+229
+222
+
+–
+1 118
+801
+610
+525
+497
+470
+460
+457
+466
+
+28
+
+FLASH-TB: Integrating Arc-Flags and Trip-Based Public Transit Routing
+
+journey unpacking took 5 µs on Paris, 7 µs on Sweden, 11 µs on Switzerland, and 17 µs for
+Germany. For FLASH-TB with the highest evaluated choice of k, this is reduced to 2 µs
+on Sweden and Paris, 3 µs on Switzerland, and 9 µs on Germany. The speedup is due to
+improved cache locality, as the queue of scanned trip segments is much smaller.
+As expected, the preprocessing time of FLASH-TB is independent of k. With the time
+for partitioning the network and the Trans-ULTRA transfer precomputation included, the
+preprocessing takes less than 30 minutes for the three smaller networks. The much higher
+times for Germany indicate that the precomputation effort is quadratic in the network size.
+Flagging the transfers is extremely effective at pruning the search space: With the highest
+number of cells, FLASH-TB reduces the number of scanned trips by a factor of 367 on the
+Paris network, 782 on Switzerland and over 1 000 on the other two networks. Without flag
+compression, this yields speedups of 501 on Germany, 112 on Paris, 448 on Sweden and
+334 on Switzerland. Because the memory consumption scales linearly with the number of
+cells, it quickly becomes very high, whereas the speedup eventually begins to stall. However,
+excellent query times can be achieved with a reasonable amount of data: For a speedup of
+100 over TB, FLASH-TB without memory compression requires a few gigabytes on Germany
+and Paris, and a few hundred megabytes on Sweden and Switzerland. For profile queries,
+the speedups are slightly lower at 457 for Germany, 48 for Paris, 235 for Sweden, and 164
+for Switzerland. This is because self-pruning already thins out the search space of each
+individual run, which means that there is less potential for additional pruning.
+Flag compression reduces the memory consumption by a factor of two to five on Paris and
+four to seven on the other networks. The resulting loss in query speed ranges from almost
+nothing to a factor of four; it is generally greater for higher values of k. This is because the
+performance overhead caused by the additional memory accesses amortizes if cached flag
+patterns are accessed frequently. Once the search space is reduced to a few dozen trips per
+query, this is no longer the case. With flag compression, the highest achieved speedups are
+198 on Germany, 25 on Paris, 123 on Sweden, and 156 on Switzerland. The space required
+for a speedup of 100 over TB is reduced to around 500 MB for Germany and around or less
+than 100 MB for Sweden and Switzerland.
+We observe that Paris, a dense metropolitan network, behaves differently from the other
+networks, which represent entire countries. The overall speedup of FLASH-TB is lower, and
+in relation to the size of the network, the memory consumption is much higher. Whereas a
+speedup of 100 can be achieved with around 10 bytes per transfer on the other networks,
+it requires 500 for Paris. This is both because more cells are required and because flag
+compression is less effective. Similar discrepancies in the performance between metropolitan
+and country networks were observed for Transfer Patterns [2] and TB-CST [25].
+To explain these differences, we analyze how the number of set flags is distributed across
+the set of transfers. Figure 6 shows a histogram of the flag distribution for a partition with
+k = 32 cells. Depending on the network, between 30% and 50% of transfers have no flags
+set at all and are therefore removed at the end of the preprocessing phase. On all networks
+except for Paris, over 70% of the remaining transfers have only one flag set and over 80%
+have at most two. There is also a small group of transfers with all or almost all flags set, but
+there are very few in between. This explains why FLASH-TB is so effective: most transfers
+are only relevant for local, intra-cell travel and can therefore be ignored outside of the target
+cell. For Paris, this effect is weaker because the network consists almost entirely of local
+transport. Accordingly, more flags are set overall and fewer transfers share the same pattern,
+so flag compression is less effective.
+
+E. Großmann, J. Sauer, C. Schulz, P. Steil and S. Witt
+
+29
+
+Figure 6 Flag distributions for k = 32 cells. The bar for value i represents the percentage of
+transfers for which exactly i out of k flags are set.
+
+Germany
+
+Paris
+60
+
+Transfers [%]
+
+Transfers [%]
+
+60
+
+40
+
+20
+
+0
+
+40
+
+20
+
+0
+0
+
+10
+20
+Number of set flags
+
+30
+
+0
+
+Sweden
+
+30
+
+Switzerland
+60
+
+Transfers [%]
+
+60
+
+Transfers [%]
+
+10
+20
+Number of set flags
+
+40
+
+20
+
+0
+
+40
+
+20
+
+0
+0
+
+10
+20
+Number of set flags
+
+30
+
+0
+
+10
+20
+Number of set flags
+
+30
+
+30
+
+FLASH-TB: Integrating Arc-Flags and Trip-Based Public Transit Routing
+
+7.4
+
+Comparison to TB-CST
+
+We compare FLASH-TB to TB-CST, which is the state of the art among speedup techniques
+with a high preprocessing effort. A direct comparison with TP is difficult because we do not
+have access to its original implementation. However, preliminary experiments with our own
+implementation of TP confirmed the findings of [25] that TB-CST without split trees has
+a very similar memory consumption and query performance while the preprocessing time
+is significantly lower. We also do not compare our algorithm to Scalable Transfer Patterns,
+whose query times are barely competitive with TB, or to PTL, which does not support
+journey unpacking.
+The results of our evaluation are shown in Table 3. The precomputation of TB-CST is
+four to ten times faster than that of FLASH-TB, even though both algorithms solve the
+all-to-all problem. This is because our algorithm cannot fully benefit from self-pruning due
+to the ULTRA conditions. However, the additional preprocessing effort pays off in the query
+phase. Whereas TB-CST must reconstruct the earliest reachable trip of each line during
+the query, FLASH-TB can access it directly. Furthermore, TB-CST has an additional time
+overhead for constructing the query graph. Consequently, it is significantly outperformed for
+fixed departure time queries: When comparing TB-CST with split trees to a configuration
+of FLASH-TB that requires approximately the same amount of space, FLASH-TB is two
+to nine times faster. The speedup is especially high for Germany and Paris. On the other
+hand, to achieve the same query speed, FLASH-TB requires between one and two orders
+of magnitude less space. Additionally, the fastest configuration of FLASH-TB outperforms
+TB-CST without split trees while still requiring much less space.
+For profile queries, TB-CST loses much of its disadvantage. Firstly, the construction of
+the query graph takes up a smaller portion of the overall running time. Secondly, instead
+of performing a run for each possible departure time, TB-CST constructs the entire profile
+during a single search within the query graph. Thus, the step of finding the earliest reachable
+trip of a line is performed for all profile entries simultaneously, making it more efficient.
+Consequently, TB-CST answers profile queries slightly faster than FLASH-TB. However, we
+note that our implementation of FLASH-TB is not specifically optimized for profile queries
+and its performance can likely be improved.
+
+8
+
+Conclusion
+
+FLASH-TB constitutes a step towards making extremely fast public transit journey planning
+more practical. It demonstrates for the first time that a moderate amount of precomputed
+data is sufficient to achieve sub-millisecond query times even on country-sized networks. The
+main challenge that must be overcome for this is that the schedule-based nature of public
+transit leads to a highly redundant path structure, in which many journeys are equivalent in
+all criteria and optimal paths between stop events do not necessarily appear in any optimal
+journey. If this redundant information is not discarded in a consistent manner, then either
+the speedup will degrade significantly or some queries will be answered incorrectly.
+Despite these advances, FLASH-TB in its current form is still of limited use to real-world
+journey planning applications. The main drawback is the quadratic preprocessing time,
+which is prohibitive for the largest networks. Some existing algorithms, including Scalable
+TP and Arc-Flags on time-expanded graphs, reduce the preprocessing time by splitting
+the work into intra-cell and inter-cell computations, but this reintroduces redundancies and
+therefore causes a significant blowup in the search space. Thus, the most important open
+question is whether this blowup can be mitigated. Tackling this question may require further
+
+E. Großmann, J. Sauer, C. Schulz, P. Steil and S. Witt
+
+31
+
+Table 3 Performance of TB-CST for 10 000 random fixed departure time queries and 1 000
+random profile queries with a departure time range of 24 hours. Query times are split into the time
+for building the query graph (Build) and exploring it (Search). On the Germany network, TB-CST
+without split trees ran out of memory.
+
+Network
+
+Split Prepro.
+trees? [hh:mm:ss]
+
+Fixed dep. query [µs]
+Build Search
+
+Profile query [µs]
+
+Total Build Search
+
+Total
+
+Memory [MB]
+
+Germany
+
+◦
+•
+
+–
+09:27:42
+
+–
+576
+
+–
+441
+
+–
+1 017
+
+–
+543
+
+–
+609
+
+–
+1 152
+
+OOM
+37 786
+
+Paris
+
+◦
+•
+
+00:04:00
+00:06:17
+
+8
+68
+
+28
+359
+
+36
+427
+
+8
+65
+
+151
+971
+
+159
+1 036
+
+103 928
+2 822
+
+Sweden
+
+◦
+•
+
+00:01:52
+00:03:02
+
+9
+15
+
+11
+32
+
+20
+46
+
+11
+15
+
+40
+83
+
+51
+98
+
+111 370
+1 350
+
+Switzerland
+
+◦
+•
+
+00:01:25
+00:02:30
+
+24
+37
+
+19
+40
+
+44
+77
+
+23
+38
+
+73
+118
+
+96
+156
+
+86 060
+1 559
+
+structural insights.
+Another important issue in practice is handling delays. The search graphs computed by
+TP are known to be very robust in this regard [5]. By comparison, FLASH-TB is likely to
+be more sensitive to delays because its pruning information is highly time-dependent. It
+remains to be shown whether a delay-resistant variant of FLASH-TB can be designed that
+still retains most of its speedup over TB. Finally, real-world timetables cover more than two
+days, e.g., an entire year. Currently, the preprocessing effort of FLASH-TB is proportional
+to the number of days. However, [26] presents a TB variant that handles longer timetables
+efficiently. Incorporating similar ideas into the FLASH-TB preprocessing step may improve
+its scalability for longer timetables.
+
+A
+
+Trans-ULTRA Optimizations
+
+A simplified version of Trans-ULTRA was presented in Section 4.3. In this section, we present
+additional performance optimizations that are carried over from ULTRA. These are based
+on the observation that in order to generate a CP transfer set, it is not necessary to find and
+unpack all canonical journeys, merely those that are candidates.
+In the profile search performed from each source stop ps , this is exploited by skipping all
+runs that cannot produce any candidates. The set of initial stop events that can occur in a
+journey with departure time τdep is given by
+E(ps , τdep ) := {T [i] | τdep + ∆τfp (ps , p(T [i])) = τdep (T [i])}.
+Normally, the profile search performs a run for every departure time τdep such that E(ps , τdep )
+is not empty. We call τdep a candidate departure time if there is a stop event T [i] ∈ E(ps , τdep )
+with p(T [i]) = ps . Let τ1dep , . . . , τkdep be the sequence of candidate departure times, sorted in
+ascending order. To simplify the notation, let τk+1
+dep := ∞. Trans-ULTRA performs a run for
+i
+each candidate departure time τdep in descending order; the non-candidate departure times
+are skipped. As a consequence, the run for τidep may find new journeys whose departure time
+is not exactly τidep but lies in the interval [τidep , τi+1
+dep ). The proof of Lemma 6 still carries
+over to a weaker claim, which is sufficient to prove Theorem 7:
+
+32
+
+FLASH-TB: Integrating Arc-Flags and Trip-Based Public Transit Routing
+
+▶ Lemma 10. Let J be a candidate that is canonical for the query Q = (ps (J), pt (J), τdep (J)).
+After the run for τdep (J) in the canonical rRAPTOR search from ps (J), the representative
+for c(J) at pt (J) is J.
+Another optimization is that the algorithm only maintains parent pointers for representatives whose initial transfer is empty; all other pointer are set to a dummy value. This allows
+the algorithm to efficiently identify whether a found journey is a candidate and needs to be
+unpacked. It can also be leveraged by adding an extra ULTRA condition (U3): Let J be the
+newly found journey and let J ′ be the previous representative. Then J is discarded if J ′ ⪯ J
+and J has a non-empty initial transfer. This does not affect the correctness of Lemma 10
+because (U3) is not fulfilled for any prefix of a canonical candidate.
+References
+1
+
+2
+
+3
+
+4
+
+5
+
+6
+7
+
+8
+
+9
+
+10
+
+Hannah Bast. Car or Public Transport – Two Worlds. In Efficient Algorithms, volume
+5760 of Lecture Notes in Computer Science, pages 355–367. Springer, 2009. doi:10.1007/
+978-3-642-03456-5_24.
+Hannah Bast, Erik Carlsson, Arno Eigenwillig, Robert Geisberger, Chris Harrelson, Veselin
+Raychev, and Fabien Viger. Fast Routing in Very Large Public Transportation Networks using
+Transfer Patterns. In Proceedings of the 18th Annual European Symposium on Algorithms,
+volume 6346 of Lecture Notes in Computer Science, pages 290–301. Springer, 2010. doi:
+10.1007/978-3-642-15775-2_25.
+Hannah Bast, Daniel Delling, Andrew V. Goldberg, Matthias Müller-Hannemann, Thomas
+Pajor, Peter Sanders, Dorothea Wagner, and Renato F. Werneck. Route Planning in Transportation Networks. In Algorithm Engineering: Selected Results and Surveys, volume 9220 of Lecture
+Notes in Computer Science, pages 19–80. Springer, 2016. doi:10.1007/978-3-319-49487-6_2.
+Hannah Bast, Matthias Hertel, and Sabine Storandt. Scalable Transfer Patterns. In Proceedings
+of the 18th Workshop on Algorithm Engineering and Experiments, pages 15–29. Society for
+Industrial and Applied Mathematics, 2016. doi:10.1137/1.9781611974317.2.
+Hannah Bast, Jonas Sternisko, and Sabine Storandt. Delay-Robustness of Transfer Patterns in
+Public Transportation Route Planning. In Proceedings of the 13th Workshop on Algorithmic
+Approaches for Transportation Modelling, Optimization, and Systems, volume 33 of OpenAccess
+Series in Informatics, pages 42–54. Schloss Dagstuhl – Leibniz-Zentrum für Informatik, 2013.
+doi:10.4230/OASIcs.ATMOS.2013.42.
+Reinhard Bauer and Daniel Delling. SHARC: Fast and Robust Unidirectional Routing. Journal
+of Experimental Algorithmics, 14:4:1–4:29, 2010. doi:10.1145/1498698.1537599.
+Moritz Baum, Valentin Buchhold, Jonas Sauer, Dorothea Wagner, and Tobias Zündorf.
+ULTRA: Unlimited Transfers for Efficient Multimodal Journey Planning. Transportation
+Science, 57:1536–1559, 2023. doi:10.1287/trsc.2022.0198.
+Annabell Berger, Daniel Delling, Andreas Gebhardt, and Matthias Müller-Hannemann. Accelerating Time-Dependent Multi-Criteria Timetable Information Is Harder Than Expected. In
+Proceedings of the 9th Workshop on Algorithmic Approaches for Transportation Modelling, Optimization, and Systems, volume 12 of OpenAccess Series in Informatics, pages 2:1–2:21. Schloss
+Dagstuhl – Leibniz-Zentrum für Informatik, 2009. doi:10.4230/OASIcs.ATMOS.2009.2148.
+Gerth S. Brodal and Riko Jacob. Time-Dependent Networks as Models to Achieve Fast Exact
+Time-Table Queries. In Proceedings of the 3rd Workshop on Algorithmic Approaches for
+Transportation Modelling, Optimization, and Systems, volume 92, pages 3–15. Elsevier, 2004.
+doi:10.1016/j.entcs.2003.12.019.
+Edith Cohen, Eran Halperin, Haim Kaplan, and Uri Zwick. Reachability and Distance
+Queries via 2-Hop Labels. SIAM Journal on Computing, 32(5):1338–1355, 2003. doi:10.1137/
+S0097539702403098.
+
+E. Großmann, J. Sauer, C. Schulz, P. Steil and S. Witt
+
+11
+
+Daniel Delling, Julian Dibbelt, Thomas Pajor, and Renato F. Werneck. Public Transit
+Labeling. In Proceedings of the 14th International Symposium on Experimental Algorithms,
+volume 9125 of Lecture Notes in Computer Science, pages 273–285. Springer, 2015. doi:
+10.1007/978-3-319-20086-6_21.
+
+12
+
+Daniel Delling, Thomas Pajor, and Dorothea Wagner. Engineering Time-Expanded Graphs for
+Faster Timetable Information. In Robust and Online Large-Scale Optimization: Models and
+Techniques for Transportation Systems, volume 5868 of Lecture Notes in Computer Science,
+pages 182–206. Springer, 2009. doi:10.1007/978-3-642-05465-5_7.
+
+13
+
+Daniel Delling, Thomas Pajor, and Renato F. Werneck. Round-Based Public Transit Routing.
+Transportation Science, 49(3):591–604, 2015. doi:10.1287/trsc.2014.0534.
+
+14
+
+Edsger W. Dijkstra. A Note on Two Problems in Connexion with Graphs. Numerische
+Mathematik, 1:269–271, 1959. doi:10.1007/BF01386390.
+
+15
+
+Yann Disser, Matthias Müller-Hannemann, and Mathias Schnee. Multi-Criteria Shortest Paths
+in Time-Dependent Train Networks. In Proceedings of the 7th International Workshop on
+Experimental and Efficient Algorithms, volume 5038 of Lecture Notes in Computer Science,
+pages 347–361. Springer, 2008. doi:10.1007/978-3-540-68552-4_26.
+
+16
+
+Ernestine Großmann, Jonas Sauer, Christian Schulz, and Patrick Steil. Arc-Flags Meet
+Trip-Based Public Transit Routing. In Proceedings of the 21st International Symposium on
+Experimental Algorithms, volume 265 of Leibniz International Proceedings in Informatics,
+pages 16:1–16:18. Schloss Dagstuhl – Leibniz-Zentrum für Informatik, 2023. doi:10.4230/
+LIPIcs.SEA.2023.16.
+
+17
+
+Moritz Hilger, Ekkehard Köhler, Rolf H. Möhring, and Heiko Schilling. Fast Point-toPoint Shortest Path Computations with Arc-Flags. In The Shortest Path Problem: Ninth
+DIMACS Implementation Challenge, volume 74 of DIMACS Series in Discrete Mathematics and Theoretical Computer Science, pages 41–72. American Mathematical Society, 2009.
+doi:10.1090/dimacs/074/03.
+
+18
+
+Ulrich Lauther. An Experimental Evaluation of Point-to-Point Shortest Path Calculation
+on Road Networks with Precalculated Edge-Flags. In The Shortest Path Problem: Ninth
+DIMACS Implementation Challenge, volume 74 of DIMACS Series in Discrete Mathematics
+and Theoretical Computer Science, pages 19–40. American Mathematical Society, 2009. doi:
+10.1090/dimacs/074/02.
+
+19
+
+Rolf H. Möhring, Heiko Schilling, Birk Schütz, Dorothea Wagner, and Thomas Willhalm.
+Partitioning Graphs to Speed Up Dijkstra’s Algorithm. Journal of Experimental Algorithmics,
+11:2.8:1–2.8:29, 2006. doi:10.1007/11427186_18.
+
+20
+
+Matthias Müller-Hannemann and Mathias Schnee. Finding All Attractive Train Connections
+by Multi-Criteria Pareto Search. In Algorithmic Methods for Railway Optimization, volume
+4359 of Lecture Notes in Computer Science, pages 246–263. Springer, 2007. doi:10.1007/
+978-3-540-74247-0_13.
+
+21
+
+Evangelia Pyrga, Frank Schulz, Dorothea Wagner, and Christos D. Zaroliagis. Efficient
+Models for Timetable Information in Public Transportation Systems. Journal of Experimental
+Algorithmics, 12:2.4:1–2.4:39, 2008. doi:10.1145/1227161.1227166.
+
+22
+
+Peter Sanders and Christian Schulz. Think Locally, Act Globally: Highly Balanced Graph
+Partitioning. In Proceedings of the 12th International Symposium on Experimental Algorithms,
+volume 7933 of Lecture Notes in Computer Science, pages 164–175. Springer, 2013. doi:
+10.1007/978-3-642-38527-8_16.
+
+23
+
+Patrick Steil. Optimal FIFO Grouping in Public Transit Networks. Technical report,
+Karlsruhe Institute of Technology, 2023. URL: https://arxiv.org/abs/2308.06629, arXiv:
+2308.06629.
+
+24
+
+Sascha Witt. Trip-Based Public Transit Routing. In Proceedings of the 23rd Annual European
+Symposium on Algorithms, volume 9294 of Lecture Notes in Computer Science, pages 1025–1036.
+Springer, 2015. doi:10.1007/978-3-662-48350-3_85.
+
+33
+
+34
+
+FLASH-TB: Integrating Arc-Flags and Trip-Based Public Transit Routing
+
+25
+
+26
+
+Sascha Witt. Trip-Based Public Transit Routing Using Condensed Search Trees. In Proceedings
+of the 16th Workshop on Algorithmic Approaches for Transportation Modelling, Optimization,
+and Systems, volume 54 of OpenAccess Series in Informatics, pages 10:1–10:12. Schloss Dagstuhl
+– Leibniz-Zentrum für Informatik, 2016. doi:10.4230/OASIcs.ATMOS.2016.10.
+Sascha Witt. Extending the Time Horizon: Efficient Public Transit Routing on ArbitraryLength Timetables. Technical report, Karlsruhe Institute of Technology, 2021. URL: https:
+//arxiv.org/abs/2109.14143, arXiv:2109.14143.
+
+
