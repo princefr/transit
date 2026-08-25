@@ -20,7 +20,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -57,29 +58,101 @@ struct Bucket {
     last: Instant,
 }
 
+#[derive(Default)]
+struct KeyCounters {
+    allowed: AtomicU64,
+    rejected: AtomicU64,
+}
+
+struct Entry {
+    cfg: ApiKeyConfig,
+    bucket: Mutex<Bucket>,
+    counters: KeyCounters,
+}
+
 pub struct ApiGate {
-    /// key -> (config, bucket)
-    entries: HashMap<String, (ApiKeyConfig, Mutex<Bucket>)>,
+    /// key -> config + bucket + metering counters
+    entries: HashMap<String, Entry>,
+}
+
+/// Global per-name metering registry (readable from /metrics without holding
+/// the gate itself). Populated once by [`ApiGate::from_config`].
+static KEY_COUNTERS: OnceLock<Mutex<HashMap<String, KeyCounters>>> = OnceLock::new();
+/// Requests rejected for missing/unknown API keys.
+static UNAUTHORIZED_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Whether the gate is open (no keys configured → auth/rate-limit bypassed).
+static GATE_OPEN: AtomicBool = AtomicBool::new(true);
+
+/// Snapshot of one named API key's metering counters.
+pub struct ApiKeyMetric {
+    pub name: String,
+    pub allowed: u64,
+    pub rejected: u64,
+}
+
+/// (gate_open, unauthorized_total, per-key metrics) for the metrics endpoint.
+pub fn api_gate_metrics() -> (bool, u64, Vec<ApiKeyMetric>) {
+    let open = GATE_OPEN.load(Ordering::Relaxed);
+    let unauthorized = UNAUTHORIZED_TOTAL.load(Ordering::Relaxed);
+    let mut keys = Vec::new();
+    if let Some(reg) = KEY_COUNTERS.get() {
+        if let Ok(map) = reg.lock() {
+            for (name, c) in map.iter() {
+                keys.push(ApiKeyMetric {
+                    name: name.clone(),
+                    allowed: c.allowed.load(Ordering::Relaxed),
+                    rejected: c.rejected.load(Ordering::Relaxed),
+                });
+            }
+        }
+    }
+    keys.sort_by(|a, b| a.name.cmp(&b.name));
+    (open, unauthorized, keys)
+}
+
+fn registry_counter(name: &str, allowed: bool) {
+    if let Some(reg) = KEY_COUNTERS.get() {
+        if let Ok(map) = reg.lock() {
+            if let Some(c) = map.get(name) {
+                if allowed {
+                    c.allowed.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    c.rejected.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
 }
 
 impl ApiGate {
     pub fn from_config(cfg: &ApiConfig) -> Self {
-        let entries = cfg
+        let entries: HashMap<String, Entry> = cfg
             .keys
             .iter()
             .map(|k| {
                 (
                     k.key.clone(),
-                    (
-                        k.clone(),
-                        Mutex::new(Bucket {
+                    Entry {
+                        cfg: k.clone(),
+                        bucket: Mutex::new(Bucket {
                             tokens: k.burst as f64,
                             last: Instant::now(),
                         }),
-                    ),
+                        counters: KeyCounters::default(),
+                    },
                 )
             })
             .collect();
+        // Seed the global registry so /metrics exposes every configured key
+        // from startup (even at zero requests).
+        let reg = KEY_COUNTERS.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Ok(mut map) = reg.lock() {
+            for k in &cfg.keys {
+                let name = if k.name.is_empty() { "unnamed" } else { &k.name };
+                map.entry(name.to_string()).or_default();
+            }
+        }
+        GATE_OPEN.store(entries.is_empty(), Ordering::Relaxed);
         Self { entries }
     }
 
@@ -103,15 +176,18 @@ pub async fn api_gate_middleware(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     if key.is_empty() {
+        UNAUTHORIZED_TOTAL.fetch_add(1, Ordering::Relaxed);
         return (
             StatusCode::UNAUTHORIZED,
             "missing X-API-Key header",
         )
             .into_response();
     }
-    let Some((cfg, bucket)) = gate.entries.get(key) else {
+    let Some(entry) = gate.entries.get(key) else {
+        UNAUTHORIZED_TOTAL.fetch_add(1, Ordering::Relaxed);
         return (StatusCode::UNAUTHORIZED, "invalid API key").into_response();
     };
+    let (cfg, bucket) = (&entry.cfg, &entry.bucket);
     let now = Instant::now();
     let ok = {
         let mut b = bucket.lock().unwrap();
@@ -126,11 +202,21 @@ pub async fn api_gate_middleware(
         }
     };
     if !ok {
+        entry.counters.rejected.fetch_add(1, Ordering::Relaxed);
+        registry_counter(
+            if cfg.name.is_empty() { "unnamed" } else { &cfg.name },
+            false,
+        );
         return (
             StatusCode::TOO_MANY_REQUESTS,
             "rate limit exceeded",
         )
             .into_response();
     }
+    entry.counters.allowed.fetch_add(1, Ordering::Relaxed);
+    registry_counter(
+        if cfg.name.is_empty() { "unnamed" } else { &cfg.name },
+        true,
+    );
     next.run(request).await
 }

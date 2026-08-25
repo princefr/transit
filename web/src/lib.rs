@@ -593,6 +593,7 @@ async fn plan_itineraries(
     wheelchair: bool,
     bike_from: bool,
     bike_to: bool,
+    excluded_lines: &[String],
 ) -> Result<Value, String> {
     let place_json = |p: &PlacePick| -> Value {
         if p.kind == "address" {
@@ -626,7 +627,7 @@ async fn plan_itineraries(
             legs {
               __typename
               ... on TransitLeg {
-                mode routeShortName routeLongName tripShortName tripId
+                mode routeShortName routeLongName tripShortName tripId routeId
                 stopHeadsign headsign
                 routeColor routeTextColor wheelchair bikesAllowed
                 sameVehicle
@@ -641,12 +642,13 @@ async fn plan_itineraries(
                   realtimeArrival realtimeDeparture
                 }
                 geometry { lat lon }
-                vehicle { lat lon bearing label occupancy currentStatus updatedAt }
-                alerts {
-                  id header description severity cause effect
-                  lines { shortName color textColor }
-                }
-              }
+                 vehicle { lat lon bearing label occupancy currentStatus updatedAt }
+                 alerts {
+                   id header description severity cause effect
+                   informedRouteIds
+                   lines { shortName color textColor }
+                 }
+               }
               ... on WalkLeg {
                 mode
                 durationSeconds distanceMeters
@@ -680,6 +682,9 @@ async fn plan_itineraries(
     }
     input["bikeFrom"] = json!(bike_from);
     input["bikeTo"] = json!(bike_to);
+    if !excluded_lines.is_empty() {
+        input["excludedLines"] = json!(excluded_lines);
+    }
     let vars = json!({ "input": input });
     let data = match gql(q, vars.clone()).await {
         Ok(d) => d,
@@ -700,7 +705,7 @@ async fn plan_itineraries(
                     legs {
                       __typename
                       ... on TransitLeg {
-                        mode routeShortName routeLongName tripShortName tripId
+                        mode routeShortName routeLongName tripShortName tripId routeId
                         stopHeadsign headsign
                         routeColor routeTextColor wheelchair bikesAllowed
                         sameVehicle
@@ -1239,6 +1244,8 @@ struct App {
     selected: Option<usize>,
     /// Last plan used « Fauteuil roulant » — show wheelchair badges on results.
     plan_wheelchair: bool,
+    /// Scenario planning: lines excluded from routing («Replanifier sans cette ligne»).
+    excluded_lines: Vec<String>,
     origin_timer: Option<gloo_timers::callback::Timeout>,
     dest_timer: Option<gloo_timers::callback::Timeout>,
     /// Bumped whenever live tracking should cancel in-flight work.
@@ -1266,6 +1273,7 @@ impl App {
             journeys: Vec::new(),
             selected: None,
             plan_wheelchair: false,
+            excluded_lines: Vec::new(),
             origin_timer: None,
             dest_timer: None,
             live_gen: 0,
@@ -1288,6 +1296,225 @@ fn wheelchair_badge_html() -> String {
         mode_icon_path("wheelchair")
     )
 }
+
+// ─── Alert-aware rerouting ──────────────────────────────────────────────────
+
+/// Extract an IDFM product code (e.g. `C01742`) from a route ref / LineRef.
+/// Mirrors the backend matcher in src/routing/journey.rs (`product_code_token`).
+fn product_code_token(raw: &str) -> Option<String> {
+    for part in raw.split(|c: char| !c.is_ascii_alphanumeric()) {
+        let p = part.trim();
+        if p.len() >= 5
+            && p.len() <= 8
+            && p.as_bytes()[0].eq_ignore_ascii_case(&b'C')
+            && p[1..].bytes().all(|c| c.is_ascii_digit())
+        {
+            return Some(p.to_ascii_uppercase());
+        }
+    }
+    None
+}
+
+/// Truncate a string on char boundaries with an ellipsis.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max).collect::<String>())
+    }
+}
+
+/// Best-effort namespaced route id candidates for a transit leg.
+///
+/// The GraphQL `TransitLeg` does not expose its GTFS route id; derive candidates
+/// from the leg's alerts (`informedRouteIds`, e.g. SIRI LineRefs
+/// « idfm:STIF:Line::C01742: »), normalized toward GTFS route-id shapes
+/// (« idfm:C01742 ») using the feed prefix of the leg trip id. Routing compares
+/// `excludedLines` exactly against trip route ids, so extra candidates are sent
+/// too — unmatched entries are simply ignored server-side.
+fn leg_route_id_candidates(leg: &Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let push = |out: &mut Vec<String>, s: String| {
+        if !s.is_empty() && !out.contains(&s) {
+            out.push(s);
+        }
+    };
+    // Primary source: the backend now exposes the GTFS route id directly.
+    if let Some(rid) = leg.get("routeId").and_then(|r| r.as_str()) {
+        push(&mut out, rid.to_string());
+    }
+    let feed = leg
+        .get("tripId")
+        .and_then(|x| x.as_str())
+        .and_then(|t| t.split(':').next())
+        .filter(|f| !f.is_empty())
+        .unwrap_or("idfm")
+        .to_string();
+    if let Some(alerts) = leg.get("alerts").and_then(|a| a.as_array()) {
+        for a in alerts {
+            if let Some(rids) = a.get("informedRouteIds").and_then(|r| r.as_array()) {
+                for rid in rids.iter().filter_map(|r| r.as_str()) {
+                    push(&mut out, rid.to_string());
+                    if let Some(code) = product_code_token(rid) {
+                        push(&mut out, format!("{feed}:{code}"));
+                    }
+                    let tail = rid
+                        .rsplit(|c| c == ':' || c == '/')
+                        .find(|p| !p.is_empty())
+                        .unwrap_or(rid);
+                    if tail.len() >= 3 && tail.len() <= 12 {
+                        push(&mut out, format!("{feed}:{tail}"));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// True when this transit leg carries an active disruption (canceled or alert).
+fn leg_disrupted(leg: &Value) -> bool {
+    leg.get("canceled").and_then(|x| x.as_bool()) == Some(true)
+        || leg
+            .get("alerts")
+            .and_then(|a| a.as_array())
+            .is_some_and(|a| !a.is_empty())
+}
+
+/// Orange warning chip for a disrupted leg: short alert text + full tooltip.
+fn leg_alert_chip_html(leg: &Value) -> String {
+    let Some(alerts) = leg.get("alerts").and_then(|a| a.as_array()) else {
+        return String::new();
+    };
+    let headers: Vec<&str> = alerts
+        .iter()
+        .filter_map(|a| a.get("header").and_then(|x| x.as_str()))
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .collect();
+    if headers.is_empty() {
+        return r#" <span class="alert-chip" title="Perturbation sur cette ligne">⚠ Perturbation</span>"#.to_string();
+    }
+    let title = headers.join(" — ");
+    format!(
+        r#" <span class="alert-chip" title="{title}">⚠ {short}</span>"#,
+        title = escape_html(&truncate_chars(&title, 200)),
+        short = escape_html(&truncate_chars(headers[0], 48)),
+    )
+}
+
+/// « Replanifier sans cette ligne » button for a disrupted transit leg.
+/// Empty when no route id candidate could be derived from the leg alerts.
+fn replan_button_html(leg: &Value, journey_idx: Option<usize>) -> String {
+    if !leg_disrupted(leg) {
+        return String::new();
+    }
+    let ids = leg_route_id_candidates(leg);
+    if ids.is_empty() {
+        return String::new();
+    }
+    let jidx = journey_idx.map(|i| i.to_string()).unwrap_or_default();
+    format!(
+        r#" <button type="button" class="replan-btn" data-journey-idx="{jidx}" data-route-ids="{ids}" title="Recalculer un itinéraire sans cette ligne (scénario)">Replanifier sans cette ligne</button>"#,
+        ids = escape_html(&ids.join("|")),
+    )
+}
+
+/// Banner shown above the results while lines are excluded from routing.
+fn excluded_banner_html(app: &App) -> String {
+    if app.excluded_lines.is_empty() {
+        return String::new();
+    }
+    let labels: Vec<String> = app
+        .excluded_lines
+        .iter()
+        .map(|r| {
+            // Display the significant tail («C01742» / line code) rather than the feed.
+            r.rsplit(':')
+                .find(|p| !p.is_empty())
+                .unwrap_or(r.as_str())
+                .to_string()
+        })
+        .collect();
+    let n = labels.len();
+    format!(
+        r#"<div class="excluded-banner" role="status">🚫 Ligne{s} exclue{s} de la recherche : <b>{labels}</b><button type="button" class="excluded-clear" title="Relancer la recherche avec toutes les lignes">Rétablir</button></div>"#,
+        s = if n > 1 { "s" } else { "" },
+        labels = escape_html(&labels.join(", ")),
+    )
+}
+
+/// Add a line to the exclusion set and re-run the itinerary search.
+fn replan_without_line(route_ids: &str) {
+    let added: Vec<String> = route_ids
+        .split('|')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    APP.with(|app| {
+        let mut a = app.borrow_mut();
+        for r in added {
+            if !a.excluded_lines.contains(&r) {
+                a.excluded_lines.push(r);
+            }
+        }
+    });
+    set_status("Ligne exclue — recalcul de l’itinéraire…", false);
+    plan_clicked();
+}
+
+/// Clear all exclusions and re-run the itinerary search.
+fn clear_excluded_lines() {
+    APP.with(|app| app.borrow_mut().excluded_lines.clear());
+    set_status("Lignes rétablies — recalcul de l’itinéraire…", false);
+    plan_clicked();
+}
+
+/// Bind click handlers for «Replanifier sans cette ligne» buttons and the
+/// exclusion banner's «Rétablir» inside the given container.
+fn bind_replan_actions(container: &Element) {
+    if let Some(list) = container.query_selector_all(".replan-btn").ok() {
+        for i in 0..list.length() {
+            if let Some(node) = list.item(i) {
+                if let Ok(elem) = node.dyn_into::<Element>() {
+                    let ids = elem.get_attribute("data-route-ids").unwrap_or_default();
+                    let closure = Closure::wrap(Box::new(move |e: web_sys::MouseEvent| {
+                        e.stop_propagation();
+                        e.prevent_default();
+                        replan_without_line(&ids);
+                    })
+                        as Box<dyn FnMut(_)>);
+                    let _ = elem.add_event_listener_with_callback(
+                        "click",
+                        closure.as_ref().unchecked_ref(),
+                    );
+                    closure.forget();
+                }
+            }
+        }
+    }
+    if let Some(list) = container.query_selector_all(".excluded-clear").ok() {
+        for i in 0..list.length() {
+            if let Some(node) = list.item(i) {
+                if let Ok(elem) = node.dyn_into::<Element>() {
+                    let closure = Closure::wrap(Box::new(move |e: web_sys::MouseEvent| {
+                        e.stop_propagation();
+                        e.prevent_default();
+                        clear_excluded_lines();
+                    })
+                        as Box<dyn FnMut(_)>);
+                    let _ = elem.add_event_listener_with_callback(
+                        "click",
+                        closure.as_ref().unchecked_ref(),
+                    );
+                    closure.forget();
+                }
+            }
+        }
+    }
+}
+
 
 /// Collect disruption messages for a journey (journey.alerts + leg.alerts + headers).
 fn journey_disruption_messages(j: &Value) -> Vec<(String, String, String)> {
@@ -2599,11 +2826,17 @@ fn format_fare(amount: f64, currency: Option<&str>) -> String {
 }
 
 fn render_journeys(app: &App) {
+    let excl_banner = excluded_banner_html(app);
     if app.journeys.is_empty() {
         set_html(
             "journeys",
-            r#"<div class="empty">Aucun itinéraire. Recherchez une gare ou une ville, puis calculez.</div>"#,
+            &format!(
+                r#"{excl_banner}<div class="empty">Aucun itinéraire. Recherchez une gare ou une ville, puis calculez.</div>"#
+            ),
         );
+        if let Some(c) = el("journeys") {
+            bind_replan_actions(&c);
+        }
         return;
     }
     let mut html = String::new();
@@ -2773,7 +3006,9 @@ fn render_journeys(app: &App) {
                         }
                     }
                     if canceled {
-                        extra.push_str(r#" <span class="badge-danger">supprimé</span>"#);
+                        extra.push_str(
+                            r#" <span class="alert-chip alert-chip--canceled" title="Course supprimée en temps réel">⛔ Supprimé</span>"#,
+                        );
                     } else if let Some(d) = delay {
                         if d != 0 {
                             extra.push_str(&format!(
@@ -2787,11 +3022,10 @@ fn render_journeys(app: &App) {
                         .and_then(|a| a.as_array())
                         .map(|a| a.len())
                         .unwrap_or(0);
-                    if leg_alerts > 0 {
-                        extra.push_str(&format!(
-                            r#" <span class="leg-alert-sign" title="Perturbation sur cette course">⚠</span>"#
-                        ));
+                    if leg_alerts > 0 && !canceled {
+                        extra.push_str(&leg_alert_chip_html(leg));
                     }
+                    extra.push_str(&replan_button_html(leg, Some(i)));
                     legs_html.push_str(&format!(
                         r#"<div class="leg{leg_cls}"><img class="mode-icon" src="{icon}" alt="{mode_alt}"/><div>{chip}{mode} {trip} · {times} · {from} → {to}{extra}</div></div>"#,
                         icon = mode_icon_path(&mode),
@@ -2900,12 +3134,17 @@ fn render_journeys(app: &App) {
         ""
     };
     let header = format!(
-        r#"<div class="journeys-header"><span class="journeys-count">{} proposition{}</span>{pmr_note}<span class="journeys-hint">Cliquer pour afficher sur la carte</span></div>"#,
+        r#"{excl_banner}<div class="journeys-header"><span class="journeys-count">{} proposition{}</span>{pmr_note}<span class="journeys-hint">Cliquer pour afficher sur la carte</span></div>"#,
         app.journeys.len(),
         if app.journeys.len() > 1 { "s" } else { "" },
         pmr_note = pmr_note
     );
     set_html("journeys", &format!("{header}{html}"));
+
+    // Reroute actions (replan buttons + exclusion banner)
+    if let Some(c) = el("journeys") {
+        bind_replan_actions(&c);
+    }
 
     // Bind click handlers (do not steal clicks on expandable disruption <details>)
     if let Some(container) = el("journeys") {
@@ -2923,6 +3162,8 @@ fn render_journeys(app: &App) {
                                     if let Ok(el) = t.dyn_into::<web_sys::Element>() {
                                         if el.closest("details.disruption-panel").ok().flatten().is_some()
                                             || el.closest("summary").ok().flatten().is_some()
+                                            || el.closest(".replan-btn").ok().flatten().is_some()
+                                            || el.closest(".excluded-clear").ok().flatten().is_some()
                                         {
                                             e.stop_propagation();
                                             return;
@@ -3438,13 +3679,20 @@ fn show_trip_detail_card(journey: &Value) {
                 };
                 let mut badges = String::new();
                 if canceled {
-                    badges.push_str(r#" <span class="badge-danger">supprimé</span>"#);
+                    badges.push_str(
+                        r#" <span class="alert-chip alert-chip--canceled" title="Course supprimée en temps réel">⛔ Supprimé</span>"#,
+                    );
                 } else if delay != 0 {
                     badges.push_str(&format!(
                         r#" <span class="delay">{}</span>"#,
                         format_delay_minutes(delay)
                     ));
                 }
+                if !canceled {
+                    badges.push_str(&leg_alert_chip_html(leg));
+                }
+                let jidx = APP.with(|app| app.borrow().selected);
+                badges.push_str(&replan_button_html(leg, jidx));
                 if same_vehicle {
                     badges.push_str(
                         r#" <span class="same-vehicle-badge">même véhicule</span>"#,
@@ -3604,6 +3852,11 @@ fn show_trip_detail_card(journey: &Value) {
 
     body.push_str("</ol>");
     set_html("trip-detail-body", &format!("{body_prefix}{body}"));
+
+    // Reroute actions inside the detail card timeline
+    if let Some(body_el) = el("trip-detail-body") {
+        bind_replan_actions(&body_el);
+    }
 
     if let Some(card) = el("trip-detail-card") {
         let _ = card.remove_attribute("hidden");
@@ -3928,6 +4181,7 @@ fn plan_clicked() {
     let wheelchair = checkbox_checked("wheelchair");
     let bike_from = checkbox_checked("bike-from");
     let bike_to = checkbox_checked("bike-to");
+    let excluded = APP.with(|app| app.borrow().excluded_lines.clone());
     set_status("Recherche d’itinéraires…", false);
     set_plan_loading(true);
 
@@ -3940,6 +4194,7 @@ fn plan_clicked() {
             wheelchair,
             bike_from,
             bike_to,
+            &excluded,
         )
         .await;
         set_plan_loading(false);
@@ -3981,10 +4236,20 @@ fn plan_clicked() {
                     stop_live_tracking();
                     stop_global_live();
                     call_map("clearJourneyAndFocus", None);
+                    let excl_note = if excluded.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            " Lignes exclues de la recherche : {}. Rétablissez-les si nécessaire.",
+                            excluded.join(", ")
+                        )
+                    };
                     set_status(
-                        "Aucun itinéraire pour ce trajet. Essayez des gares ou villes \
-                         (ex. Aulnay-sous-Bois → Gare du Nord). Attendez le chargement \
-                         du réseau si la Santé indique peu de trips.",
+                        &format!(
+                            "Aucun itinéraire pour ce trajet. Essayez des gares ou villes \
+                             (ex. Aulnay-sous-Bois → Gare du Nord). Attendez le chargement \
+                             du réseau si la Santé indique peu de trips.{excl_note}"
+                        ),
                         true,
                     );
                 } else {

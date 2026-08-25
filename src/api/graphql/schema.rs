@@ -1450,6 +1450,118 @@ impl QueryRoot {
 
 pub struct SubscriptionRoot;
 
+/// Snapshot of real + synthetic vehicle positions inside an axis-aligned bbox.
+///
+/// Mirrors the geo-filtering half of the `vehicles` query (real GPS VP wins over
+/// synthetic TripUpdate estimates) without cache/prim-interest side effects.
+fn vehicles_in_bbox(
+    rt: &crate::rt::overlay::RealtimeOverlay,
+    epoch: Option<&crate::gtfs::pack::StaticEpoch>,
+    min_lat: f64,
+    min_lon: f64,
+    max_lat: f64,
+    max_lon: f64,
+    limit: usize,
+) -> Vec<VehiclePosition> {
+    let in_box =
+        |lat: f64, lon: f64| lat >= min_lat && lat <= max_lat && lon >= min_lon && lon <= max_lon;
+
+    let mut feed_ids: Vec<String> = rt.feeds.keys().cloned().collect();
+    feed_ids.sort_by_key(|f| match f.as_str() {
+        "idfm" => 0u8,
+        "sncf" => 2,
+        _ => 1,
+    });
+
+    let mut out: Vec<VehiclePosition> = Vec::new();
+    let mut real_bases: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    'real: for fid in &feed_ids {
+        let Some(fr) = rt.feeds.get(fid) else {
+            continue;
+        };
+        for v in fr.vehicles.values() {
+            if !in_box(v.lat, v.lon) {
+                continue;
+            }
+            let trip_rt = v
+                .trip_id
+                .as_deref()
+                .and_then(|tid| fr.get_trip(tid).or_else(|| rt.get_trip(tid)));
+            out.push(map_vehicle_enriched(v, Some(fid.as_str()), epoch, trip_rt));
+            if let Some(ref tid) = v.trip_id {
+                let base = tid.rsplit_once('@').map(|(b, _)| b).unwrap_or(tid);
+                real_bases.insert(base.to_string());
+            }
+            if out.len() >= limit {
+                break 'real;
+            }
+        }
+    }
+
+    if out.len() < limit {
+        for fid in &feed_ids {
+            if out.len() >= limit {
+                break;
+            }
+            let Some(fr) = rt.feeds.get(fid) else {
+                continue;
+            };
+            let updated_at = fr.trip_updates_fetched_at.unwrap_or_else(Utc::now);
+            let Some(epoch) = epoch else {
+                continue;
+            };
+            for (trip_key, trip) in &fr.trips {
+                if trip.canceled || trip.stop_updates.is_empty() || trip_key.contains(":#r=") {
+                    continue;
+                }
+                let base = trip_key
+                    .rsplit_once('@')
+                    .map(|(b, _)| b)
+                    .unwrap_or(trip_key.as_str());
+                if real_bases.contains(base) || rt.has_vehicle_for_trip(base) {
+                    continue;
+                }
+                let Some(synth) =
+                    synthetic_vehicle_from_trip_update(fid, trip_key, trip, epoch, updated_at)
+                else {
+                    continue;
+                };
+                if !in_box(synth.lat, synth.lon) {
+                    continue;
+                }
+                out.push(map_vehicle_enriched(&synth, Some(fid.as_str()), Some(epoch), Some(trip)));
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Order-independent fingerprint of a snapshot (ids + rounded positions + delay)
+/// so identical payloads are not re-emitted.
+fn snapshot_fingerprint(vs: &[VehiclePosition]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut parts: Vec<String> = vs
+        .iter()
+        .map(|v| {
+            format!(
+                "{}|{:.5}|{:.5}|{}",
+                v.trip_id.as_ref().map(|i| i.0.as_str()).unwrap_or(""),
+                v.lat,
+                v.lon,
+                v.delay_seconds.unwrap_or(0)
+            )
+        })
+        .collect();
+    parts.sort();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    parts.hash(&mut h);
+    h.finish()
+}
+
 #[Subscription]
 impl SubscriptionRoot {
     async fn feed_status(
@@ -1515,6 +1627,58 @@ impl SubscriptionRoot {
                     Ok(RtVersion(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        })
+    }
+
+    /// Live vehicle-position snapshots for a map viewport.
+    ///
+    /// Emits all vehicles (real GPS + synthetic estimates) inside the bbox,
+    /// polled every `intervalSecs` (clamped 2–30, default 5). A payload is sent
+    /// only when the snapshot changed. Stream ends when the client disconnects.
+    async fn vehicles_live(
+        &self,
+        ctx: &Context<'_>,
+        min_lat: f64,
+        min_lon: f64,
+        max_lat: f64,
+        max_lon: f64,
+        #[graphql(default = 5)] interval_secs: i32,
+    ) -> Result<impl Stream<Item = Vec<VehiclePosition>> + 'static> {
+        if !(min_lat < max_lat && min_lon < max_lon)
+            || !(-90.0..=90.0).contains(&min_lat)
+            || !(-90.0..=90.0).contains(&max_lat)
+            || !(-180.0..=180.0).contains(&min_lon)
+            || !(-180.0..=180.0).contains(&max_lon)
+        {
+            return Err(gql_err("invalid bbox", "BAD_REQUEST"));
+        }
+        let state = ctx.data::<Arc<AppState>>()?.clone();
+        Ok(async_stream::stream! {
+            let period = std::time::Duration::from_secs(interval_secs.clamp(2, 30) as u64);
+            let mut tick = tokio::time::interval(period);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut last_fp: u64 = 0;
+            let mut first = true;
+            loop {
+                tick.tick().await;
+                let rt = state.load_rt();
+                let epoch = state.load_epoch();
+                let snap = vehicles_in_bbox(
+                    &rt,
+                    Some(epoch.as_ref()),
+                    min_lat,
+                    min_lon,
+                    max_lat,
+                    max_lon,
+                    500,
+                );
+                let fp = snapshot_fingerprint(&snap);
+                if first || fp != last_fp {
+                    first = false;
+                    last_fp = fp;
+                    yield snap;
                 }
             }
         })

@@ -1559,6 +1559,9 @@ pub struct TransitLeg {
     pub mode: Mode,
     pub route_short_name: Option<String>,
     pub route_long_name: Option<String>,
+    /// Namespaced GTFS route id (`feed:routeId`) — use with `excludedLines`
+    /// for scenario replanning.
+    pub route_id: Option<String>,
     pub agency_name: Option<String>,
     pub trip_id: Option<ID>,
     pub headsign: Option<String>,
@@ -2027,6 +2030,7 @@ pub fn map_journey(
                     mode: mode_from_str(&t.mode),
                     route_short_name: Some(t.route_short_name.clone()),
                     route_long_name: Some(t.route_long_name.clone()),
+                    route_id: Some(t.route_id.clone()),
                     agency_name: t.agency_name.clone(),
                     trip_id: Some(ID(t.trip_id.clone())),
                     headsign: t.headsign.clone(),

@@ -1453,6 +1453,79 @@ button.btn {
   border-radius: 4px;
 }
 
+/* ── Alert-aware rerouting (disruption chips + replan actions) ── */
+
+.alert-chip {
+  display: inline-block;
+  font-size: 0.65rem;
+  font-weight: 700;
+  line-height: 1.4;
+  color: #9a3412;
+  background: #ffedd5;
+  border: 1px solid #fdba74;
+  padding: 0.08rem 0.4rem;
+  border-radius: 4px;
+  max-width: 15rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+.alert-chip--canceled {
+  color: #fff;
+  background: #dc2626;
+  border-color: #b91c1c;
+}
+
+.replan-btn {
+  display: inline-block;
+  font: inherit;
+  font-size: 0.65rem;
+  font-weight: 650;
+  color: hsl(var(--primary));
+  background: transparent;
+  border: 1px solid hsl(var(--primary) / 0.35);
+  padding: 0.08rem 0.45rem;
+  border-radius: 999px;
+  cursor: pointer;
+  vertical-align: middle;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.replan-btn:hover {
+  background: hsl(var(--primary) / 0.08);
+  border-color: hsl(var(--primary) / 0.6);
+}
+
+.excluded-banner {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  font-size: 0.75rem;
+  color: #92400e;
+  background: #fffbeb;
+  border: 1px solid #fcd34d;
+  border-radius: var(--radius);
+  padding: 0.4rem 0.55rem;
+  margin-bottom: 0.5rem;
+}
+
+.excluded-clear {
+  font: inherit;
+  font-size: 0.7rem;
+  font-weight: 650;
+  color: hsl(var(--primary));
+  background: transparent;
+  border: none;
+  text-decoration: underline;
+  cursor: pointer;
+  margin-left: auto;
+  padding: 0 0.15rem;
+}
+
+
 .same-vehicle-badge {
   display: inline-block;
   font-size: 0.65rem;

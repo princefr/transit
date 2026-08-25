@@ -55,6 +55,42 @@ pub async fn metrics(Extension(state): Extension<Arc<AppState>>) -> Response {
         }
     }
 
+    let (gate_open, unauthorized_total, key_metrics) = crate::api::gate::api_gate_metrics();
+    body.push_str(
+        "# HELP transit_api_gate_open Whether the API gate is open (no auth/rate-limit required)\n",
+    );
+    body.push_str("# TYPE transit_api_gate_open gauge\n");
+    body.push_str(&format!(
+        "transit_api_gate_open {}\n",
+        if gate_open { 1 } else { 0 }
+    ));
+
+    body.push_str(
+        "# HELP transit_api_unauthorized_total Requests rejected for missing/unknown API keys\n",
+    );
+    body.push_str("# TYPE transit_api_unauthorized_total counter\n");
+    body.push_str(&format!("transit_api_unauthorized_total {unauthorized_total}\n"));
+
+    body.push_str("# HELP transit_api_key_requests_total Requests allowed per API key name\n");
+    body.push_str("# TYPE transit_api_key_requests_total counter\n");
+    for k in &key_metrics {
+        body.push_str(&format!(
+            "transit_api_key_requests_total{{key=\"{}\"}} {}\n",
+            sanitize_label(&k.name),
+            k.allowed
+        ));
+    }
+
+    body.push_str("# HELP transit_api_key_rejected_total Requests rate-limited per API key name\n");
+    body.push_str("# TYPE transit_api_key_rejected_total counter\n");
+    for k in &key_metrics {
+        body.push_str(&format!(
+            "transit_api_key_rejected_total{{key=\"{}\"}} {}\n",
+            sanitize_label(&k.name),
+            k.rejected
+        ));
+    }
+
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
