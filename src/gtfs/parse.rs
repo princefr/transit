@@ -519,7 +519,14 @@ pub fn load_gtfs_bytes_with_horizon(
     let mut trips: Vec<TripRecord> = Vec::new();
     let mut trip_id_to_idx: HashMap<String, u32> = HashMap::new();
 
-    for (raw_trip, mut list) in times_by_trip {
+    // Deterministic trip order — HashMap iteration is randomly seeded per
+    // process, which would otherwise shuffle `epoch.trips`, breaking FLASH-TB
+    // disk-cache shape validation and run-to-run reproducibility.
+    let mut ordered_trips: Vec<(String, Vec<(u16, PackedStopTime)>)> =
+        times_by_trip.into_iter().collect();
+    ordered_trips.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (raw_trip, mut list) in ordered_trips {
         list.sort_by_key(|(seq, _)| *seq);
         let Some(meta) = trip_meta.get(&raw_trip) else {
             continue;

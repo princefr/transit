@@ -6,7 +6,7 @@ use chrono::{TimeZone, Utc};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
-use transit::gtfs::pack::build_epoch;
+use transit::gtfs::pack::{build_epoch_with_flash, FlashMode};
 use transit::gtfs::parse::load_gtfs_zip;
 use transit::routing::{plan_journeys, ItineraryQuery};
 use transit::search::search_stops;
@@ -23,8 +23,10 @@ fn make_query_geo(
 ) -> ItineraryQuery {
     let dep = Utc.with_ymd_and_hms(2026, 7, 30, hour, minute, 0).unwrap();
     ItineraryQuery {
-        from_stop_id: Some(from.raw_id.clone()),
-        to_stop_id: Some(to.raw_id.clone()),
+        // Namespaced id (matches epoch.stop_id_to_idx keys) — exercises the
+        // same stop-resolution path the GraphQL API uses.
+        from_stop_id: Some(from.id.clone()),
+        to_stop_id: Some(to.id.clone()),
         from_lat: from.lat,
         from_lon: from.lon,
         to_lat: to.lat,
@@ -76,17 +78,22 @@ fn bench_idfm_raptor_vs_tbr() {
     let bundle = load_gtfs_zip("idfm", &zip_path).expect("failed to load IDFM GTFS");
     eprintln!("  loaded in {:.1}s", t0.elapsed().as_secs_f64());
 
-    eprintln!("Building epoch (includes 64-cell partition + Arc-Flags)...");
+    eprintln!("Building epoch (layout-graph partition + FLASH-TB arc-flags)...");
     let t0 = Instant::now();
-    let epoch = build_epoch(vec![Arc::new(bundle)], vec![]);
+    let flash_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/flash");
+    let epoch = build_epoch_with_flash(
+        vec![Arc::new(bundle)],
+        vec![],
+        transit::gtfs::pack::FlashMode::Persist(&flash_dir),
+    );
     eprintln!("  built in {:.1}s", t0.elapsed().as_secs_f64());
     eprintln!(
-        "  stops={}, trips={}, walk_edges={}, cells={}, arc_flags={}",
+        "  stops={}, trips={}, walk_edges={}, cells={}, flag_patterns={}",
         epoch.stop_count(),
         epoch.trip_count(),
         epoch.walk_edges.len(),
         epoch.num_cells,
-        epoch.arc_flags.len(),
+        epoch.flag_patterns.len(),
     );
 
     let test_pairs = vec![
@@ -139,6 +146,13 @@ fn bench_idfm_raptor_vs_tbr() {
         }
         let t_us_1shot = t0.elapsed().as_micros() as f64 / iterations as f64;
 
+        // Benchmark RAPTOR 1-shot (same single-departure pass)
+        let t0 = Instant::now();
+        for _ in 0..iterations {
+            let _ = plan_journeys(&epoch, &q_raptor_1shot);
+        }
+        let r_us_1shot = t0.elapsed().as_micros() as f64 / iterations as f64;
+
         // Benchmark RAPTOR API pipeline
         let t0 = Instant::now();
         for _ in 0..iterations {
@@ -182,8 +196,8 @@ fn bench_idfm_raptor_vs_tbr() {
             from_name, to_name, desc
         );
         eprintln!(
-            "  RAPTOR Full API:  {:>8.1} µs/op\n  FLASH-TB Full API: {:>8.1} µs/op | Speedup: {:>5.2}x | {}\n  FLASH-TB 1-Shot:   {:>8.1} µs/op",
-            r_us, t_us, speedup, match_status, t_us_1shot
+            "  RAPTOR Full API:  {:>8.1} µs/op\n  FLASH-TB Full API: {:>8.1} µs/op | Speedup: {:>5.2}x | {}\n  RAPTOR 1-Shot:     {:>8.1} µs/op\n  FLASH-TB 1-Shot:   {:>8.1} µs/op",
+            r_us, t_us, speedup, match_status, r_us_1shot, t_us_1shot
         );
         eprintln!("--------------------------------------------------------------------------");
     }

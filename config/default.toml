@@ -35,11 +35,13 @@ max_depth = 15
 itinerary_timeout_secs = 90
 
 # Base Adresse Nationale — local autocomplete (see crates/ban-search).
-# Build index: make ban-index   (downloads IDF depts + writes data/ban/index.bin)
+# Build index: make ban-index-fr  (whole France) or make ban-index (IDF only)
+# When index.bin is missing, the server downloads + builds it in the background.
 [ban]
 enabled = true
 # data_dir = "./data/ban"   # default: {runtime.data_dir}/ban
-# departments = ["75", "77", "78", "91", "92", "93", "94", "95"]
+# departments = ["all"]     # default: all France; or e.g. ["75", "77"]
+# auto_download = true      # download+build at startup when index.bin is missing
 
 [redis]
 enabled = false

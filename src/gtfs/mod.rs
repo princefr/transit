@@ -1,5 +1,6 @@
 pub mod calendar;
 pub mod cell_bitset;
+pub mod flash_store;
 pub mod pack;
 pub mod parse;
 pub mod siri_trip_map;

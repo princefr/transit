@@ -1,6 +1,9 @@
 /// Compact bitset over partition cells for FLASH-TB arc-flags.
 /// Supports any number of cells using `Vec<u64>` internally.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Hashable so flag patterns can be deduplicated into a compressed table
+/// (FLASH-TB §5.2 flag-pattern compression).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CellBitSet {
     words: Vec<u64>,
 }
@@ -51,6 +54,16 @@ impl CellBitSet {
 
     pub fn is_empty(&self) -> bool {
         self.words.iter().all(|&w| w == 0)
+    }
+
+    /// Raw words, for content-keyed pattern tables.
+    pub fn words(&self) -> &[u64] {
+        &self.words
+    }
+
+    /// Rebuild from serialized words (`words()` round-trip).
+    pub fn from_words(words: Vec<u64>) -> Self {
+        Self { words }
     }
 }
 

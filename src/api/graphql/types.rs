@@ -1842,7 +1842,8 @@ pub struct ItineraryInput {
     pub bike_from: Option<bool>,
     /// Last km by bike (last stop → destination).
     pub bike_to: Option<bool>,
-    /// Use Trip-Based Public Transit Routing instead of RAPTOR.
+    /// Use Trip-Based Public Transit Routing (FLASH-TB) instead of RAPTOR.
+    /// Defaults to true — FLASH-TB is the primary router.
     pub use_tbr: Option<bool>,
 }
 

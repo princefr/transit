@@ -339,6 +339,43 @@ fn has_departures(epoch: &StaticEpoch, idx: usize) -> bool {
 
 /// Expand a user-picked stop into all boardable monomodals / quays for that place.
 /// End users pick « Aulnay-sous-Bois » or « Châtelet »; routing needs every RER/Métro shell.
+/// Memoized place-cluster expansions. Station-shell expansion scans the whole
+/// place-name index per query (~8 ms on IDFM); the result only depends on
+/// (epoch, stop, walk budget), so cache it keyed by epoch id.
+fn cached_place_access(
+    epoch: &StaticEpoch,
+    idx: u32,
+    max_walk_m: f64,
+    walk_speed_m_s: f64,
+    limit: usize,
+) -> Vec<AccessStop> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<(String, u32, u64, u64, u32), Vec<AccessStop>>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (
+        epoch.id.clone(),
+        idx,
+        max_walk_m.to_bits(),
+        walk_speed_m_s.to_bits(),
+        limit as u32,
+    );
+    if let Ok(map) = cache.lock() {
+        if let Some(hit) = map.get(&key) {
+            return hit.clone();
+        }
+    }
+    let out = expand_place_access(epoch, idx, max_walk_m, walk_speed_m_s, limit);
+    if let Ok(mut map) = cache.lock() {
+        if map.len() > 20_000 {
+            map.clear(); // epoch rotation guard
+        }
+        map.insert(key, out.clone());
+    }
+    out
+}
+
 fn expand_place_access(
     epoch: &StaticEpoch,
     seed_idx: u32,
@@ -380,17 +417,25 @@ fn expand_place_access(
             .unwrap_or_default();
         // Prefix / contains matches for variants (« Gare de Lyon » vs « Lyon Part-Dieu »)
         if candidates.len() < limit {
-            for (k, idxs) in &epoch.place_name_index {
-                if k == &key {
-                    continue;
-                }
-                let name_match = k.starts_with(&key)
-                    || key.starts_with(k)
-                    || (key.len() >= 5 && k.contains(&key))
-                    || (k.len() >= 5 && key.contains(k));
-                if name_match {
-                    candidates.extend(idxs.iter().copied());
-                }
+            // Collect matching keys first and sort them — HashMap iteration
+            // order is randomly seeded per process, which made the candidate
+            // set (and thus journeys) vary between runs when the result was
+            // truncated by `limit`.
+            let mut matched_keys: Vec<&String> = epoch
+                .place_name_index
+                .keys()
+                .filter(|k| {
+                    let k: &String = k;
+                    k != &key
+                        && (k.starts_with(&key)
+                            || key.starts_with(k.as_str())
+                            || (key.len() >= 5 && k.contains(key.as_str()))
+                            || (k.len() >= 5 && key.contains(k.as_str())))
+                })
+                .collect();
+            matched_keys.sort();
+            for k in matched_keys {
+                candidates.extend(epoch.place_name_index[k].iter().copied());
             }
         }
         for i in candidates {
@@ -528,9 +573,10 @@ pub fn resolve_access_stops_profile(
             // Plain GTFS quays keep classic expansion so unit fixtures still transfer at B.
             if is_idfm_place_stop(seed) || seed.location_type == 1 {
                 let cap = limit.max(24).min(64);
-                return expand_place_access(epoch, idx, max_walk_m, walk_speed_m_s, cap);
+                return cached_place_access(epoch, idx, max_walk_m, walk_speed_m_s, cap);
             }
-            // Classic: seed + parent/child siblings only
+            // Classic: seed + parent/child siblings — via the precomputed
+            // children_by_parent index (linear scans over 48k stops cost ~10ms).
             let mut out = vec![AccessStop {
                 stop_idx: idx,
                 duration_s: 0,
@@ -539,12 +585,23 @@ pub fn resolve_access_stops_profile(
             }];
             let stop = &epoch.stops[idx as usize];
             if let Some(ref p) = stop.parent_id {
-                for (i, s) in epoch.stops.iter().enumerate() {
-                    if (s.parent_id.as_deref() == Some(p.as_str()) || s.id == *p)
-                        && i as u32 != idx
-                    {
+                if let Some(siblings) = epoch.children_by_parent.get(p.as_str()) {
+                    for &i in siblings {
+                        if i != idx {
+                            out.push(AccessStop {
+                                stop_idx: i,
+                                duration_s: 60,
+                                distance_m: 50.0,
+                                geometry: None,
+                            });
+                        }
+                    }
+                }
+                // The parent station record itself (id == parent_id), when present.
+                if let Some(&pi) = epoch.stop_id_to_idx.get(p.as_str()) {
+                    if pi != idx {
                         out.push(AccessStop {
-                            stop_idx: i as u32,
+                            stop_idx: pi,
                             duration_s: 60,
                             distance_m: 50.0,
                             geometry: None,
@@ -552,14 +609,16 @@ pub fn resolve_access_stops_profile(
                     }
                 }
             }
-            for (i, s) in epoch.stops.iter().enumerate() {
-                if s.parent_id.as_deref() == Some(&stop.id) && i as u32 != idx {
-                    out.push(AccessStop {
-                        stop_idx: i as u32,
-                        duration_s: 60,
-                        distance_m: 50.0,
-                        geometry: None,
-                    });
+            if let Some(children) = epoch.children_by_parent.get(stop.id.as_str()) {
+                for &i in children {
+                    if i != idx {
+                        out.push(AccessStop {
+                            stop_idx: i,
+                            duration_s: 60,
+                            distance_m: 50.0,
+                            geometry: None,
+                        });
+                    }
                 }
             }
             out.truncate(limit.max(8));
@@ -567,8 +626,16 @@ pub fn resolve_access_stops_profile(
         }
     }
     if let (Some(lat), Some(lon)) = (lat, lon) {
-        let points = epoch.geo_stop_points_view();
-        let near = crate::link::geo::nearby(&points, lat, lon, max_walk_m, limit);
+        // Borrowed when the epoch was packed (production); cloned only in tests.
+        let owned;
+        let points: &[(usize, f64, f64)] = match epoch.geo_stop_points_ref() {
+            Some(p) => p,
+            None => {
+                owned = epoch.geo_stop_points_view();
+                &owned
+            }
+        };
+        let near = crate::link::geo::nearby(points, lat, lon, max_walk_m, limit);
         let speed = walk_speed_m_s.max(0.1);
         // Cap OSRM calls: refine at most the nearest few candidates.
         const OSRM_REFINE_LIMIT: usize = 6;

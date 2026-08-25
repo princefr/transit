@@ -485,7 +485,7 @@ fn plan_depart_after(
 
         let Some(mut journey) = reconstruct(
             epoch,
-            &scratch.labels,
+            scratch.labels.as_slice(),
             target_idx,
             &egress[&target_idx],
             total_arr,
@@ -1248,9 +1248,30 @@ fn run_raptor(
     best_target
 }
 
-pub(super) fn reconstruct(
+/// Read-only label access for journey reconstruction.
+///
+/// Reconstruction only walks the parent chain of one journey (O(legs)
+/// lookups), so implementations can be lazy — dense matrices, sparse maps or
+/// on-the-fly converters all work without copying the full label table.
+pub(super) trait LabelSource {
+    fn rounds(&self) -> usize;
+    fn get(&self, round: usize, stop: usize) -> Option<Reach>;
+}
+
+impl LabelSource for [Vec<Option<Reach>>] {
+    #[inline]
+    fn rounds(&self) -> usize {
+        self.len()
+    }
+    #[inline]
+    fn get(&self, round: usize, stop: usize) -> Option<Reach> {
+        self.get(round)?.get(stop)?.clone()
+    }
+}
+
+pub(super) fn reconstruct<L: LabelSource + ?Sized>(
     epoch: &StaticEpoch,
-    labels: &[Vec<Option<Reach>>],
+    labels: &L,
     target_idx: u32,
     egress: &AccessStop,
     total_arr: u32,
@@ -1262,8 +1283,8 @@ pub(super) fn reconstruct(
     // Find latest round with a label at target (prefer earliest arrival among labels).
     let mut best_round: Option<usize> = None;
     let mut best_arr = u32::MAX;
-    for r in 0..labels.len() {
-        if let Some(lab) = &labels[r][target_idx as usize] {
+    for r in 0..labels.rounds() {
+        if let Some(lab) = labels.get(r, target_idx as usize) {
             let a = lab.arrival_s();
             if a < best_arr || (a == best_arr && best_round.map(|br| r > br).unwrap_or(true)) {
                 // Prefer fewer rounds for same arrival (fewer transfers).
@@ -1285,13 +1306,13 @@ pub(super) fn reconstruct(
     let mut chain: Vec<Reach> = Vec::new();
 
     while round >= 0 {
-        let lab = labels[round as usize][stop as usize]
-            .clone()
+        let lab = labels
+            .get(round as usize, stop as usize)
             .or_else(|| {
                 // Search earlier rounds for a label at this stop with same best arrival.
                 for r in (0..=round as usize).rev() {
-                    if let Some(l) = &labels[r][stop as usize] {
-                        return Some(l.clone());
+                    if let Some(l) = labels.get(r, stop as usize) {
+                        return Some(l);
                     }
                 }
                 None
