@@ -970,6 +970,12 @@ fn raptor_transit_stop_based(
         if board_after >= *best_dest {
             continue;
         }
+        // Wheelchair: skip boarding at stops flagged inaccessible (GTFS 2).
+        if q.wheelchair
+            && epoch.stops.get(stop_idx as usize).map(|s| s.wheelchair) == Some(2)
+        {
+            continue;
+        }
 
         let deps = epoch
             .stop_departures
@@ -1155,6 +1161,9 @@ fn run_raptor(
 
     let trip_ok = |trip: &crate::gtfs::pack::GlobalTrip| {
         if q.excluded_trip_ids.contains(&trip.id) {
+            return false;
+        }
+        if !q.excluded_lines.is_empty() && q.excluded_lines.contains(&trip.route_id) {
             return false;
         }
         // Soft wheelchair filter: exclude explicitly inaccessible trips (GTFS 2).
@@ -1943,6 +1952,7 @@ mod tests {
             default_transfer_s: 60,
             timezone: "UTC".into(),
             excluded_trip_ids: HashSet::new(),
+            excluded_lines: HashSet::new(),
             rt_adjust: std::collections::HashMap::new(),
             wheelchair: false,
             osrm_url: None,

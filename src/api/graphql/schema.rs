@@ -728,6 +728,145 @@ impl QueryRoot {
         Ok(true)
     }
 
+    /// Isochrone: every stop reachable from `origin` within `maxMinutes`,
+    /// with earliest arrival and transit-leg counts. One FLASH-TB search.
+    async fn isochrone(
+        &self,
+        ctx: &Context<'_>,
+        input: IsochroneInput,
+    ) -> Result<Vec<IsochroneStop>> {
+        let state = ctx.data::<Arc<AppState>>()?;
+        let epoch = state.load_epoch();
+        let cfg = &state.config.routing;
+
+        if epoch.trip_count() == 0 {
+            return Err(gql_err(
+                "static timetable not loaded yet; try again shortly",
+                "NOT_READY",
+            ));
+        }
+
+        let departure_at = input.departure_at.unwrap_or_else(Utc::now);
+        let date = service_date_in_tz(departure_at, &cfg.timezone);
+        let dep_s = local_seconds_since_midnight(departure_at, &cfg.timezone);
+        let midnight = local_midnight_utc(date, &cfg.timezone);
+
+        let modes = input.modes.map(|ms| {
+            ms.into_iter()
+                .filter_map(|m| m.to_pack())
+                .collect::<Vec<_>>()
+        });
+
+        // Access: walk/bike from origin coordinates or the origin stop itself.
+        let origins = crate::routing::walk::resolve_access_stops_profile(
+            epoch.as_ref(),
+            input.origin.stop_id.as_deref().map(|i| i.to_string()).as_deref(),
+            input.origin.lat,
+            input.origin.lon,
+            input.max_access_meters.clamp(0, 5000) as f64,
+            cfg.walk_speed_m_s,
+            if epoch.trip_count() > 80_000 { 40 } else { 16 },
+            None,
+            crate::routing::walk::OsrmProfile::Foot,
+        );
+        if origins.is_empty() {
+            return Err(gql_err("origin not found", "ORIGIN_NOT_FOUND"));
+        }
+
+        let q = ItineraryQuery {
+            from_stop_id: input.origin.stop_id.as_deref().map(|i| i.to_string()),
+            to_stop_id: None,
+            from_lat: input.origin.lat,
+            from_lon: input.origin.lon,
+            to_lat: None,
+            to_lon: None,
+            departure_at,
+            arrive_by: false,
+            max_transfers: 8,
+            max_results: 1,
+            modes,
+            max_walk_meters: input.max_access_meters.clamp(0, 5000) as u32,
+            walk_speed_m_s: cfg.walk_speed_m_s,
+            raptor_max_rounds: cfg.raptor_max_rounds,
+            default_transfer_s: cfg.default_transfer_s,
+            timezone: cfg.timezone.clone(),
+            excluded_trip_ids: Default::default(),
+            excluded_lines: input
+                .excluded_lines
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            rt_adjust: Default::default(),
+            wheelchair: input.wheelchair,
+            osrm_url: None,
+            bike_from: false,
+            bike_to: false,
+            bike_speed_m_s: cfg.bike_speed_m_s,
+            max_bike_meters: cfg.max_bike_meters,
+            use_tbr: true,
+        };
+
+        let deadline_s = dep_s + (input.max_minutes.clamp(5, 120).min(120) as u32) * 60;
+        let stops =
+            {
+                let epoch = epoch.clone();
+                tokio::task::spawn_blocking(move || crate::routing::tbr::plan_isochrone_tbr(&epoch, &q, &origins))
+            }
+                .await
+                .map_err(|e| gql_err(e.to_string(), "ISOCHRONE_FAILED"))?;
+
+        let out: Vec<IsochroneStop> = stops
+            .into_iter()
+            .filter(|s| s.arrival_s <= deadline_s)
+            .filter_map(|s| {
+                let rec = epoch.stops.get(s.stop_idx as usize)?;
+                Some(IsochroneStop {
+                    stop: stop_from_record(rec),
+                    arrival_at: midnight + chrono::Duration::seconds(s.arrival_s as i64),
+                    travel_seconds: s.arrival_s.saturating_sub(dep_s) as i32,
+                    legs: s.legs.saturating_sub(1) as i32,
+                })
+            })
+            .collect();
+        Ok(out)
+    }
+
+    /// GBFS bike/scooter-share stations inside a bounding box
+    /// (from configured GBFS feeds; empty when disabled).
+    async fn vehicle_rental_stations(
+        &self,
+        ctx: &Context<'_>,
+        min_lat: f64,
+        min_lon: f64,
+        max_lat: f64,
+        max_lon: f64,
+        limit: Option<i32>,
+    ) -> Result<Vec<VehicleRentalStation>> {
+        let state = ctx.data::<Arc<AppState>>()?;
+        let snap = state.gbfs.load_full();
+        let limit = limit.unwrap_or(100).clamp(1, 1000) as usize;
+        let mut out: Vec<VehicleRentalStation> = snap
+            .stations
+            .iter()
+            .filter(|s| {
+                s.lat >= min_lat && s.lat <= max_lat && s.lon >= min_lon && s.lon <= max_lon
+            })
+            .map(|s| VehicleRentalStation {
+                id: ID(format!("{}:{}", s.feed_id, s.station_id)),
+                feed_id: s.feed_id.clone(),
+                name: s.name.clone(),
+                lat: s.lat,
+                lon: s.lon,
+                capacity: s.capacity.map(|c| c as i32),
+                bikes_available: s.bikes_available.map(|c| c as i32),
+                docks_available: s.docks_available.map(|c| c as i32),
+                is_renting: s.is_renting,
+            })
+            .collect();
+        out.truncate(limit);
+        Ok(out)
+    }
+
     async fn itineraries(
         &self,
         ctx: &Context<'_>,
@@ -846,6 +985,11 @@ impl QueryRoot {
             default_transfer_s: cfg.default_transfer_s,
             timezone: cfg.timezone.clone(),
             excluded_trip_ids,
+            excluded_lines: input
+                .excluded_lines
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
             rt_adjust,
             wheelchair: input.wheelchair.unwrap_or(false),
             osrm_url: {

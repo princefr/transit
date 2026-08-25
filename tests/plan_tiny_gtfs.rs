@@ -85,6 +85,7 @@ fn sample_query(from: &str, to: &str) -> ItineraryQuery {
             max_bike_meters: 5000,
             use_tbr: false,
             excluded_trip_ids: HashSet::new(),
+            excluded_lines: HashSet::new(),
         rt_adjust: Default::default(),
         wheelchair: false,
     }

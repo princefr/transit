@@ -22,6 +22,34 @@ pub struct Config {
     /// Optional Redis cache for hot GraphQL paths (disabled by default).
     #[serde(default)]
     pub redis: RedisConfig,
+    /// GBFS bike/scooter-share feeds (disabled by default).
+    #[serde(default)]
+    pub gbfs: GbfsConfig,
+    /// API keys + rate limiting (open access when disabled / no keys).
+    #[serde(default)]
+    pub api: crate::api::gate::ApiConfig,
+}
+
+/// GBFS auto-discovery manifest feeds.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GbfsConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_gbfs_interval")]
+    pub poll_interval_secs: u64,
+    #[serde(default)]
+    pub feeds: Vec<GbfsFeedConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GbfsFeedConfig {
+    pub id: String,
+    /// GBFS auto-discovery manifest URL (`gbfs.json`).
+    pub url: String,
+}
+
+fn default_gbfs_interval() -> u64 {
+    60
 }
 
 /// Local BAN index (`crates/ban-search`) — real street/address autocomplete.
@@ -475,6 +503,12 @@ impl Default for Config {
             prim: PrimConfig::default(),
             ban: BanConfigSection::default(),
             redis: RedisConfig::default(),
+            api: Default::default(),
+            gbfs: GbfsConfig {
+                enabled: false,
+                poll_interval_secs: default_gbfs_interval(),
+                feeds: Vec::new(),
+            },
         }
     }
 }

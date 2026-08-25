@@ -26,6 +26,8 @@ pub struct AppState {
     pub prim: SharedPrim,
     /// Base Adresse Nationale local index (may be empty if not built).
     pub ban: SharedBan,
+    /// GBFS bike/scooter-share station snapshot (empty when disabled).
+    pub gbfs: crate::gbfs::SharedGbfs,
     /// Optional Redis cache (no-op when disabled or unreachable).
     pub cache: TransitCache,
 }
@@ -48,6 +50,9 @@ impl AppState {
                     .spawn(move || provision_ban_index(ban2, dir, depts));
             }
         }
+        let gbfs: crate::gbfs::SharedGbfs =
+            Arc::new(arc_swap::ArcSwap::from_pointee(crate::gbfs::empty_snapshot()));
+        crate::gbfs::spawn_gbfs_poller_self(&config, gbfs.clone());
         Self {
             config: Arc::new(config),
             epoch: Arc::new(ArcSwap::from_pointee(StaticEpoch::empty())),
@@ -56,6 +61,7 @@ impl AppState {
             equipment: new_shared_equipment(),
             prim: new_shared_prim(),
             ban,
+            gbfs,
             cache,
         }
     }

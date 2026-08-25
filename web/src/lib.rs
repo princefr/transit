@@ -151,12 +151,22 @@ struct FeedHealth {
 }
 
 #[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DatasetLoading {
+    phase: i32,
+    label: String,
+    percent: Option<i32>,
+    eta_seconds: Option<u64>,
+}
+
 struct HealthSnapshot {
     status: String,
     _epoch_id: String,
     stops: i32,
     trips: i32,
     feeds: Vec<FeedHealth>,
+    dataset_loading: Option<DatasetLoading>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -375,6 +385,14 @@ async fn fetch_health_snapshot() -> Result<HealthSnapshot, String> {
         stops: body.get("stops").and_then(|n| n.as_i64()).unwrap_or(0) as i32,
         trips: body.get("trips").and_then(|n| n.as_i64()).unwrap_or(0) as i32,
         feeds,
+        dataset_loading: body.get("dataset_loading").and_then(|v| {
+            Some(DatasetLoading {
+                phase: v.get("phase")?.as_i64()? as i32,
+                label: v.get("label")?.as_str()?.to_string(),
+                percent: v.get("percent").and_then(|p| p.as_i64()).map(|p| p as i32),
+                eta_seconds: v.get("etaSeconds").and_then(|e| e.as_u64()),
+            })
+        }),
     })
 }
 
@@ -4035,6 +4053,17 @@ fn feed_loading_label(feed: &FeedHealth) -> String {
     }
 }
 
+/// French human ETA: "2 min 30 s" / "1 h 05".
+fn format_eta_fr(secs: u64) -> String {
+    if secs >= 3600 {
+        format!("{} h {:02}", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{} min {:02}", secs / 60, secs % 60)
+    } else {
+        format!("{secs} s")
+    }
+}
+
 fn apply_static_loading_ui(health: &HealthSnapshot) {
     let all_ready = if health.feeds.is_empty() {
         health.trips > 0
@@ -4074,9 +4103,43 @@ fn apply_static_loading_ui(health: &HealthSnapshot) {
         let headline = primary
             .map(|f| feed_loading_label(f))
             .unwrap_or_else(|| "Chargement des horaires…".to_string());
+        // Dataset-loading progress (percent + ETA from /health).
+        let mut progress_line = String::new();
+        if let Some(dl) = &health.dataset_loading {
+            if !all_ready {
+                match (dl.percent, dl.eta_seconds) {
+                    (Some(pct), Some(eta)) => {
+                        progress_line = format!(
+                            "{} % · restant ~{}",
+                            pct,
+                            format_eta_fr(eta)
+                        );
+                    }
+                    (Some(pct), None) => {
+                        progress_line = format!("{} %", pct);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let headline = if progress_line.is_empty() {
+            headline
+        } else {
+            format!("{headline} — {}", progress_line)
+        };
         set_html("static-loading-message", &escape_html(&headline));
         if let Some(txt) = el("static-loading-banner-text") {
             txt.set_inner_html(&escape_html(&headline));
+        }
+        // Progress bar fill.
+        if let Some(fill) = el("static-loading-bar-fill") {
+            let pct = health
+                .dataset_loading
+                .as_ref()
+                .and_then(|d| d.percent)
+                .unwrap_or(0)
+                .clamp(0, 100);
+            let _ = fill.set_attribute("style", &format!("width: {pct}%"));
         }
 
         let mut feeds_html = String::new();

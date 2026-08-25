@@ -6,6 +6,7 @@ pub mod cache;
 pub mod config;
 pub mod equipment;
 pub mod error;
+pub mod gbfs;
 pub mod feeds;
 pub mod gtfs;
 pub mod link;

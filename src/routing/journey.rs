@@ -167,6 +167,9 @@ pub struct ItineraryQuery {
     /// Trip ids (namespaced) to skip at boarding time, e.g. RT cancellations.
     /// Routing does not import the RT layer; callers pass the set.
     pub excluded_trip_ids: HashSet<String>,
+    /// Route/line ids (namespaced) to exclude entirely — scenario planning
+    /// ("what if line X is down?"). Trips on these routes are never boarded.
+    pub excluded_lines: HashSet<String>,
     /// GTFS-RT delays / skipped stops keyed by namespaced trip id (`feed:trip`).
     /// Empty → pure schedule RAPTOR.
     pub rt_adjust: HashMap<String, RtTripAdjust>,

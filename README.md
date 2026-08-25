@@ -151,7 +151,7 @@ make smoke          # probes /health and GraphQL against BASE_URL
 - **Secrets:** `.env` (loaded by `make run`, `scripts/run_server.sh`, systemd) — never commit
 - **Env overrides:** `TRANSIT__SERVER__BIND=127.0.0.1:8080` (figment `__` nesting)
 
-Key sections: `[server]`, `[routing]`, `[graphql]`, `[prim]`, `[[feeds]]`, optional `[redis]` and `[ban]`.
+Key sections: `[server]`, `[routing]`, `[graphql]`, `[prim]`, `[[feeds]]`, optional `[redis]`, `[ban]`, `[gbfs]` and `[api]` (API keys + rate limiting).
 
 Feed downloads can also use per-feed auth in TOML (`auth_header` + `auth_env`); see comments in `config/default.toml` for `IDFM_PRIM_API_KEY` and `PRIM_DATASET_KEY`.
 
@@ -170,6 +170,15 @@ make ban-index
 - **IDFM loading UX** — progress while the large feed parses
 - **Multi-feed** — namespaced ids (`idfm:…`, `sncf:…`), configurable `[[feeds]]`
 - **Docker** — `docker compose up --build` (mounts `./data` for GTFS cache)
+- **FLASH-TB routing** — Arc-Flags + Trip-Based engine, ~10× faster than
+  RAPTOR end-to-end on IDFM; flags persist to `data/flash/` keyed by feed
+  content hash (recompute once per dataset version, load in seconds after)
+- **Isochrones** — `isochrone(origin, maxMinutes)` GraphQL query: every
+  reachable stop with arrival times, from one sub-second FLASH-TB search
+- **Scenario planning** — `excludedLines: ["idfm:C01742"]` on `itineraries`
+  replans around a suspended line
+- **GBFS bike/scooter-share** — configure feeds under `[gbfs]`, query
+  `vehicleRentalStations(bbox)` for live availability
 
 ---
 

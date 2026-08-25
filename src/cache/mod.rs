@@ -259,6 +259,12 @@ impl TransitCache {
             input.bike_from.unwrap_or(false).to_string(),
             input.bike_to.unwrap_or(false).to_string(),
             input.use_tbr.unwrap_or(true).to_string(),
+            {
+                let mut lines: Vec<String> =
+                    input.excluded_lines.clone().unwrap_or_default();
+                lines.sort();
+                lines.join(",")
+            },
             routing.timezone.clone(),
             routing.max_transfers.to_string(),
             routing.raptor_max_rounds.to_string(),
@@ -625,6 +631,7 @@ mod tests {
             bike_from: None,
             bike_to: None,
             use_tbr: None,
+            excluded_lines: None,
         };
         let routing = crate::config::RoutingConfig {
             timezone: "Europe/Paris".into(),

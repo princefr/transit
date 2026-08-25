@@ -1744,7 +1744,7 @@ pub struct SystemHealth {
     pub epoch_id: String,
 }
 
-#[derive(async_graphql::InputObject)]
+#[derive(async_graphql::InputObject, Debug, Clone)]
 pub struct PlaceInput {
     pub stop_id: Option<ID>,
     pub lat: Option<f64>,
@@ -1823,6 +1823,22 @@ impl BBoxInput {
 }
 
 #[derive(async_graphql::InputObject)]
+/// One GBFS bike/scooter-share station with live availability.
+#[derive(SimpleObject, Clone)]
+pub struct VehicleRentalStation {
+    pub id: ID,
+    pub feed_id: String,
+    pub name: String,
+    pub lat: f64,
+    pub lon: f64,
+    pub capacity: Option<i32>,
+    pub bikes_available: Option<i32>,
+    pub docks_available: Option<i32>,
+    pub is_renting: bool,
+}
+
+/// Itinerary planning input.
+#[derive(async_graphql::InputObject, Debug, Clone)]
 pub struct ItineraryInput {
     pub from: PlaceInput,
     pub to: PlaceInput,
@@ -1845,6 +1861,45 @@ pub struct ItineraryInput {
     /// Use Trip-Based Public Transit Routing (FLASH-TB) instead of RAPTOR.
     /// Defaults to true — FLASH-TB is the primary router.
     pub use_tbr: Option<bool>,
+    /// Scenario planning: namespaced route/line ids to exclude from routing
+    /// entirely ("what if line X is down?"). Trips on these lines are never
+    /// boarded and alternative journeys are returned.
+    #[graphql(default)]
+    pub excluded_lines: Option<Vec<String>>,
+}
+
+/// Input for the `isochrone` query — "where can I travel to within N minutes?"
+#[derive(async_graphql::InputObject, Debug, Clone)]
+pub struct IsochroneInput {
+    /// Origin (stop id or coordinates).
+    pub origin: PlaceInput,
+    /// Departure time; defaults to now. (Arrive-by isochrones are not supported.)
+    pub departure_at: Option<DateTime<Utc>>,
+    /// Travel-time budget in minutes (clamped 5–120).
+    pub max_minutes: i32,
+    /// Modes allowed for transit legs.
+    pub modes: Option<Vec<Mode>>,
+    /// Max walk/bike distance from origin to first stop (m).
+    #[graphql(default = 1000)]
+    pub max_access_meters: i32,
+    /// Wheelchair-only trips and step-free preference.
+    #[graphql(default)]
+    pub wheelchair: bool,
+    /// Scenario planning: namespaced route/line ids to exclude.
+    #[graphql(default)]
+    pub excluded_lines: Option<Vec<String>>,
+}
+
+/// One reachable stop with its earliest arrival inside the time budget.
+#[derive(SimpleObject, Clone)]
+pub struct IsochroneStop {
+    pub stop: GqlStop,
+    /// Arrival time at this stop.
+    pub arrival_at: DateTime<Utc>,
+    /// Total travel seconds from origin (including initial access walk).
+    pub travel_seconds: i32,
+    /// Number of transit legs used (0 = reached on foot only).
+    pub legs: i32,
 }
 
 /// Build a GraphQL error with a machine-readable `code` extension.

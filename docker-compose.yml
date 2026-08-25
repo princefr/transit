@@ -13,4 +13,21 @@ services:
       RUST_LOG: info,transit=info
       TRANSIT__SERVER__BIND: 0.0.0.0:8080
       TRANSIT__RUNTIME__DATA_DIR: /app/data
+      # Street-level walk/bike routing via the OSRM service below:
+      # TRANSIT_ROUTING__OSRM_URL: http://osrm:5000
     restart: unless-stopped
+
+  # Optional street-level pedestrian/cycle router. Requires an OSM extract:
+  #   docker run -v "$PWD/data/osrm:/data" osrm/osrm-backend osrm-extract \
+  #     -p /opt/car.lua /data/ile-de-france-latest.osm.pbf
+  #   docker run -v "$PWD/data/osrm:/data" osrm/osrm-backend osrm-partition /data/*.osrm
+  #   docker run -v "$PWD/data/osrm:/data" osrm/osrm-backend osrm-customize /data/*.osrm
+  # Then uncomment TRANSIT_ROUTING__OSRM_URL above.
+  # osrm:
+  #   image: osrm/osrm-backend:latest
+  #   ports:
+  #     - "5000:5000"
+  #   volumes:
+  #     - ./data/osrm:/data
+  #   command: osrm-routed --algorithm mld /data/ile-de-france-latest.osrm
+  #   restart: unless-stopped

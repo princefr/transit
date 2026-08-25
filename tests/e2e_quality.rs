@@ -89,6 +89,7 @@ fn query(from: &str, to: &str) -> ItineraryQuery {
         default_transfer_s: 120,
         timezone: "Europe/Paris".into(),
         excluded_trip_ids: Default::default(),
+        excluded_lines: Default::default(),
         rt_adjust: Default::default(),
         wheelchair: false,
         osrm_url: None,

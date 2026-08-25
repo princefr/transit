@@ -937,6 +937,9 @@ fn run_tbr(
         if q.excluded_trip_ids.contains(&trip.id) {
             return false;
         }
+        if !q.excluded_lines.is_empty() && q.excluded_lines.contains(&trip.route_id) {
+            return false;
+        }
         if q.wheelchair && trip.wheelchair == 2 {
             return false;
         }
@@ -1007,6 +1010,12 @@ fn run_tbr(
                 arrival_here.saturating_add(q.default_transfer_s)
             };
             if board_after >= best_dest {
+                continue;
+            }
+            // Wheelchair: skip boarding at stops flagged inaccessible (GTFS 2).
+            if q.wheelchair
+                && epoch.stops.get(stop_idx as usize).map(|st| st.wheelchair) == Some(2)
+            {
                 continue;
             }
 
@@ -1402,6 +1411,291 @@ fn place_from_query_from(epoch: &StaticEpoch, q: &ItineraryQuery) -> Place {
     super::raptor::place_from_query_from(epoch, q)
 }
 
+/// One reachable stop in an isochrone: earliest arrival and the round
+/// (≈ transfers) at which it was first reached.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct IsochroneStop {
+    pub stop_idx: u32,
+    /// Seconds since local midnight of the service date.
+    pub arrival_s: u32,
+    /// Number of transit legs used (0 = reached on foot from origin).
+    pub legs: u32,
+}
+
+/// One-to-all FLASH-TB search: every stop reachable from `origins` within the
+/// deadline, with earliest arrival + trip count. This is the engine's killer
+/// app — a country-scale isochrone in a single sub-second search.
+///
+/// Runs unpruned (no target cell ⇒ no arc-flag gating) with the same line /
+/// trip-stamp / segment-queue mechanics as [`run_tbr`].
+pub fn plan_isochrone_tbr(
+    epoch: &StaticEpoch,
+    q: &ItineraryQuery,
+    origins: &[AccessStop],
+) -> Vec<IsochroneStop> {
+    let date = service_date_in_tz(q.departure_at, &q.timezone);
+    let dep_s = local_seconds_since_midnight(q.departure_at, &q.timezone);
+    let mut scratch = TbrScratch::new(epoch, q, date);
+    s_isochrone(epoch, q, dep_s, origins, &mut scratch)
+}
+
+fn s_isochrone(
+    epoch: &StaticEpoch,
+    q: &ItineraryQuery,
+    dep_s: u32,
+    origins: &[AccessStop],
+    s: &mut TbrScratch,
+) -> Vec<IsochroneStop> {
+    s.reset();
+    let horizon = dep_s.saturating_add(6 * 3600);
+
+    let mode_ok = |m: RouteMode| {
+        q.modes
+            .as_ref()
+            .map(|ms| ms.is_empty() || ms.contains(&m))
+            .unwrap_or(true)
+    };
+    let trip_ok = |trip: &crate::gtfs::pack::GlobalTrip| {
+        if q.excluded_trip_ids.contains(&trip.id)
+            || (!q.excluded_lines.is_empty() && q.excluded_lines.contains(&trip.route_id))
+        {
+            return false;
+        }
+        !(q.wheelchair && trip.wheelchair == 2)
+    };
+
+    // Round 0: access.
+    s.stamp = s.stamp.wrapping_add(1);
+    let seed_stamp = s.stamp;
+    for o in origins {
+        let arr = dep_s.saturating_add(o.duration_s);
+        if arr < horizon && arr < s.earliest[o.stop_idx as usize] {
+            if s.earliest[o.stop_idx as usize] == u32::MAX {
+                s.touched.push(o.stop_idx);
+            }
+            s.earliest[o.stop_idx as usize] = arr;
+            s.labels[0][o.stop_idx as usize] = Some(TbrReach::Access {
+                stop_idx: o.stop_idx,
+                arrival_s: arr,
+                walk_duration: o.duration_s,
+                walk_distance: o.distance_m,
+            });
+            s.reached.push(o.stop_idx);
+            s.stop_stamp[o.stop_idx as usize] = seed_stamp;
+        }
+    }
+    if s.reached.is_empty() {
+        return Vec::new();
+    }
+
+    for round in 0..s.rounds {
+        // Departure-scan phase (walk/origin stops) + segment phase.
+        s.stamp = s.stamp.wrapping_add(1);
+        let round_stamp = s.stamp;
+        let mut next_reached: Vec<u32> = Vec::new();
+
+        // Ride queued segments from the previous round.
+        let segs: Vec<(u32, u32, u32)> = std::mem::take(&mut s.seg_queue);
+        for (seg_ti, seg_off, seg_stop) in segs {
+            let seg_tiu = seg_ti as usize;
+            if !s.active[seg_tiu] {
+                continue;
+            }
+            let trip = &epoch.trips[seg_tiu];
+            if q.excluded_trip_ids.contains(&trip.id)
+                || (!q.excluded_lines.is_empty() && q.excluded_lines.contains(&trip.route_id))
+                || (q.wheelchair && trip.wheelchair == 2)
+                || !mode_ok(trip.mode)
+            {
+                continue;
+            }
+            scan_trip_forward(
+                epoch,
+                q,
+                seg_tiu,
+                trip,
+                seg_off,
+                0,
+                None,
+                &mut u32::MAX,
+                &HashMap::new(),
+                s,
+                round,
+                round_stamp,
+                &mut next_reached,
+                &crate::gtfs::cell_bitset::CellBitSet::new(0),
+                false,
+                Some(seg_stop),
+            );
+        }
+
+        // Departure scans for walk-reached stops.
+        let reached: Vec<u32> = std::mem::take(&mut s.reached);
+        for &stop_idx in &reached {
+            let arrival_here = s.earliest[stop_idx as usize];
+            if arrival_here == u32::MAX {
+                continue;
+            }
+            // Wheelchair: skip boarding at inaccessible stops.
+            if q.wheelchair
+                && epoch.stops.get(stop_idx as usize).map(|st| st.wheelchair) == Some(2)
+            {
+                continue;
+            }
+            let board_after = if round == 0 {
+                arrival_here
+            } else {
+                arrival_here.saturating_add(q.default_transfer_s)
+            };
+            let deps = epoch
+                .stop_departures
+                .get(stop_idx as usize)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            if deps.is_empty() {
+                continue;
+            }
+            let has_freq = epoch
+                .stop_has_freq
+                .get(stop_idx as usize)
+                .copied()
+                .unwrap_or(false);
+            let start = if has_freq {
+                0
+            } else {
+                deps.partition_point(|&(t, off)| {
+                    epoch.stop_times[(epoch.trips[t as usize].stop_time_start + off) as usize]
+                        .departure_s
+                        < board_after
+                })
+            };
+            for &(ti, st_off) in deps[start..].iter() {
+                let ti_us = ti as usize;
+                let trip = &epoch.trips[ti_us];
+                if !mode_ok(trip.mode) || !trip_ok(trip) || !s.active[ti_us] {
+                    continue;
+                }
+                if trip.frequency_windows.is_empty() {
+                    let st_board =
+                        &epoch.stop_times[(trip.stop_time_start + st_off) as usize];
+                    if st_board.departure_s < board_after
+                        || st_board.departure_s >= horizon
+                        || st_board.pickup_type == 1
+                    {
+                        if st_board.departure_s >= horizon {
+                            break;
+                        }
+                        continue;
+                    }
+                } else {
+                    continue; // freq trips skipped in isochrone search
+                }
+                let line_id = epoch.line_of_trip.get(ti_us).copied().unwrap_or(u32::MAX);
+                if line_id != u32::MAX
+                    && s.line_stamp.get(line_id as usize).copied().unwrap_or(0) == round_stamp
+                {
+                    continue;
+                }
+                if s.trip_stamp[ti_us] == round_stamp {
+                    continue;
+                }
+                s.trip_stamp[ti_us] = round_stamp;
+                if line_id != u32::MAX {
+                    if let Some(ls) = s.line_stamp.get_mut(line_id as usize) {
+                        *ls = round_stamp;
+                    }
+                }
+                scan_trip_forward(
+                    epoch,
+                    q,
+                    ti_us,
+                    trip,
+                    st_off,
+                    0,
+                    None,
+                    &mut u32::MAX,
+                    &HashMap::new(),
+                    s,
+                    round,
+                    round_stamp,
+                    &mut next_reached,
+                    &crate::gtfs::cell_bitset::CellBitSet::new(0),
+                    false,
+                    Some(stop_idx),
+                );
+            }
+        }
+
+        // Walk transfer phase.
+        let transit_reached: Vec<u32> = next_reached.drain(..).collect();
+        for stop_idx in &transit_reached {
+            let arrival_here = s.earliest[*stop_idx as usize];
+            for &ei in epoch
+                .walk_adj
+                .get(*stop_idx as usize)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[])
+            {
+                let e = &epoch.walk_edges[ei];
+                let arr = arrival_here.saturating_add(e.duration_s);
+                if arr >= horizon {
+                    continue;
+                }
+                let to = e.to_stop_idx;
+                if arr < s.earliest[to as usize] {
+                    s.improve(
+                        round,
+                        to,
+                        arr,
+                        TbrReach::Walk {
+                            arrival_s: arr,
+                            from_stop: *stop_idx,
+                            to_stop: to,
+                            duration_s: e.duration_s,
+                            distance_m: e.distance_m,
+                            prev_round: (round + 1) as u16,
+                        },
+                    );
+                    if s.stop_stamp[to as usize] != round_stamp {
+                        s.stop_stamp[to as usize] = round_stamp;
+                        s.reached.push(to);
+                    }
+                }
+            }
+        }
+
+        // Unflagged mode: transit stops re-enter the departure-scan set.
+        for &si in &transit_reached {
+            if s.stop_stamp[si as usize] == round_stamp {
+                s.reached.push(si);
+            }
+        }
+        if s.reached.is_empty() && s.seg_queue.is_empty() {
+            break;
+        }
+    }
+
+    // Collect: earliest arrival + first reaching round per touched stop.
+    let mut out: Vec<IsochroneStop> = Vec::new();
+    for si in std::mem::take(&mut s.touched) {
+        let mut best_round: Option<usize> = None;
+        for (r, row) in s.labels.iter().enumerate() {
+            if row[si as usize].is_some() {
+                best_round = Some(r);
+                break;
+            }
+        }
+        let Some(r) = best_round else { continue };
+        out.push(IsochroneStop {
+            stop_idx: si,
+            arrival_s: s.earliest[si as usize],
+            legs: r as u32,
+        });
+    }
+    out.sort_by_key(|x| x.arrival_s);
+    out
+}
+
 fn place_from_query_to(epoch: &StaticEpoch, q: &ItineraryQuery) -> Place {
     super::raptor::place_from_query_to(epoch, q)
 }
@@ -1662,6 +1956,7 @@ mod tests {
             default_transfer_s: 60,
             timezone: "UTC".into(),
             excluded_trip_ids: HashSet::new(),
+            excluded_lines: HashSet::new(),
             rt_adjust: std::collections::HashMap::new(),
             wheelchair: false,
             osrm_url: None,
