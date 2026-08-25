@@ -106,6 +106,7 @@ async fn try_load_initial(
             .await
             .map_err(|e| crate::error::TransitError::Other(e.into()))?;
         let parse_t0 = Instant::now();
+        crate::gtfs::load_progress::set_phase(crate::gtfs::load_progress::PHASE_PARSE);
         let bundle = tokio::task::spawn_blocking(move || {
             load_gtfs_bytes_with_horizon(&feed_id, &bytes, horizon)
         })
@@ -143,6 +144,7 @@ async fn check_and_update(
     tx: &mpsc::Sender<FeedEvent>,
 ) -> Result<()> {
     let t0 = Instant::now();
+    crate::gtfs::load_progress::set_phase(crate::gtfs::load_progress::PHASE_DOWNLOAD);
     let meta = read_meta(data_dir, &feed.id);
     let headers: Vec<(String, String)> = feed.auth_header_pair().into_iter().collect();
     let dl = download_conditional_with_headers(
@@ -220,6 +222,7 @@ async fn check_and_update(
         horizon_days = ?horizon,
         "parsing static GTFS (blocking pool)"
     );
+    crate::gtfs::load_progress::set_phase(crate::gtfs::load_progress::PHASE_PARSE);
     let bundle = tokio::task::spawn_blocking(move || {
         load_gtfs_bytes_with_horizon(&feed_id, &bytes, horizon)
     })

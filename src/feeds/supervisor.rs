@@ -454,6 +454,7 @@ fn rebuild_epoch(
         hub,
         crate::gtfs::pack::FlashMode::Persist(flash_dir),
     );
+    crate::gtfs::load_progress::set_phase(crate::gtfs::load_progress::PHASE_READY);
     info!(
         epoch_id = %epoch.id,
         stops = epoch.stop_count(),

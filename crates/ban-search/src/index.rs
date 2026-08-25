@@ -7,7 +7,12 @@ use crate::types::{AddressHit, BanError, BanStats};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Write};
+
+/// Versioned file header. Files without it are rejected on load so schema
+/// drift or truncated writes can never reach bincode (which would otherwise
+/// abort the process trying to allocate garbage length prefixes).
+const MAGIC: &[u8; 8] = b"BANIDX1\n";
 use std::path::Path;
 use tracing::info;
 
@@ -113,8 +118,19 @@ impl BanIndex {
     }
 
     /// Load a previously saved index (`index.bin`).
+    ///
+    /// Files are prefixed with a magic + format-version header; anything
+    /// else (old unversioned files, schema drift, truncated writes) is
+    /// rejected *before* bincode runs — a corrupt payload would otherwise
+    /// deserialize garbage length prefixes and abort the process with a
+    /// multi-TB allocation.
     pub fn load(path: &Path) -> Result<Self, BanError> {
-        let f = File::open(path)?;
+        let mut f = File::open(path)?;
+        let mut magic = [0u8; MAGIC.len()];
+        use std::io::Read;
+        if f.read_exact(&mut magic).is_err() || &magic != MAGIC {
+            return Err(BanError::Bincode("missing or bad BAN index header".into()));
+        }
         let data: IndexData = bincode::deserialize_from(BufReader::new(f))
             .map_err(|e| BanError::Bincode(e.to_string()))?;
         info!(
@@ -126,14 +142,25 @@ impl BanIndex {
         Ok(Self { data })
     }
 
-    /// Persist index for fast startup.
+    /// Persist index for fast startup (atomic: tmp file + rename).
     pub fn save(&self, path: &Path) -> Result<(), BanError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let f = File::create(path)?;
-        bincode::serialize_into(BufWriter::new(f), &self.data)
-            .map_err(|e| BanError::Bincode(e.to_string()))?;
+        let tmp = path.with_extension("bin.tmp");
+        {
+            let f = File::create(&tmp)?;
+            let mut w = BufWriter::new(f);
+            w.write_all(MAGIC)
+                .map_err(|e| BanError::Bincode(e.to_string()))?;
+            bincode::serialize_into(&mut w, &self.data)
+                .map_err(|e| BanError::Bincode(e.to_string()))?;
+            w.flush().ok();
+            w.get_ref()
+                .sync_all()
+                .map_err(|e| BanError::Io(std::io::Error::other(e)))?;
+        }
+        std::fs::rename(&tmp, path).map_err(BanError::from)?;
         info!(path = %path.display(), "BAN index saved");
         Ok(())
     }

@@ -783,6 +783,7 @@ pub fn build_epoch_with_flash(
 
     sort_stop_departures(&mut epoch);
     let t_pack = std::time::Instant::now();
+    crate::gtfs::load_progress::set_phase(crate::gtfs::load_progress::PHASE_PACK);
     compute_line_groups(&mut epoch);
     eprintln!("[pack] line groups in {:.1}s", t_pack.elapsed().as_secs_f32());
     compute_partition(&mut epoch);
@@ -851,6 +852,9 @@ pub fn build_epoch_with_flash(
             }
             match cached {
                 Some((ap, fp, tt)) => {
+                    crate::gtfs::load_progress::set_phase(
+                        crate::gtfs::load_progress::PHASE_FLAGS_LOAD,
+                    );
                     epoch.arc_flag_pattern = ap;
                     epoch.flag_patterns = fp;
                     epoch.trip_transfers = tt;
@@ -1386,12 +1390,18 @@ fn compute_arc_flags(epoch: &mut StaticEpoch) {
     let next_source = AtomicUsize::new(0);
     let results: Mutex<Vec<HashMap<u64, CellBitSet>>> = Mutex::new(Vec::new());
     let horizon_s = dep_times[dep_times.len() - 1].saturating_add(FLASH_HORIZON_S);
-
+    crate::gtfs::load_progress::set_phase(crate::gtfs::load_progress::PHASE_FLAGS_COMPUTE);
+    crate::gtfs::load_progress::flags_set_total(
+        (sources.len() * dep_times.len()) as u64,
+    );
+    // Batched progress ticks: one atomic add per worker loop keeps overhead
+    // negligible while giving /health a smooth percentage.
     std::thread::scope(|scope| {
         for _ in 0..n_threads {
             scope.spawn(|| {
                 let mut st = FlashState::new(n_stops, epoch.trips.len(), epoch.line_trips.len());
                 let mut local: HashMap<u64, CellBitSet> = HashMap::new();
+                let mut ticks = 0u64;
                 loop {
                     let i = next_source.fetch_add(1, Ordering::Relaxed);
                     if i >= sources.len() {
@@ -1403,8 +1413,13 @@ fn compute_arc_flags(epoch: &mut StaticEpoch) {
                             epoch, &entry_prefix, walk_base, ps, dep, horizon_s, &mut st,
                         );
                         flash_set_flags(epoch, &st, num_cells, &mut local);
+                        ticks += 1;
+                        if ticks % 16 == 0 {
+                            crate::gtfs::load_progress::flags_tick(16);
+                        }
                     }
                 }
+                crate::gtfs::load_progress::flags_tick(ticks % 16);
                 if !local.is_empty() {
                     results.lock().unwrap().push(local);
                 }
