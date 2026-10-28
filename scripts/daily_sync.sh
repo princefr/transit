@@ -38,20 +38,18 @@ GTFS_URL="${GTFS_URL:-${IDFM_GTFS_URL:-https://www.data.gouv.fr/api/1/datasets/r
 UA="${SYNC_USER_AGENT:-transit-rs/0.1 daily_sync}"
 RESTART="${RESTART:-0}"
 BUILD_LINES="${BUILD_LINES:-0}"
-LOCK="/tmp/transit-daily-sync-${FEED_ID}.lock"
+# Lock lives in the (user-owned) feed dir, not at a predictable path in
+# world-writable /tmp where another user could pre-create or symlink it.
+LOCK="$FEED_DIR/.daily_sync.lock"
 
-CURL_EXTRA=()
 # Public data.gouv.fr permanent resources redirect to OpenDataSoft and reject
 # X-API-KEY (401). Only attach dataset auth for PRIM Datahub / gated URLs.
+# The key is never put on curl's command line (visible in `ps`): it is fed to
+# `curl -H @-` on stdin by the shell builtin printf.
+DATASET_KEY=""
 case "$GTFS_URL" in
   *prim.iledefrance-mobilites.fr*|*transport.data.gouv.fr*)
-    if [[ -n "${PRIM_DATASET_KEY:-}" ]]; then
-      CURL_EXTRA+=(-H "X-API-KEY: ${PRIM_DATASET_KEY}")
-    elif [[ -n "${DATASETS_API_KEY:-}" ]]; then
-      CURL_EXTRA+=(-H "X-API-KEY: ${DATASETS_API_KEY}")
-    elif [[ -n "${DATAGOUV_API_KEY:-}" ]]; then
-      CURL_EXTRA+=(-H "X-API-KEY: ${DATAGOUV_API_KEY}")
-    fi
+    DATASET_KEY="${PRIM_DATASET_KEY:-${DATASETS_API_KEY:-${DATAGOUV_API_KEY:-}}}"
     ;;
 esac
 
@@ -65,7 +63,8 @@ log() {
 }
 
 # Single-flight: concurrent cron/timer exits cleanly
-exec 9>"$LOCK"
+# Append mode: never truncates whatever the path points at.
+exec 9>>"$LOCK"
 if ! flock -n 9; then
   log "another daily_sync for feed=$FEED_ID holds $LOCK; exit 0"
   exit 0
@@ -83,17 +82,28 @@ cleanup_partial() {
 }
 trap cleanup_partial EXIT
 
+download() {
+  # Extra request headers are read from stdin (`-H @-`); empty stdin = none.
+  curl -fL --retry 3 --retry-delay 5 --retry-all-errors \
+    -A "$UA" \
+    -H @- \
+    --connect-timeout 30 \
+    --max-time 1800 \
+    -o "$TMP_ZIP" \
+    "$GTFS_URL"
+}
+
 log "downloading → $TMP_ZIP"
-if ! curl -fL --retry 3 --retry-delay 5 --retry-all-errors \
-  -A "$UA" \
-  "${CURL_EXTRA[@]}" \
-  --connect-timeout 30 \
-  --max-time 1800 \
-  -o "$TMP_ZIP" \
-  "$GTFS_URL"; then
+if [[ -n "$DATASET_KEY" ]]; then
+  if ! printf 'X-API-KEY: %s\n' "$DATASET_KEY" | download; then
+    log "ERROR: download failed"
+    exit 1
+  fi
+elif ! download </dev/null; then
   log "ERROR: download failed"
   exit 1
 fi
+unset DATASET_KEY
 
 BYTES="$(wc -c <"$TMP_ZIP" | tr -d ' ')"
 log "downloaded bytes=$BYTES"
@@ -155,14 +165,21 @@ mv -f "$PROMOTE_TMP" "$CURRENT"
 log "promoted → $CURRENT"
 
 META="$FEED_DIR/current.meta.json"
-cat >"$META" <<EOF
-{
-  "sha256": "$NEW_SHA",
-  "loaded_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "static_url": "$GTFS_URL",
-  "source": "daily_sync.sh"
-}
-EOF
+# Build JSON with a real encoder: GTFS_URL is user-provided and may contain
+# quotes / backslashes that would corrupt a heredoc-built document.
+META_TMP="$META.tmp.$$"
+python3 - "$META_TMP" "$NEW_SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$GTFS_URL" <<'PY'
+import json, sys
+out, sha, loaded_at, url = sys.argv[1:5]
+with open(out, "w", encoding="utf-8") as f:
+    json.dump(
+        {"sha256": sha, "loaded_at": loaded_at, "static_url": url, "source": "daily_sync.sh"},
+        f,
+        indent=2,
+    )
+    f.write("\n")
+PY
+mv -f "$META_TMP" "$META"
 log "meta=$META"
 
 touch "$FEED_DIR/reload"

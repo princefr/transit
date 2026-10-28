@@ -3,10 +3,16 @@ services:
     build: .
     image: transit:local
     ports:
-      - "8080:8080"
+      # Loopback only by default. Put a reverse proxy (TLS, rate limiting) in
+      # front, or change to "8080:8080" deliberately to expose on all interfaces.
+      - "127.0.0.1:8080:8080"
     volumes:
-      # Persist downloaded GTFS / RT cache across restarts
-      - ./data:/app/data
+      # Persist downloaded GTFS / RT cache across restarts. A named volume is
+      # used because the container runs as uid 10001: a host bind mount such
+      # as ./data:/app/data is owned by your host user and fails with EACCES.
+      # To use a bind mount anyway: `sudo chown -R 10001:10001 ./data`, or add
+      # `user: "${UID}:${GID}"` to this service.
+      - transit-data:/app/data
       # Optional: mount a custom config over the image default
       # - ./config/default.toml:/app/config/default.toml:ro
     environment:
@@ -14,3 +20,6 @@ services:
       TRANSIT__SERVER__BIND: 0.0.0.0:8080
       TRANSIT__RUNTIME__DATA_DIR: /app/data
     restart: unless-stopped
+
+volumes:
+  transit-data:

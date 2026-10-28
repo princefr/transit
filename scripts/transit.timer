@@ -12,6 +12,7 @@
 #   systemctl list-timers | grep transit
 #
 # Crontab alternative (no systemd):
+#   CRON_TZ=Europe/Paris
 #   15 5,13,21 * * * /home/ondonda/rust/transit/scripts/daily_sync.sh >>/home/ondonda/rust/transit/data/logs/cron.log 2>&1
 
 [Unit]
@@ -19,10 +20,11 @@ Description=Schedule IDFM / transit GTFS daily_sync (3× daily)
 Documentation=file:///home/ondonda/rust/transit/docs/IDFM_DAILY.md
 
 [Timer]
-# Morning, afternoon, evening UTC-ish; adjust for local ops
-OnCalendar=*-*-* 05:15:00
-OnCalendar=*-*-* 13:15:00
-OnCalendar=*-*-* 21:15:00
+# Morning, afternoon, evening Paris local time, independent of the host timezone
+# (the timezone suffix needs systemd >= 235).
+OnCalendar=*-*-* 05:15:00 Europe/Paris
+OnCalendar=*-*-* 13:15:00 Europe/Paris
+OnCalendar=*-*-* 21:15:00 Europe/Paris
 Persistent=true
 RandomizedDelaySec=120
 Unit=transit-daily-sync.service

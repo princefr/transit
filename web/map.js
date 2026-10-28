@@ -141,14 +141,23 @@
     return m;
   }
 
+  /** Only `#rgb` / `#rrggbb` may reach an inline `style` attribute. */
+  function safeCssColor(c, fallback) {
+    const s = String(c == null ? "" : c).trim();
+    return /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(s) ? s : fallback;
+  }
+
   function iconHtml(mode, color) {
-    const c = color || MODE_COLORS[(mode || "OTHER").toUpperCase()] || "#334155";
+    const c = safeCssColor(
+      color || MODE_COLORS[(mode || "OTHER").toUpperCase()],
+      "#334155"
+    );
     const key = modeKey(mode);
     const src = `assets/icons/${key}.svg`;
     const fallback = INLINE_ICONS[key] || INLINE_ICONS.other;
     return (
       `<div class="map-mode-icon" style="background:${c}">` +
-      `<img src="${src}" alt="${mode || ""}" onerror="this.outerHTML=\`${fallback.replace(/`/g, "")}\`"/>` +
+      `<img src="${escapeHtml(src)}" alt="${escapeHtml(mode || "")}" onerror="this.outerHTML=\`${fallback.replace(/`/g, "")}\`"/>` +
       `</div>`
     );
   }
@@ -347,10 +356,10 @@
     let v = null;
     if (opts != null && typeof opts !== "object") {
       bearing = opts;
-      color = arguments[1] || color;
+      color = safeCssColor(arguments[1], color);
     } else if (opts && typeof opts === "object") {
       bearing = opts.bearing;
-      color = opts.color || color;
+      color = safeCssColor(opts.color, color);
       mode = opts.mode || mode;
       badge = opts.badge != null ? String(opts.badge) : "";
       label = opts.label != null ? String(opts.label) : badge;
@@ -362,7 +371,7 @@
         ? Number(bearing)
         : null;
     const colors = v ? resolveVehicleColors(v, color) : { bg: color, fg: contrastText(color) };
-    const c = colors.bg;
+    const c = safeCssColor(colors.bg, "#38bdf8");
     const fg = colors.fg;
     const key = modeKey(mode);
     const src = v ? vehicleGlyphPath(v) : `assets/icons/${key}.svg`;
@@ -382,7 +391,7 @@
       labelHtml +
       `<div class="live-vehicle-rot" style="${rotStyle}">` +
       `<div class="live-vehicle-body" style="border-color:${c}">` +
-      `<img class="live-vehicle-glyph" src="${src}" alt="${escapeHtml(mode || "vehicle")}" width="20" height="20" ` +
+      `<img class="live-vehicle-glyph" src="${escapeHtml(src)}" alt="${escapeHtml(mode || "vehicle")}" width="20" height="20" ` +
       `onerror="this.src='assets/icons/train.svg'"/>` +
       `</div>` +
       `</div>` +
@@ -522,11 +531,12 @@
   }
 
   function escapeHtml(s) {
-    return String(s || "")
+    return (s == null ? "" : String(s))
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;");
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
   }
 
   function idfmPopup(feature) {
@@ -705,14 +715,6 @@
     entry.anim = requestAnimationFrame(frame);
   }
 
-  function escapeHtml(s) {
-    return String(s)
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;");
-  }
-
   function vehiclePopup(v) {
     const parts = [];
     const mapLabel = vehicleMapLabel(v);
@@ -826,7 +828,7 @@
           ? Number(v.bearing)
           : null;
       const color =
-        v.color ||
+        safeCssColor(v.color, null) ||
         modeColor(v.mode, v.routeColor || v.route_color) ||
         "#38bdf8";
       const popup = vehiclePopup(v);
@@ -993,6 +995,8 @@
         lineJoin: "round",
         lineCap: "round",
       });
+      // leg.label / m.title are HTML built by web/src/lib.rs (journey_to_map),
+      // which escapes every feed-provided value with escape_html().
       if (leg.label) line.bindPopup(leg.label);
       line.addTo(layerGroup);
       lines.push(line);

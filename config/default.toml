@@ -1,6 +1,10 @@
 [server]
-bind = "0.0.0.0:8080"
-graphql_playground = true
+# Loopback by default. Containers override with TRANSIT__SERVER__BIND=0.0.0.0:8080
+# (set in Dockerfile / docker-compose.yml).
+bind = "127.0.0.1:8080"
+# GraphiQL playground at /graphiql. Off by default; enable for local dev
+# (`make run` / `make run-debug` export TRANSIT__SERVER__GRAPHQL_PLAYGROUND=true).
+graphql_playground = false
 
 [runtime]
 # RAPTOR runs on blocking pool; keep a few free for health/stops while planning.
@@ -22,9 +26,14 @@ max_walk_meters = 2000
 # Walk links between boardable stops (complete transfer graph). 400m+ for monomodal RER↔Métro.
 hub_link_radius_m = 450
 # OSRM for street-level walk/bike paths on the map (access, egress, transfers).
-# Empty = straight lines only. Public demo (best-effort) or self-host:
-osrm_url = "https://router.project-osrm.org"
-# Or env: TRANSIT_OSRM_URL=https://router.project-osrm.org
+# Empty (default) = straight lines only, no third-party requests.
+# Privacy: when set, users' origin/destination coordinates are sent to this
+# server. The public demo server (https://router.project-osrm.org) is
+# best-effort and its usage policy forbids production use — self-host OSRM
+# (https://github.com/Project-OSRM/osrm-backend) or opt in explicitly, e.g.
+#   osrm_url = "http://127.0.0.1:5000"
+# or env: TRANSIT_OSRM_URL=... (alias of TRANSIT__ROUTING__OSRM_URL)
+osrm_url = ""
 bike_speed_m_s = 4.2
 max_bike_meters = 5000
 

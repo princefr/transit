@@ -98,7 +98,9 @@ fn find_zip_entry(archive: &mut ZipArchive<Cursor<Vec<u8>>>, name: &str) -> Opti
     // case-insensitive search on the basename
     archive
         .file_names()
+        .filter_map(|n| n.ok())
         .find(|n| {
+            let n: &str = n;
             let base = Path::new(n)
                 .file_name()
                 .and_then(|s| s.to_str())

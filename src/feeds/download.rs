@@ -37,7 +37,10 @@ pub fn validate_gtfs_zip(bytes: &[u8]) -> Result<()> {
         let file = archive
             .by_index(i)
             .map_err(|e| TransitError::Parse(format!("zip entry: {e}")))?;
-        let name = file.name().replace('\\', "/");
+        let name = file
+            .name()
+            .map_err(|e| TransitError::Parse(format!("zip entry name: {e}")))?
+            .replace('\\', "/");
         let base = name
             .rsplit('/')
             .next()
