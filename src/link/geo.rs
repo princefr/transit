@@ -15,6 +15,10 @@ pub fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 /// Approximate meters per degree of latitude (constant).
 const M_PER_DEG_LAT: f64 = 111_320.0;
 
+/// Bounding boxes are widened slightly: `M_PER_DEG_LAT` is a flat-earth constant a bit
+/// larger than the haversine sphere's metres per degree.
+const BBOX_MARGIN: f64 = 1.02;
+
 fn m_per_deg_lon(lat: f64) -> f64 {
     M_PER_DEG_LAT * lat.to_radians().cos().abs().max(0.2)
 }
@@ -49,8 +53,8 @@ impl GeoGrid {
     }
 
     fn neighbor_range(&self, lat: f64, lon: f64, radius_m: f64) -> (i32, i32, i32, i32) {
-        let dlat = radius_m / M_PER_DEG_LAT;
-        let dlon = radius_m / m_per_deg_lon(lat);
+        let dlat = radius_m * BBOX_MARGIN / M_PER_DEG_LAT;
+        let dlon = radius_m * BBOX_MARGIN / m_per_deg_lon(lat);
         let (ix0, iy0) = Self::cell_key(lat - dlat, lon - dlon, self.cell_deg);
         let (ix1, iy1) = Self::cell_key(lat + dlat, lon + dlon, self.cell_deg);
         (ix0.min(ix1), iy0.min(iy1), ix0.max(ix1), iy0.max(iy1))
@@ -113,7 +117,46 @@ pub fn hub_links(points: &[(usize, f64, f64)], radius_m: f64) -> Vec<(usize, usi
     out
 }
 
+fn sort_truncate(mut scored: Vec<(usize, f64)>, limit: usize) -> Vec<(usize, f64)> {
+    scored.sort_by(|a, b| {
+        a.1.partial_cmp(&b.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    scored.truncate(limit);
+    scored
+}
+
+impl GeoGrid {
+    /// Original ids (`points[i].0`) within `max_m` of (lat, lon), nearest first.
+    ///
+    /// `points` must be the slice the grid was built from. Any `max_m` works (the
+    /// neighbourhood scan adapts); cells sized near typical radii are fastest.
+    pub fn nearby(
+        &self,
+        points: &[(usize, f64, f64)],
+        lat: f64,
+        lon: f64,
+        max_m: f64,
+        limit: usize,
+    ) -> Vec<(usize, f64)> {
+        if points.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        let scored = self
+            .query(points, lat, lon, max_m)
+            .into_iter()
+            .map(|(pi, d)| (points[pi].0, d))
+            .collect();
+        sort_truncate(scored, limit)
+    }
+}
+
 /// Find stop indices (original ids from points) within max_m of a point, nearest first.
+///
+/// One-shot helper: a linear scan with a cheap lat/lon bounding-box prefilter (no index
+/// is built, so it is O(n) with a tiny constant). Callers issuing many queries against
+/// the same points should build a [`GeoGrid`] once and use [`GeoGrid::nearby`].
 pub fn nearby(
     points: &[(usize, f64, f64)],
     lat: f64,
@@ -124,15 +167,17 @@ pub fn nearby(
     if points.is_empty() || limit == 0 {
         return Vec::new();
     }
-    let grid = GeoGrid::build(points, max_m);
-    let mut scored: Vec<(usize, f64)> = grid
-        .query(points, lat, lon, max_m)
-        .into_iter()
-        .map(|(pi, d)| (points[pi].0, d))
+    let dlat = max_m * BBOX_MARGIN / M_PER_DEG_LAT;
+    let dlon = max_m * BBOX_MARGIN / m_per_deg_lon(lat);
+    let scored = points
+        .iter()
+        .filter(|&&(_, plat, plon)| (plat - lat).abs() <= dlat && (plon - lon).abs() <= dlon)
+        .filter_map(|&(id, plat, plon)| {
+            let d = haversine_m(lat, lon, plat, plon);
+            (d <= max_m).then_some((id, d))
+        })
         .collect();
-    scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-    scored.truncate(limit);
-    scored
+    sort_truncate(scored, limit)
 }
 
 #[cfg(test)]
@@ -156,6 +201,20 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].0, 0);
         assert!(hits.iter().all(|(id, _)| *id != 2));
+    }
+
+    #[test]
+    fn prebuilt_grid_nearby_matches_linear_scan() {
+        let mut points = Vec::new();
+        for i in 0..30 {
+            for j in 0..30 {
+                points.push((i * 30 + j, 48.0 + i as f64 * 0.002, 2.0 + j as f64 * 0.003));
+            }
+        }
+        let grid = GeoGrid::build(&points, 500.0);
+        for &(lat, lon, r) in &[(48.03, 2.04, 300.0), (48.01, 2.01, 1200.0), (47.0, 1.0, 500.0)] {
+            assert_eq!(grid.nearby(&points, lat, lon, r, 25), nearby(&points, lat, lon, r, 25));
+        }
     }
 
     #[test]

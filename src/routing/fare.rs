@@ -4,32 +4,33 @@
 //!
 //! - **Not ticket purchase**: amounts are rough estimates for display only.
 //! - French / national feeds often omit or only partially publish fare tables.
-//! - Transfer products, time-based validity, and multi-operator pass logic are not modeled.
+//! - Multi-operator passes and journey-level zone products spanning several legs are
+//!   not modeled (zones are matched per leg).
 //! - Prices are never invented: no match or empty tables ⇒ `None`.
 //!
-//! # Matching strategy
+//! # Matching strategy (per transit leg)
 //!
-//! 1. Collect transit legs with namespaced `route_id` and board/alight stop `zone_id`
-//!    (from [`crate::gtfs::pack::StopRecord::zone_id`], namespaced as `feed:zone` when present).
-//! 2. Collect the set of all zones visited by transit legs (board + alight).
-//! 3. A rule **matches** when all of its set filters pass:
-//!    - `route_id`: empty **or** equals a leg route;
-//!    - `origin_id`: empty **or** equals the **board** stop `zone_id` of some matching leg
-//!      (or of a leg that also satisfies route when route is set);
-//!    - `destination_id`: empty **or** equals the **alight** stop `zone_id` of that same leg;
-//!    - `contains_id`: empty **or** present in the journey zone set.
-//! 4. **Specificity** (higher wins when several rules match the same journey):
-//!    - +4 if `route_id` is set
-//!    - +2 if `origin_id` is set
-//!    - +2 if `destination_id` is set
-//!    - +1 if `contains_id` is set
-//!    So **route+zones > route-only > network-wide**. Only rules at the maximum
-//!    specificity among matches are kept (avoids double-counting a flat network fare
-//!    when a zone product already applies).
-//! 5. Collect unique matched `FareAttribute`s. If all share one currency, **sum** their
-//!    prices. Mixed currencies or empty match set ⇒ `None`.
+//! 1. Each transit leg has its namespaced `route_id` and board/alight stop `zone_id`
+//!    (from [`crate::gtfs::pack::StopRecord::zone_id`]).
+//! 2. A rule **matches a leg** when all of its set filters pass:
+//!    - `route_id`: empty **or** equals the leg route;
+//!    - `origin_id`: empty **or** equals the leg **board** zone;
+//!    - `destination_id`: empty **or** equals the leg **alight** zone;
+//!    - `contains_id`: empty **or** equals the board or alight zone of the leg.
+//! 3. **Specificity** (higher wins when several rules match the same leg):
+//!    +4 `route_id`, +2 `origin_id`, +2 `destination_id`, +1 `contains_id`
+//!    (route+zones > route-only > network-wide). Among the most specific matches the
+//!    **cheapest** fare applies (GTFS: rider buys the cheapest valid product).
+//! 4. If **any** transit leg has no matching rule ⇒ `None` (an undercounted total
+//!    would be misleading).
+//! 5. Tickets: consecutive legs priced with the same `fare_id` share one ticket while
+//!    `fare_attributes.transfers` (empty = unlimited) and `transfer_duration` (seconds
+//!    since the ticket's first boarding) allow it; otherwise a new ticket is bought.
+//!    Ticket prices are summed; mixed currencies ⇒ `None`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+
+use chrono::{DateTime, Utc};
 
 use crate::gtfs::pack::{FareAttribute, FareRule, StaticEpoch};
 
@@ -40,6 +41,7 @@ use super::journey::{Journey, Leg};
 pub struct FareEstimate {
     pub amount: f64,
     pub currency: String,
+    /// Fare products bought, one entry per ticket (in journey order).
     pub fare_ids: Vec<String>,
     pub note: String,
 }
@@ -49,6 +51,7 @@ struct LegFareCtx<'a> {
     route_id: &'a str,
     origin_zone: Option<&'a str>,
     dest_zone: Option<&'a str>,
+    board_at: DateTime<Utc>,
 }
 
 fn rule_specificity(rule: &FareRule) -> u8 {
@@ -68,38 +71,67 @@ fn rule_specificity(rule: &FareRule) -> u8 {
     s
 }
 
-/// Whether `rule` matches at least one transit leg under the given zone set.
-fn rule_matches_legs(rule: &FareRule, legs: &[LegFareCtx<'_>], journey_zones: &HashSet<&str>) -> bool {
-    if let Some(ref contains) = rule.contains_id {
-        if !journey_zones.contains(contains.as_str()) {
+/// Whether `rule` applies to a single transit leg.
+fn rule_matches_leg(rule: &FareRule, leg: &LegFareCtx<'_>) -> bool {
+    if let Some(ref rid) = rule.route_id {
+        if rid.as_str() != leg.route_id {
             return false;
         }
     }
-
-    for leg in legs {
-        if let Some(ref rid) = rule.route_id {
-            if rid.as_str() != leg.route_id {
-                continue;
-            }
+    if let Some(ref oid) = rule.origin_id {
+        if leg.origin_zone != Some(oid.as_str()) {
+            return false;
         }
-        if let Some(ref oid) = rule.origin_id {
-            if leg.origin_zone != Some(oid.as_str()) {
-                continue;
-            }
-        }
-        if let Some(ref did) = rule.destination_id {
-            if leg.dest_zone != Some(did.as_str()) {
-                continue;
-            }
-        }
-        return true;
     }
-    false
+    if let Some(ref did) = rule.destination_id {
+        if leg.dest_zone != Some(did.as_str()) {
+            return false;
+        }
+    }
+    if let Some(ref cid) = rule.contains_id {
+        let c = Some(cid.as_str());
+        if leg.origin_zone != c && leg.dest_zone != c {
+            return false;
+        }
+    }
+    true
+}
+
+/// Most specific, then cheapest, fare product for one leg.
+fn fare_for_leg<'e>(
+    epoch: &'e StaticEpoch,
+    attr_by_id: &HashMap<&str, &'e FareAttribute>,
+    leg: &LegFareCtx<'_>,
+) -> Option<&'e FareAttribute> {
+    let mut best: Option<(u8, &FareAttribute)> = None;
+    for rule in &epoch.fare_rules {
+        let Some(&attr) = attr_by_id.get(rule.fare_id.as_str()) else {
+            continue;
+        };
+        if !rule_matches_leg(rule, leg) {
+            continue;
+        }
+        let spec = rule_specificity(rule);
+        let better = match best {
+            None => true,
+            Some((bs, ba)) => {
+                spec > bs
+                    || (spec == bs
+                        && (attr.price < ba.price
+                            || (attr.price == ba.price && attr.fare_id < ba.fare_id)))
+            }
+        };
+        if better {
+            best = Some((spec, attr));
+        }
+    }
+    best.map(|(_, a)| a)
 }
 
 /// Estimate journey fare from epoch fare tables. Returns `None` if no data or no match.
 pub fn estimate_journey_fare(epoch: &StaticEpoch, journey: &Journey) -> Option<FareEstimate> {
-    if epoch.fares.is_empty() {
+    if epoch.fares.is_empty() || epoch.fare_rules.is_empty() {
+        // Attributes without rules may be agency-wide, but cannot be safely assigned.
         return None;
     }
 
@@ -109,96 +141,72 @@ pub fn estimate_journey_fare(epoch: &StaticEpoch, journey: &Journey) -> Option<F
         .map(|f| (f.fare_id.as_str(), f))
         .collect();
 
-    let mut leg_ctxs: Vec<LegFareCtx<'_>> = Vec::new();
-    let mut journey_zones: HashSet<&str> = HashSet::new();
+    let zone_of = |stop_id: &str| {
+        epoch
+            .stop_id_to_idx
+            .get(stop_id)
+            .and_then(|&i| epoch.stops.get(i as usize))
+            .and_then(|s| s.zone_id.as_deref())
+    };
 
+    let mut leg_ctxs: Vec<LegFareCtx<'_>> = Vec::new();
     for leg in &journey.legs {
         let Leg::Transit(t) = leg else { continue };
-        let Some(trip) = epoch
+        // A leg we cannot identify cannot be priced: refuse rather than undercount.
+        let trip = epoch
             .trip_id_to_idx
             .get(&t.trip_id)
-            .and_then(|&i| epoch.trips.get(i as usize))
-        else {
-            continue;
-        };
-        let origin_zone = epoch
-            .stop_id_to_idx
-            .get(&t.from.stop_id)
-            .and_then(|&i| epoch.stops.get(i as usize))
-            .and_then(|s| s.zone_id.as_deref());
-        let dest_zone = epoch
-            .stop_id_to_idx
-            .get(&t.to.stop_id)
-            .and_then(|&i| epoch.stops.get(i as usize))
-            .and_then(|s| s.zone_id.as_deref());
-        if let Some(z) = origin_zone {
-            journey_zones.insert(z);
-        }
-        if let Some(z) = dest_zone {
-            journey_zones.insert(z);
-        }
+            .and_then(|&i| epoch.trips.get(i as usize))?;
         leg_ctxs.push(LegFareCtx {
             route_id: trip.route_id.as_str(),
-            origin_zone,
-            dest_zone,
+            origin_zone: zone_of(&t.from.stop_id),
+            dest_zone: zone_of(&t.to.stop_id),
+            board_at: t.scheduled_departure,
         });
     }
     if leg_ctxs.is_empty() {
         return None;
     }
 
-    // If there are no rules, fares alone are not applied (GTFS: attributes without rules
-    // may be agency-wide, but without rules we cannot safely assign them to a journey).
-    if epoch.fare_rules.is_empty() {
-        return None;
-    }
-
-    let mut matched: Vec<(&FareRule, u8)> = Vec::new();
-    for rule in &epoch.fare_rules {
-        if !attr_by_id.contains_key(rule.fare_id.as_str()) {
-            continue;
-        }
-        if rule_matches_legs(rule, &leg_ctxs, &journey_zones) {
-            matched.push((rule, rule_specificity(rule)));
-        }
-    }
-
-    if matched.is_empty() {
-        return None;
-    }
-
-    let max_spec = matched.iter().map(|(_, s)| *s).max().unwrap_or(0);
-    let mut matched_ids: HashSet<String> = HashSet::new();
-    for (rule, spec) in matched {
-        if spec == max_spec {
-            matched_ids.insert(rule.fare_id.clone());
+    // (fare, first boarding, transfers used) of the ticket currently held.
+    let mut current: Option<(&FareAttribute, DateTime<Utc>, u32)> = None;
+    let mut tickets: Vec<&FareAttribute> = Vec::new();
+    for leg in &leg_ctxs {
+        let attr = fare_for_leg(epoch, &attr_by_id, leg)?;
+        let reuse = match current {
+            Some((cur, first, used)) if cur.fare_id == attr.fare_id => {
+                let transfers_ok = cur.transfers.map(|n| used < n as u32).unwrap_or(true);
+                let duration_ok = cur
+                    .transfer_duration
+                    .map(|d| (leg.board_at - first).num_seconds() <= d as i64)
+                    .unwrap_or(true);
+                transfers_ok && duration_ok
+            }
+            _ => false,
+        };
+        if reuse {
+            if let Some((_, _, used)) = current.as_mut() {
+                *used += 1;
+            }
+        } else {
+            tickets.push(attr);
+            current = Some((attr, leg.board_at, 0));
         }
     }
 
-    let mut attrs: Vec<&FareAttribute> = matched_ids
-        .iter()
-        .filter_map(|id| attr_by_id.get(id.as_str()).copied())
-        .collect();
-    attrs.sort_by(|a, b| a.fare_id.cmp(&b.fare_id));
-
-    if attrs.is_empty() {
+    let currency = tickets[0].currency_type.clone();
+    if tickets.iter().any(|f| f.currency_type != currency) {
         return None;
     }
+    let amount: f64 = tickets.iter().map(|f| f.price).sum();
+    let fare_ids: Vec<String> = tickets.iter().map(|f| f.fare_id.clone()).collect();
 
-    let currency = attrs[0].currency_type.clone();
-    if attrs.iter().any(|f| f.currency_type != currency) {
-        return None;
-    }
-
-    let amount: f64 = attrs.iter().map(|f| f.price).sum();
-    let fare_ids: Vec<String> = attrs.iter().map(|f| f.fare_id.clone()).collect();
-
-    let note = if attrs.len() == 1 {
-        "Best-effort GTFS fare estimate (single product). Not for purchase; data may be incomplete."
+    let note = if tickets.len() == 1 {
+        "Best-effort GTFS fare estimate (single ticket). Not for purchase; data may be incomplete."
             .to_string()
     } else {
-        "Best-effort GTFS fare estimate (sum of unique matched products). \
-         Transfer tickets may be cheaper; data may be incomplete. Not for purchase."
+        "Best-effort GTFS fare estimate (one ticket per leg unless the fare allows transfers). \
+         Passes or transfer products may be cheaper; data may be incomplete. Not for purchase."
             .to_string()
     };
 
@@ -539,7 +547,7 @@ mod tests {
     }
 
     #[test]
-    fn network_wide_and_route_sum_unique_same_specificity() {
+    fn equally_specific_products_pick_cheapest() {
         let mut epoch = base_epoch();
         // Two route-level products (same specificity class via different routes would
         // not both match; same route + network: different specificity → only route wins.
@@ -581,8 +589,97 @@ mod tests {
         ]);
         let j = sample_journey();
         let est = estimate_journey_fare(&epoch, &j).expect("fare");
+        // Two network-wide products for the same single leg are alternatives: cheapest.
+        assert!((est.amount - 1.0).abs() < 1e-9);
+        assert_eq!(est.fare_ids, vec!["test:a".to_string()]);
+    }
+
+    fn fare(id: &str, price: f64, transfers: Option<u8>, dur: Option<u32>) -> FareAttribute {
+        FareAttribute {
+            fare_id: id.into(),
+            price,
+            currency_type: "EUR".into(),
+            payment_method: 1,
+            transfers,
+            transfer_duration: dur,
+        }
+    }
+
+    fn route_rule(fare_id: &str, route: Option<&str>) -> FareRule {
+        FareRule {
+            fare_id: fare_id.into(),
+            route_id: route.map(Into::into),
+            origin_id: None,
+            destination_id: None,
+            contains_id: None,
+        }
+    }
+
+    /// Epoch with a second trip `test:t2` on route `test:r2`; journey t1 then t2
+    /// (boardings 08:00 and 09:10).
+    fn two_leg_setup() -> (StaticEpoch, Journey) {
+        let mut epoch = base_epoch();
+        let mut t2 = epoch.trips[0].clone();
+        t2.id = "test:t2".into();
+        t2.route_id = "test:r2".into();
+        epoch.trips.push(t2);
+        epoch.trip_id_to_idx.insert("test:t2".into(), 1);
+        let mut j = sample_journey();
+        let Leg::Transit(mut second) = j.legs[0].clone() else {
+            unreachable!()
+        };
+        second.trip_id = "test:t2".into();
+        second.route_id = "test:r2".into();
+        second.scheduled_departure = Utc.with_ymd_and_hms(2026, 6, 1, 9, 10, 0).unwrap();
+        second.scheduled_arrival = Utc.with_ymd_and_hms(2026, 6, 1, 9, 40, 0).unwrap();
+        j.legs.push(Leg::Transit(second));
+        (epoch, j)
+    }
+
+    #[test]
+    fn mixed_route_journey_sums_per_leg_products() {
+        let (mut epoch, j) = two_leg_setup();
+        epoch.fares.extend([fare("test:bus", 2.0, Some(0), None), fare("test:tram", 3.0, Some(0), None)]);
+        epoch.fare_rules.extend([
+            route_rule("test:bus", Some("test:r1")),
+            route_rule("test:tram", Some("test:r2")),
+        ]);
+        let est = estimate_journey_fare(&epoch, &j).expect("fare");
+        assert!((est.amount - 5.0).abs() < 1e-9);
+        assert_eq!(est.fare_ids, vec!["test:bus".to_string(), "test:tram".to_string()]);
+    }
+
+    #[test]
+    fn same_fare_twice_without_transfers_is_charged_twice() {
+        let (mut epoch, j) = two_leg_setup();
+        epoch.fares.push(fare("test:flat", 2.0, Some(0), None));
+        epoch.fare_rules.push(route_rule("test:flat", None));
+        let est = estimate_journey_fare(&epoch, &j).expect("fare");
         assert!((est.amount - 4.0).abs() < 1e-9);
         assert_eq!(est.fare_ids.len(), 2);
+    }
+
+    #[test]
+    fn same_fare_with_transfer_allowance_charged_once() {
+        let (mut epoch, j) = two_leg_setup();
+        // One transfer within 90 minutes: second boarding is 70 min after the first.
+        epoch.fares.push(fare("test:flat", 2.0, Some(1), Some(5400)));
+        epoch.fare_rules.push(route_rule("test:flat", None));
+        let est = estimate_journey_fare(&epoch, &j).expect("fare");
+        assert!((est.amount - 2.0).abs() < 1e-9);
+
+        // Validity expired (60 min) → two tickets.
+        epoch.fares[0].transfer_duration = Some(3600);
+        let est = estimate_journey_fare(&epoch, &j).expect("fare");
+        assert!((est.amount - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn unmatched_leg_returns_none() {
+        let (mut epoch, j) = two_leg_setup();
+        epoch.fares.push(fare("test:bus", 2.0, None, None));
+        epoch.fare_rules.push(route_rule("test:bus", Some("test:r1")));
+        assert!(estimate_journey_fare(&epoch, &j).is_none());
     }
 
     #[test]

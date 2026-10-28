@@ -342,28 +342,51 @@ pub fn service_date_in_tz(dt: DateTime<Utc>, tz_name: &str) -> NaiveDate {
     dt.date_naive()
 }
 
-/// Seconds since local midnight for departure (handles Europe/Paris).
-pub fn local_seconds_since_midnight(dt: DateTime<Utc>, tz_name: &str) -> u32 {
-    use chrono::Timelike;
+/// GTFS service-day anchor: **noon local time minus 12 hours** (GTFS reference §
+/// stop_times "time measured from noon minus 12h"). On regular days this equals local
+/// midnight; on DST transition days it differs by ±1 h, so `anchor + stop_time` yields
+/// the correct absolute instant. A nonexistent/ambiguous noon (never seen in practice)
+/// falls back to the earliest valid mapping, then to the UTC offset at noon.
+pub fn service_day_anchor_utc(date: NaiveDate, tz_name: &str) -> DateTime<Utc> {
+    use chrono::{LocalResult, Offset, TimeZone};
+    let noon = date.and_hms_opt(12, 0, 0).unwrap();
+    let half_day = chrono::Duration::hours(12);
     if let Ok(tz) = tz_name.parse::<chrono_tz::Tz>() {
-        let local = dt.with_timezone(&tz);
-        return local.num_seconds_from_midnight();
+        let noon_utc = match tz.from_local_datetime(&noon) {
+            LocalResult::Single(dt) => dt.with_timezone(&Utc),
+            LocalResult::Ambiguous(a, _) => a.with_timezone(&Utc),
+            LocalResult::None => {
+                // Use the offset in force at (naive) noon UTC as best effort.
+                let off = tz.offset_from_utc_datetime(&noon).fix();
+                DateTime::from_naive_utc_and_offset(noon, Utc)
+                    - chrono::Duration::seconds(off.local_minus_utc() as i64)
+            }
+        };
+        return noon_utc - half_day;
     }
-    dt.time().num_seconds_from_midnight()
+    DateTime::from_naive_utc_and_offset(noon, Utc) - half_day
 }
 
+/// Signed seconds from the GTFS service-day anchor of `date` to `dt`.
+pub fn seconds_since_service_anchor(dt: DateTime<Utc>, date: NaiveDate, tz_name: &str) -> i64 {
+    (dt - service_day_anchor_utc(date, tz_name)).num_seconds()
+}
+
+/// Seconds since the GTFS service-day anchor ("noon − 12h") of the local date of `dt`.
+///
+/// Equals wall-clock seconds since midnight except on DST transition days, where it is
+/// consistent with [`local_midnight_utc`] so `anchor + secs == dt`. Saturates at 0 for the
+/// first local hour of a fall-back day (that instant belongs to the previous service day,
+/// which callers search separately).
+pub fn local_seconds_since_midnight(dt: DateTime<Utc>, tz_name: &str) -> u32 {
+    let date = service_date_in_tz(dt, tz_name);
+    seconds_since_service_anchor(dt, date, tz_name).clamp(0, u32::MAX as i64) as u32
+}
+
+/// GTFS time origin for `date` (see [`service_day_anchor_utc`]). Kept under its historical
+/// name: every `anchor + stop_time_seconds` conversion goes through here.
 pub fn local_midnight_utc(date: NaiveDate, tz_name: &str) -> DateTime<Utc> {
-    use chrono::TimeZone;
-    if let Ok(tz) = tz_name.parse::<chrono_tz::Tz>() {
-        return tz
-            .from_local_datetime(&date.and_hms_opt(0, 0, 0).unwrap())
-            .single()
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(|| {
-                DateTime::from_naive_utc_and_offset(date.and_hms_opt(0, 0, 0).unwrap(), Utc)
-            });
-    }
-    DateTime::from_naive_utc_and_offset(date.and_hms_opt(0, 0, 0).unwrap(), Utc)
+    service_day_anchor_utc(date, tz_name)
 }
 
 /// Extract an IDFM / GTFS product code (e.g. `C01375`) from a route or LineRef.
@@ -967,6 +990,70 @@ pub fn stop_ref(epoch: &StaticEpoch, idx: u32) -> StopRef {
         lat: s.lat,
         lon: s.lon,
         platform: s.platform_code.clone(),
+    }
+}
+
+#[cfg(test)]
+mod service_anchor_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    #[test]
+    fn regular_day_anchor_is_local_midnight() {
+        // 2026-07-27 CEST: midnight == 2026-07-26T22:00Z.
+        let a = service_day_anchor_utc(d(2026, 7, 27), "Europe/Paris");
+        assert_eq!(a, Utc.with_ymd_and_hms(2026, 7, 26, 22, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn spring_forward_anchor_noon_minus_12h() {
+        // 2026-03-29: noon is CEST (10:00Z) → anchor 2026-03-28T22:00Z (23:00 CET on the
+        // previous evening), one hour before local midnight (23:00Z).
+        let a = service_day_anchor_utc(d(2026, 3, 29), "Europe/Paris");
+        assert_eq!(a, Utc.with_ymd_and_hms(2026, 3, 28, 22, 0, 0).unwrap());
+        // GTFS 08:00:00 that day is 08:00 CEST == 06:00Z.
+        assert_eq!(
+            a + chrono::Duration::seconds(8 * 3600),
+            Utc.with_ymd_and_hms(2026, 3, 29, 6, 0, 0).unwrap()
+        );
+        // Query 08:00 CEST is 28 800 s after the anchor (wall-clock consistent).
+        let q = Utc.with_ymd_and_hms(2026, 3, 29, 6, 0, 0).unwrap();
+        assert_eq!(local_seconds_since_midnight(q, "Europe/Paris"), 8 * 3600);
+        assert_eq!(local_midnight_utc(d(2026, 3, 29), "Europe/Paris"), a);
+    }
+
+    #[test]
+    fn fall_back_anchor_noon_minus_12h() {
+        // 2026-10-25: noon is CET (11:00Z) → anchor 2026-10-24T23:00Z (01:00 CEST),
+        // one hour after local midnight (22:00Z).
+        let a = service_day_anchor_utc(d(2026, 10, 25), "Europe/Paris");
+        assert_eq!(a, Utc.with_ymd_and_hms(2026, 10, 24, 23, 0, 0).unwrap());
+        // GTFS 08:00:00 == 08:00 CET == 07:00Z.
+        let q = Utc.with_ymd_and_hms(2026, 10, 25, 7, 0, 0).unwrap();
+        assert_eq!(local_seconds_since_midnight(q, "Europe/Paris"), 8 * 3600);
+        // 00:30 CEST (22:30Z) precedes the anchor: clamps to 0 (previous service day
+        // covers it), and the signed helper reports −30 min.
+        let early = Utc.with_ymd_and_hms(2026, 10, 24, 22, 30, 0).unwrap();
+        assert_eq!(local_seconds_since_midnight(early, "Europe/Paris"), 0);
+        assert_eq!(
+            seconds_since_service_anchor(early, d(2026, 10, 25), "Europe/Paris"),
+            -1800
+        );
+        // Seen from the previous service day it is GTFS time 24:30:00.
+        assert_eq!(
+            seconds_since_service_anchor(early, d(2026, 10, 24), "Europe/Paris"),
+            24 * 3600 + 1800
+        );
+    }
+
+    #[test]
+    fn unknown_timezone_falls_back_to_utc() {
+        let a = service_day_anchor_utc(d(2026, 3, 29), "Not/AZone");
+        assert_eq!(a, Utc.with_ymd_and_hms(2026, 3, 29, 0, 0, 0).unwrap());
     }
 }
 
