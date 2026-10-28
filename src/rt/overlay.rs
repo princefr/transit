@@ -51,7 +51,7 @@ pub struct RtStats {
 
 #[derive(Debug, Clone, Default)]
 pub struct StopTimeRt {
-    pub stop_sequence: u16,
+    pub stop_sequence: u32,
     pub stop_id: Option<String>,
     pub arrival_delay: Option<i32>,
     pub departure_delay: Option<i32>,
@@ -71,12 +71,12 @@ pub struct TripRt {
     pub direction_id: Option<u32>,
     /// `TripDescriptor.start_time` (HH:MM:SS), when present.
     pub start_time: Option<String>,
-    pub stop_updates: HashMap<u16, StopTimeRt>,
+    pub stop_updates: HashMap<u32, StopTimeRt>,
 }
 
 impl TripRt {
     /// Find a stop update by sequence, or by namespaced / raw stop_id.
-    pub fn stop_update_by_seq(&self, stop_sequence: u16) -> Option<&StopTimeRt> {
+    pub fn stop_update_by_seq(&self, stop_sequence: u32) -> Option<&StopTimeRt> {
         self.stop_updates.get(&stop_sequence)
     }
 
@@ -94,7 +94,7 @@ impl TripRt {
     /// Best-effort stop update: prefer sequence, then stop_id.
     pub fn find_stop_update(
         &self,
-        stop_sequence: Option<u16>,
+        stop_sequence: Option<u32>,
         stop_id: Option<&str>,
     ) -> Option<&StopTimeRt> {
         if let Some(seq) = stop_sequence {
@@ -111,7 +111,7 @@ impl TripRt {
     /// Delay seconds for arrival at a stop: stop arrival_delay → departure_delay → trip delay.
     pub fn arrival_delay_secs(
         &self,
-        stop_sequence: Option<u16>,
+        stop_sequence: Option<u32>,
         stop_id: Option<&str>,
     ) -> Option<i32> {
         if let Some(u) = self.find_stop_update(stop_sequence, stop_id) {
@@ -125,7 +125,7 @@ impl TripRt {
     /// Delay seconds for departure at a stop: stop departure_delay → arrival_delay → trip delay.
     pub fn departure_delay_secs(
         &self,
-        stop_sequence: Option<u16>,
+        stop_sequence: Option<u32>,
         stop_id: Option<&str>,
     ) -> Option<i32> {
         if let Some(u) = self.find_stop_update(stop_sequence, stop_id) {
@@ -137,7 +137,7 @@ impl TripRt {
     }
 
     /// Whether this stop is marked SKIPPED.
-    pub fn is_stop_skipped(&self, stop_sequence: Option<u16>, stop_id: Option<&str>) -> bool {
+    pub fn is_stop_skipped(&self, stop_sequence: Option<u32>, stop_id: Option<&str>) -> bool {
         self.find_stop_update(stop_sequence, stop_id)
             .map(|u| u.skipped)
             .unwrap_or(false)
@@ -147,7 +147,7 @@ impl TripRt {
     pub fn apply_arrival(
         &self,
         scheduled: DateTime<Utc>,
-        stop_sequence: Option<u16>,
+        stop_sequence: Option<u32>,
         stop_id: Option<&str>,
     ) -> StopRealtime {
         self.apply_time(scheduled, stop_sequence, stop_id, true)
@@ -157,7 +157,7 @@ impl TripRt {
     pub fn apply_departure(
         &self,
         scheduled: DateTime<Utc>,
-        stop_sequence: Option<u16>,
+        stop_sequence: Option<u32>,
         stop_id: Option<&str>,
     ) -> StopRealtime {
         self.apply_time(scheduled, stop_sequence, stop_id, false)
@@ -166,7 +166,7 @@ impl TripRt {
     fn apply_time(
         &self,
         scheduled: DateTime<Utc>,
-        stop_sequence: Option<u16>,
+        stop_sequence: Option<u32>,
         stop_id: Option<&str>,
         arrival: bool,
     ) -> StopRealtime {
@@ -690,7 +690,7 @@ impl RealtimeOverlay {
         &self,
         trip_id: &str,
         scheduled: DateTime<Utc>,
-        stop_sequence: Option<u16>,
+        stop_sequence: Option<u32>,
         stop_id: Option<&str>,
     ) -> StopRealtime {
         match self.get_trip(trip_id) {
@@ -709,7 +709,7 @@ impl RealtimeOverlay {
         &self,
         trip_id: &str,
         scheduled: DateTime<Utc>,
-        stop_sequence: Option<u16>,
+        stop_sequence: Option<u32>,
         stop_id: Option<&str>,
     ) -> StopRealtime {
         match self.get_trip(trip_id) {

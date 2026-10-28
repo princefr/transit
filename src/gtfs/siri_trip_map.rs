@@ -274,16 +274,38 @@ pub fn resolve_static_trip<'a>(
         }
     }
 
-    // 5) Legacy fuzzy suffix match
-    let raw = base_key.rsplit_once(':').map(|(_, r)| r).unwrap_or(base_key);
+    // 5) Legacy fuzzy suffix match — only on a distinctive tail, and only
+    //    when exactly one static trip matches (HashMap order is random, so
+    //    "first match" would be nondeterministic).
+    fuzzy_unique_match(epoch, base_key)
+}
+
+/// Minimum length of the journey-ref tail used for fuzzy matching. Shorter
+/// tails ("1", "", "LOC") match many unrelated trips.
+const FUZZY_MIN_TAIL_LEN: usize = 6;
+
+fn fuzzy_unique_match<'a>(epoch: &'a StaticEpoch, base_key: &str) -> Option<&'a GlobalTrip> {
+    let trimmed = base_key.trim_end_matches(':');
+    let trimmed = trimmed.strip_suffix(":LOC").unwrap_or(trimmed);
+    let raw = trimmed.rsplit_once(':').map(|(_, r)| r).unwrap_or(trimmed);
+    if raw.len() < FUZZY_MIN_TAIL_LEN {
+        return None;
+    }
+    let mut found: Option<u32> = None;
     for (k, &idx) in &epoch.trip_id_to_idx {
         if k.ends_with(raw) || (raw.len() >= 8 && k.contains(raw)) {
-            return epoch.trips.get(idx as usize);
+            if found.is_some_and(|f| f != idx) {
+                return None; // ambiguous
+            }
+            found = Some(idx);
         }
     }
-
-    None
+    found.and_then(|idx| epoch.trips.get(idx as usize))
 }
+
+/// Seconds in a GTFS service day (used to map wall-clock times onto the
+/// previous service day's > 24:00 times).
+const DAY_S: i64 = 86_400;
 
 fn resolve_by_route_and_time<'a>(
     epoch: &'a StaticEpoch,
@@ -296,44 +318,70 @@ fn resolve_by_route_and_time<'a>(
         .as_deref()
         .and_then(line_product_code)
         .or_else(|| line_token_from_journey_ref(base_key))?;
-    let feed = base_key.split(':').next().unwrap_or("idfm");
 
     let tz = chrono_tz::Europe::Paris;
     let dt = chrono::DateTime::from_timestamp(dep_utc, 0)?.with_timezone(&tz);
-    let dep_s = (dt.num_seconds_from_midnight() as i32).max(0) as u32;
+    let dep_s = dt.num_seconds_from_midnight() as i64;
+    let today = dt.date_naive();
+    let yesterday = today.pred_opt();
 
     let candidates = epoch.route_line_to_trip_idxs.get(&line_token)?;
-    let mut best: Option<(u32, u32)> = None; // (delta_s, trip_idx)
+    // Service is unknown when the feed has no calendar (synthetic epochs):
+    // don't filter in that case.
+    let runs_on = |trip: &GlobalTrip, date: chrono::NaiveDate| -> bool {
+        epoch
+            .calendars
+            .get(&trip.feed_id)
+            .map(|cal| cal.is_active(&trip.service_id, date))
+            .unwrap_or(true)
+    };
+
+    // (|delta| s, scheduled departure relative to `today` midnight, trip_idx)
+    let mut matches: Vec<(i64, i64, u32)> = Vec::new();
     for &trip_idx in candidates {
-        let trip = epoch.trips.get(trip_idx as usize)?;
-        if trip.frequency_windows.is_empty() {
-            let st = epoch.stop_times.get(trip.stop_time_start as usize)?;
-            let delta = st.departure_s.abs_diff(dep_s);
-            if delta <= 900 {
-                if best.map(|(d, _)| delta < d).unwrap_or(true) {
-                    best = Some((delta, trip_idx));
+        let Some(trip) = epoch.trips.get(trip_idx as usize) else {
+            continue;
+        };
+        if !trip.frequency_windows.is_empty() {
+            continue;
+        }
+        let Some(st) = epoch.stop_times.get(trip.stop_time_start as usize) else {
+            continue;
+        };
+        let sched = st.departure_s as i64;
+        let mut best_for_trip: Option<(i64, i64)> = None;
+        // Trip of today's service day: schedule time == wall time.
+        if runs_on(trip, today) {
+            best_for_trip = Some(((sched - dep_s).abs(), sched));
+        }
+        // Trip of yesterday's service day: schedule time − 24h == wall time
+        // (e.g. a 00:30 RT departure ↔ 24:30 in GTFS).
+        if let Some(y) = yesterday {
+            if sched >= DAY_S / 2 && runs_on(trip, y) {
+                let rel = sched - DAY_S;
+                let d = (rel - dep_s).abs();
+                if best_for_trip.map(|(bd, _)| d < bd).unwrap_or(true) {
+                    best_for_trip = Some((d, rel));
                 }
+            }
+        }
+        if let Some((d, rel)) = best_for_trip {
+            if d <= 900 + 120 {
+                matches.push((d, rel, trip_idx));
             }
         }
     }
+    let &(delta, best_rel, trip_idx) = matches.iter().min_by_key(|m| (m.0, m.2))?;
+    if delta > 900 {
+        return None;
+    }
     // Reject ambiguous matches (two trips within 2 min of schedule)
-    if let Some((delta, trip_idx)) = best {
-        let trip = epoch.trips.get(trip_idx as usize)?;
-        let st = epoch.stop_times.get(trip.stop_time_start as usize)?;
-        let mut close = 0u32;
-        for &ti in candidates {
-            let t = epoch.trips.get(ti as usize)?;
-            if t.frequency_windows.is_empty() {
-                let s = epoch.stop_times.get(t.stop_time_start as usize)?;
-                if s.departure_s.abs_diff(st.departure_s) <= 120 {
-                    close += 1;
-                }
-            }
-        }
-        if close <= 1 || delta <= 60 {
-            let _ = feed;
-            return epoch.trips.get(trip_idx as usize);
-        }
+    let close = matches
+        .iter()
+        .filter(|m| (m.1 - best_rel).abs() <= 120)
+        .count();
+    if close <= 1 || delta <= 60 {
+        return epoch.trips.get(trip_idx as usize);
     }
     None
 }
@@ -428,5 +476,124 @@ trip,IDFM:TN:SNCF:9e1f3cec-e963-4c83-878e-b924db62121d,source,SNCF:ServiceJourne
     fn journey_id_extracts_siri_double_colon() {
         let id = journey_id_from_code("RATP-SIV:VehicleJourney::20260727.361.A.C01371:LOC");
         assert_eq!(id.as_deref(), Some("20260727.361.A.C01371"));
+    }
+
+    fn push_trip(epoch: &mut StaticEpoch, id: &str, service_id: &str, first_dep_s: u32) -> u32 {
+        use crate::gtfs::pack::PackedStopTime;
+        let start = epoch.stop_times.len() as u32;
+        epoch.stop_times.push(PackedStopTime {
+            stop_idx: 0,
+            arrival_s: first_dep_s,
+            departure_s: first_dep_s,
+            stop_sequence: 1,
+            pickup_type: 0,
+            drop_off_type: 0,
+            stop_headsign_idx: 0,
+            timepoint: 1,
+            shape_dist_traveled: None,
+        });
+        let idx = epoch.trips.len() as u32;
+        epoch.trips.push(GlobalTrip {
+            id: id.into(),
+            feed_id: "idfm".into(),
+            route_id: "idfm:IDFM:C01742".into(),
+            service_id: service_id.into(),
+            headsign: None,
+            short_name: None,
+            direction_id: None,
+            wheelchair: 0,
+            bikes_allowed: 0,
+            block_id: None,
+            shape_id: None,
+            mode: RouteMode::Rail,
+            route_short_name: "A".into(),
+            route_long_name: "RER A".into(),
+            route_color: None,
+            route_text_color: None,
+            route_type_raw: 2,
+            agency_name: None,
+            stop_time_start: start,
+            stop_time_len: 1,
+            frequency_windows: vec![],
+        });
+        epoch.trip_id_to_idx.insert(id.into(), idx);
+        epoch
+            .route_line_to_trip_idxs
+            .entry("C01742".into())
+            .or_default()
+            .push(idx);
+        idx
+    }
+
+    #[test]
+    fn fuzzy_match_requires_distinctive_unique_tail() {
+        let mut epoch = StaticEpoch::empty();
+        push_trip(&mut epoch, "idfm:IDFM:TN:XYZ123456", "S", 3600);
+        push_trip(&mut epoch, "idfm:IDFM:RATP:line1", "S", 3600);
+        push_trip(&mut epoch, "idfm:IDFM:RATP:other1", "S", 3600);
+
+        // Empty tail (ref ends with ':') used to match every trip.
+        assert!(resolve_static_trip(&epoch, "idfm:OP:VehicleJourney::", None).is_none());
+        assert!(resolve_static_trip(&epoch, "idfm:OP:VehicleJourney:::", None).is_none());
+        // Short tail "1" matches several trips.
+        assert!(resolve_static_trip(&epoch, "idfm:OP:VehicleJourney::1", None).is_none());
+        // `:LOC` suffix is not a usable tail on its own.
+        assert!(resolve_static_trip(&epoch, "idfm:OP:LOC", None).is_none());
+
+        // Distinctive unique tail resolves (also with a :LOC suffix).
+        let t = resolve_static_trip(&epoch, "idfm:OP:VehicleJourney::XYZ123456:LOC", None)
+            .expect("unique tail");
+        assert_eq!(t.id, "idfm:IDFM:TN:XYZ123456");
+
+        // Same tail on two trips → ambiguous → no match.
+        push_trip(&mut epoch, "idfm:IDFM:TN:OTHER:XYZ123456", "S", 7200);
+        assert!(resolve_static_trip(&epoch, "idfm:OP:VehicleJourney::XYZ123456", None).is_none());
+    }
+
+    #[test]
+    fn route_time_resolution_respects_calendar_and_after_midnight() {
+        use crate::gtfs::calendar::ServiceCalendar;
+        use chrono::{NaiveDate, TimeZone};
+
+        let mut epoch = StaticEpoch::empty();
+        let mut cal = ServiceCalendar::new();
+        let from = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2026, 12, 31).unwrap();
+        cal.add_regular("WD".into(), from, to, true, true, true, true, true, false, false);
+        cal.add_regular("WE".into(), from, to, false, false, false, false, false, true, true);
+        epoch
+            .calendars
+            .insert("idfm".into(), std::sync::Arc::new(cal));
+
+        // Weekend trip at 08:00 and weekday trip at 08:03; Monday RT at 08:00.
+        push_trip(&mut epoch, "idfm:we-0800", "WE", 8 * 3600);
+        push_trip(&mut epoch, "idfm:wd-0803", "WD", 8 * 3600 + 180);
+        // Weekday service-day trip at 24:30 (i.e. Tuesday 00:30 wall clock).
+        push_trip(&mut epoch, "idfm:wd-2430", "WD", 24 * 3600 + 1800);
+
+        let paris = chrono_tz::Europe::Paris;
+        let hint = |y, m, d, hh, mm| TripResolveHint {
+            route_id: Some("idfm:STIF:Line::C01742:".into()),
+            first_departure_utc: Some(
+                paris
+                    .with_ymd_and_hms(y, m, d, hh, mm, 0)
+                    .single()
+                    .unwrap()
+                    .timestamp(),
+            ),
+        };
+        let key = "idfm:SNCF:VehicleJourney::nomatch";
+
+        // Monday 2026-07-27 08:00 → the weekday trip, not the weekend one.
+        let t = resolve_static_trip(&epoch, key, Some(&hint(2026, 7, 27, 8, 0))).unwrap();
+        assert_eq!(t.id, "idfm:wd-0803");
+        // Saturday 2026-08-01 08:00 → the weekend trip.
+        let t = resolve_static_trip(&epoch, key, Some(&hint(2026, 8, 1, 8, 0))).unwrap();
+        assert_eq!(t.id, "idfm:we-0800");
+        // Tuesday 00:30 → Monday's 24:30 trip.
+        let t = resolve_static_trip(&epoch, key, Some(&hint(2026, 7, 28, 0, 30))).unwrap();
+        assert_eq!(t.id, "idfm:wd-2430");
+        // Sunday 00:30: Saturday's service day has no 24:30 trip.
+        assert!(resolve_static_trip(&epoch, key, Some(&hint(2026, 8, 2, 0, 30))).is_none());
     }
 }

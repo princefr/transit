@@ -1,8 +1,14 @@
 use transit::gtfs::flash_store;
+/// Usage: probe_flash <flash-*.bin> <pack fingerprint>
 fn main() {
-    let path = std::path::Path::new("data/flash/flash-bc78eee77ed8e9575ae8fb5d488e17f9d5a0630e9d53a7be4954132a7e0d81d3.bin");
+    let mut args = std::env::args().skip(1);
+    let (Some(path), Some(fingerprint)) = (args.next(), args.next()) else {
+        eprintln!("usage: probe_flash <flash-*.bin> <pack fingerprint>");
+        std::process::exit(2);
+    };
+    let path = std::path::Path::new(&path);
     let t = std::time::Instant::now();
-    match flash_store::load_flash(path) {
+    match flash_store::load_flash(path, &fingerprint) {
         Ok(Some((cells, ap, fp, tt))) => {
             println!("loaded ok in {:.1}s: cells={} walk_n={} patterns={} trips={}",
                 t.elapsed().as_secs_f32(), cells, ap.len(), fp.len(), tt.len());

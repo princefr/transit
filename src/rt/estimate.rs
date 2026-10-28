@@ -223,7 +223,7 @@ pub fn estimate_vehicle_pos(
 
 #[derive(Clone)]
 struct CallPoint {
-    seq: u16,
+    seq: u32,
     stop_id: String,
     lat: f64,
     lon: f64,
@@ -472,7 +472,7 @@ fn estimate_approaching_single(
 }
 
 struct StaticStopPin {
-    stop_sequence: u16,
+    stop_sequence: u32,
     stop_idx: u32,
     stop_id: String,
     lat: f64,
@@ -540,8 +540,8 @@ fn previous_static_stop(
 fn scheduled_run_secs(
     epoch: &StaticEpoch,
     base_key: &str,
-    from_seq: u16,
-    to_seq: u16,
+    from_seq: u32,
+    to_seq: u32,
     hint: Option<&TripResolveHint>,
 ) -> Option<u32> {
     let trip = resolve_trip(epoch, base_key, hint)?;
@@ -562,7 +562,7 @@ fn scheduled_run_secs(
 fn shape_dist_for_seq(
     epoch: &StaticEpoch,
     base_key: &str,
-    seq: u16,
+    seq: u32,
     hint: Option<&TripResolveHint>,
 ) -> Option<f32> {
     let trip = resolve_trip(epoch, base_key, hint)?;
@@ -707,7 +707,7 @@ fn build_stop_chain_polyline(
     let seq_hi = prev.seq.max(next.seq);
 
     // Collect stops whose sequence is in [lo, hi], in trip order
-    let mut chain: Vec<(u16, f64, f64)> = Vec::new();
+    let mut chain: Vec<(u32, f64, f64)> = Vec::new();
     for off in 0..trip.stop_time_len {
         let st = &epoch.stop_times[(trip.stop_time_start + off) as usize];
         if st.stop_sequence < seq_lo || st.stop_sequence > seq_hi {
@@ -1023,7 +1023,7 @@ mod tests {
     use crate::rt::overlay::{FeedRtState, StopTimeRt, TripRt};
     use std::collections::HashMap;
 
-    fn stop(seq: u16, id: &str, arr_delay: Option<i32>) -> (u16, StopTimeRt) {
+    fn stop(seq: u32, id: &str, arr_delay: Option<i32>) -> (u32, StopTimeRt) {
         (
             seq,
             StopTimeRt {
@@ -1036,7 +1036,7 @@ mod tests {
         )
     }
 
-    fn trip_with(stops: Vec<(u16, StopTimeRt)>, delay: Option<i32>, canceled: bool) -> TripRt {
+    fn trip_with(stops: Vec<(u32, StopTimeRt)>, delay: Option<i32>, canceled: bool) -> TripRt {
         TripRt {
             delay,
             canceled,

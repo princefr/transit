@@ -210,7 +210,7 @@ pub fn ingest_siri_estimated_timetable(feed_id: &str, bytes: &[u8]) -> Result<Fe
         .map(as_array_or_one)
         .unwrap_or_default();
 
-    let mut seq_counter: HashMap<String, u16> = HashMap::new();
+    let mut seq_counter: HashMap<String, u32> = HashMap::new();
 
     for del in deliveries {
         if del.get("ErrorCondition").is_some() {
@@ -415,7 +415,7 @@ pub fn ingest_siri_stop_monitoring(feed_id: &str, bytes: &[u8]) -> Result<FeedRt
         .map(as_array_or_one)
         .unwrap_or_default();
 
-    let mut seq_by_trip: HashMap<String, u16> = HashMap::new();
+    let mut seq_by_trip: HashMap<String, u32> = HashMap::new();
 
     for del in deliveries {
         if del.get("ErrorCondition").is_some() {
