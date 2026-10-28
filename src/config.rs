@@ -257,17 +257,132 @@ impl PrimConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub bind: String,
+    /// GraphiQL at `/` + `/graphiql` and schema introspection. Disable in production.
     pub graphql_playground: bool,
+    /// Browser origins allowed for CORS and for the `/ws` `Origin` check.
+    /// A `"*"` entry means permissive (any origin). Empty list = no cross-origin
+    /// browser access (same-origin requests and non-browser clients still work).
+    #[serde(default = "default_cors_origins")]
+    pub cors_allowed_origins: Vec<String>,
+    /// Expose Prometheus text at `GET /metrics` (default true).
+    #[serde(default = "default_true")]
+    pub metrics_enabled: bool,
+    /// When false (default), `/metrics` only answers loopback peers (127.0.0.1 / ::1);
+    /// other peers get 404. Set true to expose it to any peer. Note: behind a
+    /// reverse proxy on the same host every peer is loopback — block `/metrics`
+    /// at the proxy in that setup.
+    #[serde(default)]
+    pub metrics_public: bool,
+    /// Wall-clock limit for one non-websocket HTTP request (seconds).
+    /// 0 = auto (`graphql.itinerary_timeout_secs + 15`).
+    #[serde(default)]
+    pub request_timeout_secs: u64,
+    /// Max non-websocket HTTP requests processed concurrently; extra requests
+    /// wait up to 1s for a slot, then get `503`.
+    #[serde(default = "default_max_concurrent_requests")]
+    pub max_concurrent_requests: usize,
+    /// Max accepted request body size for `POST /graphql` (bytes).
+    #[serde(default = "default_max_body_bytes")]
+    pub max_body_bytes: usize,
+    /// Max operations in one batched GraphQL POST (`[{query…}, …]`).
+    #[serde(default = "default_max_batch_size")]
+    pub max_batch_size: usize,
+    /// Max simultaneously open `/ws` subscription connections (extra get `503`).
+    #[serde(default = "default_max_ws_connections")]
+    pub max_ws_connections: usize,
+    /// Max active subscriptions per websocket connection.
+    #[serde(default = "default_max_subscriptions_per_connection")]
+    pub max_subscriptions_per_connection: usize,
+}
+
+fn default_cors_origins() -> Vec<String> {
+    vec![
+        "http://127.0.0.1:8088".into(),
+        "http://localhost:8088".into(),
+    ]
+}
+fn default_max_concurrent_requests() -> usize {
+    256
+}
+fn default_max_body_bytes() -> usize {
+    256 * 1024
+}
+fn default_max_batch_size() -> usize {
+    8
+}
+fn default_max_ws_connections() -> usize {
+    256
+}
+fn default_max_subscriptions_per_connection() -> usize {
+    16
+}
+
+impl ServerConfig {
+    /// True when the CORS/Origin allowlist contains `"*"`.
+    pub fn cors_permissive(&self) -> bool {
+        self.cors_allowed_origins.iter().any(|o| o.trim() == "*")
+    }
+
+    /// Whether a browser `Origin` value is in the allowlist (exact match, ASCII
+    /// case-insensitive, trailing `/` ignored). `"*"` allows everything.
+    pub fn origin_allowed(&self, origin: &str) -> bool {
+        if self.cors_permissive() {
+            return true;
+        }
+        let o = origin.trim().trim_end_matches('/');
+        self.cors_allowed_origins
+            .iter()
+            .any(|a| a.trim().trim_end_matches('/').eq_ignore_ascii_case(o))
+    }
+
+    /// Effective non-websocket request timeout.
+    pub fn effective_request_timeout(&self, itinerary_timeout_secs: u64) -> Duration {
+        let secs = if self.request_timeout_secs > 0 {
+            self.request_timeout_secs
+        } else {
+            itinerary_timeout_secs.saturating_add(15)
+        };
+        Duration::from_secs(secs.max(1))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeConfig {
+    /// Max threads in tokio's blocking pool (RAPTOR planning, static parse, fs).
     pub blocking_threads: usize,
+    /// Max itinerary plans computed at once (each holds one blocking thread).
+    /// 0 = auto: `max(1, blocking_threads / 2)`.
+    #[serde(default)]
+    pub max_concurrent_plans: usize,
+    /// How long an itinerary request waits for a planning slot before failing
+    /// with `SERVER_BUSY` (milliseconds).
+    #[serde(default = "default_plan_queue_timeout_ms")]
+    pub plan_queue_timeout_ms: u64,
     pub max_concurrent_static_builds: usize,
     pub max_outbound_rt_requests: usize,
     pub rt_request_timeout_secs: u64,
     pub static_download_timeout_secs: u64,
     pub data_dir: PathBuf,
+}
+
+fn default_plan_queue_timeout_ms() -> u64 {
+    2_000
+}
+
+impl RuntimeConfig {
+    /// Effective tokio blocking-pool size (never below 2).
+    pub fn effective_blocking_threads(&self) -> usize {
+        self.blocking_threads.max(2)
+    }
+
+    /// Effective planning concurrency (see `max_concurrent_plans`).
+    pub fn effective_max_concurrent_plans(&self) -> usize {
+        if self.max_concurrent_plans > 0 {
+            self.max_concurrent_plans
+        } else {
+            (self.effective_blocking_threads() / 2).max(1)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -424,9 +539,20 @@ impl Default for Config {
             server: ServerConfig {
                 bind: "0.0.0.0:8080".into(),
                 graphql_playground: true,
+                cors_allowed_origins: default_cors_origins(),
+                metrics_enabled: true,
+                metrics_public: false,
+                request_timeout_secs: 0,
+                max_concurrent_requests: default_max_concurrent_requests(),
+                max_body_bytes: default_max_body_bytes(),
+                max_batch_size: default_max_batch_size(),
+                max_ws_connections: default_max_ws_connections(),
+                max_subscriptions_per_connection: default_max_subscriptions_per_connection(),
             },
             runtime: RuntimeConfig {
                 blocking_threads: 4,
+                max_concurrent_plans: 0,
+                plan_queue_timeout_ms: default_plan_queue_timeout_ms(),
                 max_concurrent_static_builds: 1,
                 max_outbound_rt_requests: 8,
                 rt_request_timeout_secs: 15,

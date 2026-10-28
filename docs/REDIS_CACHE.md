@@ -39,6 +39,30 @@ cargo run --release
 
 If Redis is unreachable at startup, the server logs a warning and continues **without** caching.
 
+### Bound Redis memory (required in production)
+
+Keys are derived from client input (search text, coordinates, departure minute),
+so the key space is effectively unbounded. The server normalizes inputs to limit
+it — search text is trimmed, lowercased and capped at 64 characters; `vehicles`
+bboxes are snapped outward to a 0.001° grid; itineraries without `departureAt`
+are bucketed by the current minute — and every key has a TTL, but a busy or
+abusive client can still mint many keys within one TTL window. **Always run
+Redis with a memory cap and an eviction policy** so it degrades to an LRU cache
+instead of exhausting RAM (or refusing writes):
+
+```conf
+# redis.conf
+maxmemory 512mb
+maxmemory-policy allkeys-lru
+```
+
+```bash
+docker run -d --name transit-redis -p 6379:6379 redis:7-alpine \
+  redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+```
+
+Use a dedicated Redis (or DB) for the cache: `allkeys-lru` may evict any key.
+
 ## What is cached
 
 | Key pattern | Resolver / endpoint | Default TTL | Invalidation |

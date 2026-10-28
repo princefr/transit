@@ -124,7 +124,7 @@ impl TransitCache {
             )
         });
         let digest = hash_parts(&[
-            search.trim().to_lowercase(),
+            normalize_search_key(search),
             near_part.unwrap_or_default(),
             limit.to_string(),
         ]);
@@ -144,7 +144,7 @@ impl TransitCache {
     }
 
     pub fn addresses_key(&self, search: &str, limit: i32) -> String {
-        let digest = hash_parts(&[search.trim().to_lowercase(), limit.to_string()]);
+        let digest = hash_parts(&[normalize_search_key(search), limit.to_string()]);
         format!("{KEY_PREFIX}:addr:{digest}")
     }
 
@@ -161,7 +161,7 @@ impl TransitCache {
     }
 
     pub fn places_key(&self, epoch_id: &str, search: &str, limit: i32) -> String {
-        let digest = hash_parts(&[search.trim().to_lowercase(), limit.to_string()]);
+        let digest = hash_parts(&[normalize_search_key(search), limit.to_string()]);
         format!("{KEY_PREFIX}:places:{epoch_id}:{digest}")
     }
 
@@ -203,7 +203,7 @@ impl TransitCache {
         });
         let bbox_part = bbox.map(|b| {
             format!(
-                "bbox:{:.4}:{:.4}:{:.4}:{:.4}",
+                "bbox:{:.3}:{:.3}:{:.3}:{:.3}",
                 b.min_lat, b.min_lon, b.max_lat, b.max_lon
             )
         });
@@ -236,11 +236,27 @@ impl TransitCache {
         input: &ItineraryInput,
         routing: &crate::config::RoutingConfig,
     ) -> String {
+        self.itinerary_key_at(epoch_id, rt_version, input, routing, chrono::Utc::now())
+    }
+
+    /// [`itinerary_key`](Self::itinerary_key) with an explicit "now". When the
+    /// request omits `departureAt`/`arriveBy` the plan is for *now*, so the key
+    /// is bucketed by the current minute (a constant bucket would serve stale
+    /// "now" itineraries for the whole TTL / RT version lifetime).
+    pub fn itinerary_key_at(
+        &self,
+        epoch_id: &str,
+        rt_version: u64,
+        input: &ItineraryInput,
+        routing: &crate::config::RoutingConfig,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> String {
         let dep_bucket = input
             .departure_at
             .or(input.arrive_by)
-            .map(|t| t.timestamp() / 60)
-            .unwrap_or(0);
+            .unwrap_or(now)
+            .timestamp()
+            .div_euclid(60);
         let modes = input.modes.as_ref().map(|ms| {
             let mut names: Vec<String> = ms.iter().map(|m| format!("{m:?}")).collect();
             names.sort();
@@ -342,6 +358,26 @@ impl TransitCache {
             self.inner.connected.store(true, Ordering::Relaxed);
         }
     }
+}
+
+/// Max characters of free-text search used by resolvers and cache keys.
+/// Longer input is truncated (autocomplete never needs more), which also caps
+/// the variety of Redis keys an abusive client can mint.
+pub const MAX_SEARCH_CHARS: usize = 64;
+
+/// Trim + truncate to [`MAX_SEARCH_CHARS`] characters (char-boundary safe).
+/// Resolvers must search with this same string so cached results match.
+pub fn clamp_search(s: &str) -> &str {
+    let t = s.trim();
+    match t.char_indices().nth(MAX_SEARCH_CHARS) {
+        Some((i, _)) => t[..i].trim_end(),
+        None => t,
+    }
+}
+
+/// Cache-key form of a search string: clamped, lowercased.
+pub fn normalize_search_key(s: &str) -> String {
+    clamp_search(s).to_lowercase()
 }
 
 fn hash_parts(parts: &[String]) -> String {
@@ -642,5 +678,82 @@ mod tests {
         let k1 = cache.itinerary_key("epoch-a", 1, &input, &routing);
         let k2 = cache.itinerary_key("epoch-b", 1, &input, &routing);
         assert_ne!(k1, k2);
+    }
+
+    fn sample_input() -> ItineraryInput {
+        ItineraryInput {
+            from: crate::api::graphql::types::PlaceInput {
+                stop_id: Some(async_graphql::ID("idfm:a".into())),
+                lat: None,
+                lon: None,
+                name: None,
+            },
+            to: crate::api::graphql::types::PlaceInput {
+                stop_id: Some(async_graphql::ID("idfm:b".into())),
+                lat: None,
+                lon: None,
+                name: None,
+            },
+            departure_at: None,
+            arrive_by: None,
+            max_transfers: 4,
+            max_results: 3,
+            modes: None,
+            max_walk_meters: 2000,
+            wheelchair: None,
+            bike_from: None,
+            bike_to: None,
+            use_tbr: None,
+        }
+    }
+
+    #[test]
+    fn itinerary_key_now_is_bucketed_by_minute() {
+        use chrono::TimeZone;
+        let cache = TransitCache::disabled(RedisConfig::default());
+        let routing = crate::config::Config::default().routing;
+        let input = sample_input(); // departureAt omitted → "now"
+        let t0 = chrono::Utc.with_ymd_and_hms(2026, 10, 28, 8, 0, 5).unwrap();
+        let same_minute = t0 + chrono::Duration::seconds(30);
+        let next_minute = t0 + chrono::Duration::seconds(60);
+        let k0 = cache.itinerary_key_at("e", 1, &input, &routing, t0);
+        assert_eq!(
+            k0,
+            cache.itinerary_key_at("e", 1, &input, &routing, same_minute)
+        );
+        assert_ne!(
+            k0,
+            cache.itinerary_key_at("e", 1, &input, &routing, next_minute),
+            "omitted departureAt must not reuse a stale 'now' bucket"
+        );
+
+        // Explicit departureAt ignores the clock.
+        let mut explicit = sample_input();
+        explicit.departure_at = Some(t0);
+        assert_eq!(
+            cache.itinerary_key_at("e", 1, &explicit, &routing, t0),
+            cache.itinerary_key_at("e", 1, &explicit, &routing, next_minute)
+        );
+        // …and matches "now" within the same minute.
+        assert_eq!(k0, cache.itinerary_key_at("e", 1, &explicit, &routing, t0));
+    }
+
+    #[test]
+    fn search_keys_are_normalized_and_capped() {
+        let cache = TransitCache::disabled(RedisConfig::default());
+        assert_eq!(
+            cache.places_key("e", "  Châtelet ", 5),
+            cache.places_key("e", "châtelet", 5)
+        );
+        let long_a = format!("{}{}", "x".repeat(MAX_SEARCH_CHARS), "aaaa");
+        let long_b = format!("{}{}", "x".repeat(MAX_SEARCH_CHARS), "bbbb");
+        assert_eq!(
+            cache.addresses_key(&long_a, 5),
+            cache.addresses_key(&long_b, 5)
+        );
+        // Truncation is char-boundary safe for multibyte input.
+        let accents = "é".repeat(MAX_SEARCH_CHARS + 10);
+        assert_eq!(clamp_search(&accents).chars().count(), MAX_SEARCH_CHARS);
+        assert_eq!(clamp_search("  ab  "), "ab");
     }
 }
