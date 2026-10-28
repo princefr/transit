@@ -15,9 +15,9 @@ fn cell_deg(radius_m: f64) -> f64 {
     (radius_m * 1.25) / 111_320.0
 }
 
-fn cell_key(lat: f64, lon: f64, cell: f64) -> (i32, i32) {
-    let i = (lat / cell).floor() as i32;
-    let j = (lon / cell).floor() as i32;
+fn cell_key(lat: f64, lon: f64, cell_lat: f64, cell_lon: f64) -> (i32, i32) {
+    let i = (lat / cell_lat).floor() as i32;
+    let j = (lon / cell_lon).floor() as i32;
     (i, j)
 }
 
@@ -28,14 +28,25 @@ pub fn hub_links_grid(points: &[(usize, f64, f64)], radius_m: f64) -> Vec<(usize
         return Vec::new();
     }
     let cell = cell_deg(radius_m).max(1e-6);
+    // A degree of longitude shrinks with cos(lat): widen longitude cells so they are
+    // at least as wide (in metres) as latitude cells at the most poleward point,
+    // otherwise the ±1-cell scan misses east-west pairs within `radius_m`.
+    let max_abs_lat = points
+        .iter()
+        .map(|p| p.1.abs())
+        .fold(0.0_f64, f64::max)
+        .min(89.0);
+    let cell_lon = cell / max_abs_lat.to_radians().cos();
     let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
     for (pi, &(_, lat, lon)) in points.iter().enumerate() {
-        grid.entry(cell_key(lat, lon, cell)).or_default().push(pi);
+        grid.entry(cell_key(lat, lon, cell, cell_lon))
+            .or_default()
+            .push(pi);
     }
 
     let mut out = Vec::new();
     for (pi, &(ia, la, loa)) in points.iter().enumerate() {
-        let (ci, cj) = cell_key(la, loa, cell);
+        let (ci, cj) = cell_key(la, loa, cell, cell_lon);
         for di in -1i32..=1 {
             for dj in -1i32..=1 {
                 let Some(others) = grid.get(&(ci + di, cj + dj)) else {
@@ -130,6 +141,19 @@ mod tests {
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].0, 0);
         assert_eq!(links[0].1, 1);
+    }
+
+    #[test]
+    fn east_west_pair_near_radius_linked() {
+        // ~240m apart purely east-west at Paris latitude (radius 250m). With
+        // square-degree cells the longitude cell is only ~0.82·r wide there,
+        // so some placements fell two cells apart and were never compared.
+        for k in 0..200 {
+            let lon0 = 2.30 + k as f64 * 0.00037;
+            let lon1 = lon0 + 240.0 / (111_320.0 * 48.85f64.to_radians().cos());
+            let pts = vec![(0, 48.85, lon0), (1, 48.85, lon1)];
+            assert_eq!(hub_links_grid(&pts, 250.0).len(), 1, "k={k}");
+        }
     }
 
     #[test]

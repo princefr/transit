@@ -259,6 +259,44 @@ pub struct AlertRt {
     pub header_translations: Vec<(String, String)>,
 }
 
+impl AlertRt {
+    /// Stable key used to upsert alerts from partial (merge) feeds: the alert id,
+    /// or `header|description` when the producer sent no id.
+    pub fn merge_key(&self) -> String {
+        if self.id.is_empty() {
+            format!(
+                "{}|{}",
+                self.header.as_deref().unwrap_or(""),
+                self.description.as_deref().unwrap_or("")
+            )
+        } else {
+            self.id.clone()
+        }
+    }
+
+    /// True when every active period has a known end strictly before `now_ts`
+    /// (POSIX seconds). Alerts without any end bound never "end" by themselves.
+    pub fn has_ended(&self, now_ts: i64) -> bool {
+        if self.active_periods.is_empty() {
+            return self.active_end.is_some_and(|e| e < now_ts);
+        }
+        self.active_periods
+            .iter()
+            .all(|(_, end)| end.is_some_and(|e| e < now_ts))
+    }
+}
+
+impl TripRt {
+    /// Latest absolute arrival/departure time (POSIX seconds) across stop updates.
+    pub fn last_stop_time(&self) -> Option<i64> {
+        self.stop_updates
+            .values()
+            .flat_map(|s| [s.arrival_time, s.departure_time])
+            .flatten()
+            .max()
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct AlertIndex {
     pub by_trip: HashMap<String, Vec<u16>>,
@@ -1011,6 +1049,38 @@ mod tests {
         let st = feed.stats();
         assert_eq!(st.canceled_trip_count, 1);
         assert_eq!(st.skipped_stop_count, 1);
+    }
+
+    #[test]
+    fn alert_has_ended_and_trip_last_stop_time() {
+        let mut a = AlertRt {
+            id: String::new(),
+            header: Some("H".into()),
+            description: Some("D".into()),
+            severity: "INFO".into(),
+            informed_stop_ids: vec![],
+            informed_route_ids: vec![],
+            informed_trip_ids: vec![],
+            cause: None,
+            effect: None,
+            url: None,
+            active_start: None,
+            active_end: None,
+            active_periods: vec![],
+            header_translations: vec![],
+        };
+        assert_eq!(a.merge_key(), "H|D");
+        assert!(!a.has_ended(1_000));
+        a.active_end = Some(500);
+        assert!(a.has_ended(1_000));
+        a.active_periods = vec![(None, Some(500)), (Some(900), None)];
+        assert!(!a.has_ended(1_000), "open-ended period keeps alert alive");
+        a.active_periods = vec![(None, Some(500)), (Some(900), Some(999))];
+        assert!(a.has_ended(1_000));
+
+        let t = sample_trip();
+        assert!(t.last_stop_time().is_some() || t.stop_updates.is_empty());
+        assert_eq!(TripRt::default().last_stop_time(), None);
     }
 
     #[test]

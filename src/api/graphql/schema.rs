@@ -340,17 +340,19 @@ impl QueryRoot {
                 ) {
                     match crate::prim::stop_board::fetch_live_board(&client, &mon, limit).await {
                         Ok(board) => {
-                            // Merge SM trips + VehicleLocation GPS into the live overlay
-                            // so the map can show real dots (not only estimated).
+                            // Hand SM trips + VehicleLocation GPS to the feed supervisor,
+                            // which merges them into its RT state (with eviction) and
+                            // republishes the overlay with a version bump. Storing a
+                            // locally merged overlay here would race with the supervisor.
                             if let Some(delta) = board.rt_delta {
                                 if !delta.vehicles.is_empty() || !delta.trips.is_empty() {
-                                    let mut overlay = (*state.load_rt()).clone();
-                                    overlay.merge_feed_delta("idfm", delta);
-                                    crate::routing::finalize_realtime_overlay(&mut overlay);
-                                    state.rt.store(std::sync::Arc::new(overlay));
+                                    // stop_board ingests SM under the "idfm" namespace.
+                                    crate::feeds::submit_realtime_delta("idfm", delta);
                                 }
                             }
                             if !board.departures.is_empty() {
+                                // PRIM answered with data: keep this stop warm-polled.
+                                crate::prim::confirm_sm_interest(&mon);
                                 let stop_rec =
                                     epoch.get_stop(stop_key).cloned().unwrap_or_else(|| {
                                         crate::prim::stop_board::shell_stop(stop_key, None)

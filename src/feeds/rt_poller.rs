@@ -1,5 +1,5 @@
 use crate::config::FeedConfig;
-use crate::feeds::download::download_bytes_with_headers;
+use crate::feeds::download::{download_bytes_with_headers, MAX_RT_BYTES};
 use crate::feeds::FeedEvent;
 use crate::rt::adapter::{ingest_realtime, RealtimeFormat, RealtimeKind};
 use crate::rt::decode::{apply_service_alerts, apply_trip_updates, apply_vehicle_positions};
@@ -152,6 +152,7 @@ pub async fn run_rt_poller(
                     &feed.user_agent,
                     timeout,
                     &headers,
+                    MAX_RT_BYTES,
                 )
                 .await;
                 drop(permit);
