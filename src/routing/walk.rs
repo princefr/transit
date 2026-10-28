@@ -114,6 +114,48 @@ impl OsrmProfile {
     }
 }
 
+/// Per-request OSRM timeout.
+pub const OSRM_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2500);
+/// Total wall-clock OSRM budget for one journey plan (access + egress + leg paths).
+/// Once spent, remaining walks keep their straight-line (haversine) estimate.
+pub const OSRM_PLAN_BUDGET: std::time::Duration = std::time::Duration::from_millis(3000);
+/// Below this remaining budget no new OSRM request is started.
+const OSRM_MIN_REQUEST: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Wall-clock deadline shared by every OSRM call made while planning one query.
+#[derive(Debug, Clone, Copy)]
+pub struct OsrmBudget {
+    deadline: std::time::Instant,
+}
+
+impl OsrmBudget {
+    pub fn new(total: std::time::Duration) -> Self {
+        Self {
+            deadline: std::time::Instant::now() + total,
+        }
+    }
+
+    /// Default per-plan budget ([`OSRM_PLAN_BUDGET`]).
+    pub fn per_plan() -> Self {
+        Self::new(OSRM_PLAN_BUDGET)
+    }
+
+    /// Timeout for the next request, or `None` when the budget is exhausted.
+    pub fn next_timeout(&self) -> Option<std::time::Duration> {
+        let left = self
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        (left >= OSRM_MIN_REQUEST).then(|| left.min(OSRM_CALL_TIMEOUT))
+    }
+}
+
+/// Normalized OSRM base URL; `None` when unset/blank (OSRM disabled).
+pub fn osrm_base(osrm_url: Option<&str>) -> Option<&str> {
+    osrm_url
+        .map(|u| u.trim().trim_end_matches('/'))
+        .filter(|u| !u.is_empty())
+}
+
 /// OSRM route between two WGS84 points (`foot` or `bike` profile).
 ///
 /// `base_url` e.g. `https://router.project-osrm.org` (no trailing slash).
@@ -128,10 +170,28 @@ pub fn osrm_route(
     to_lat: f64,
     to_lon: f64,
 ) -> Option<(u32, f64, Vec<(f64, f64)>)> {
-    let base = base_url.trim().trim_end_matches('/');
-    if base.is_empty() {
-        return None;
-    }
+    osrm_route_timeout(
+        base_url,
+        profile,
+        from_lat,
+        from_lon,
+        to_lat,
+        to_lon,
+        OSRM_CALL_TIMEOUT,
+    )
+}
+
+/// [`osrm_route`] with an explicit request timeout.
+pub fn osrm_route_timeout(
+    base_url: &str,
+    profile: OsrmProfile,
+    from_lat: f64,
+    from_lon: f64,
+    to_lat: f64,
+    to_lon: f64,
+    timeout: std::time::Duration,
+) -> Option<(u32, f64, Vec<(f64, f64)>)> {
+    let base = osrm_base(Some(base_url))?;
     // OSRM path coordinates are lon,lat
     let url = format!(
         "{base}/route/v1/{profile}/{from_lon},{from_lat};{to_lon},{to_lat}?overview=full&geometries=geojson",
@@ -139,7 +199,8 @@ pub fn osrm_route(
     );
 
     let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_millis(2500))
+        .timeout(timeout)
+        .connect_timeout(timeout)
         .user_agent("transit-rs/0.1 (osrm walk/bike paths)")
         .build()
         .ok()?;
@@ -196,28 +257,33 @@ pub fn osrm_bike_route(
     osrm_route(base_url, OsrmProfile::Bike, from_lat, from_lon, to_lat, to_lon)
 }
 
-/// Optionally refine a haversine access candidate with OSRM (fail soft).
-fn refine_with_osrm(
-    osrm_url: Option<&str>,
-    profile: OsrmProfile,
-    from_lat: f64,
-    from_lon: f64,
-    stop_lat: f64,
-    stop_lon: f64,
-    haversine: AccessStop,
-) -> AccessStop {
-    let Some(url) = osrm_url.map(str::trim).filter(|u| !u.is_empty()) else {
-        return haversine;
-    };
-    match osrm_route(url, profile, from_lat, from_lon, stop_lat, stop_lon) {
-        Some((dur, dist, geom)) => AccessStop {
-            stop_idx: haversine.stop_idx,
-            duration_s: dur,
-            distance_m: dist,
-            geometry: Some(geom),
-        },
-        None => haversine,
+/// Run OSRM requests concurrently (one scoped thread each) under `budget`.
+/// Each entry is `(from_lat, from_lon, to_lat, to_lon, profile)`; results are
+/// positional, `None` for failures / budget exhaustion.
+fn osrm_batch(
+    base: &str,
+    requests: &[(f64, f64, f64, f64, OsrmProfile)],
+    budget: &OsrmBudget,
+) -> Vec<Option<(u32, f64, Vec<(f64, f64)>)>> {
+    if requests.is_empty() {
+        return Vec::new();
     }
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = requests
+            .iter()
+            .map(|&(fla, flo, tla, tlo, profile)| {
+                let timeout = budget.next_timeout();
+                scope.spawn(move || {
+                    let timeout = timeout?;
+                    osrm_route_timeout(base, profile, fla, flo, tla, tlo, timeout)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().ok().flatten())
+            .collect()
+    })
 }
 
 /// Fill street-level polylines on walk/bike legs that only have endpoints.
@@ -233,14 +299,33 @@ pub fn enrich_non_transit_paths(
     from_profile: OsrmProfile,
     to_profile: OsrmProfile,
 ) {
-    let Some(base) = osrm_url.map(str::trim).filter(|u| !u.is_empty()) else {
+    enrich_non_transit_paths_budget(
+        journey,
+        osrm_url,
+        from_profile,
+        to_profile,
+        &OsrmBudget::per_plan(),
+    )
+}
+
+/// [`enrich_non_transit_paths`] sharing a per-plan [`OsrmBudget`]; requests for one
+/// journey run concurrently.
+pub fn enrich_non_transit_paths_budget(
+    journey: &mut crate::routing::journey::Journey,
+    osrm_url: Option<&str>,
+    from_profile: OsrmProfile,
+    to_profile: OsrmProfile,
+    budget: &OsrmBudget,
+) {
+    let Some(base) = osrm_base(osrm_url) else {
         return;
     };
     const MAX_CALLS: usize = 10;
-    let mut calls = 0usize;
     let n_legs = journey.legs.len();
-    for (i, leg) in journey.legs.iter_mut().enumerate() {
-        if calls >= MAX_CALLS {
+    let mut targets: Vec<usize> = Vec::new();
+    let mut requests: Vec<(f64, f64, f64, f64, OsrmProfile)> = Vec::new();
+    for (i, leg) in journey.legs.iter().enumerate() {
+        if requests.len() >= MAX_CALLS {
             break;
         }
         let crate::routing::journey::Leg::Walk(w) = leg else {
@@ -265,23 +350,32 @@ pub fn enrich_non_transit_paths(
         if w.distance_m < 80.0 && profile == OsrmProfile::Foot {
             continue;
         }
-        if let Some((dur, dist, geom)) = osrm_route(base, profile, fla, flo, tla, tlo) {
-            w.geometry = geom;
-            if dist > 0.0 {
-                w.distance_m = dist;
+        targets.push(i);
+        requests.push((fla, flo, tla, tlo, profile));
+    }
+    let results = osrm_batch(base, &requests, budget);
+    for ((i, req), res) in targets.into_iter().zip(requests).zip(results) {
+        let Some((dur, dist, geom)) = res else {
+            continue;
+        };
+        let profile = req.4;
+        let crate::routing::journey::Leg::Walk(w) = &mut journey.legs[i] else {
+            continue;
+        };
+        w.geometry = geom;
+        if dist > 0.0 {
+            w.distance_m = dist;
+        }
+        if profile == OsrmProfile::Bike || w.duration_s == 0 {
+            w.duration_s = dur;
+        }
+        if profile == OsrmProfile::Bike {
+            w.mode = "BIKE".into();
+        } else if w.mode.is_empty() || w.mode.eq_ignore_ascii_case("BIKE") {
+            // Don't leave BIKE on a foot transfer after re-enrich
+            if profile == OsrmProfile::Foot && i != 0 && i + 1 != n_legs {
+                w.mode = "WALK".into();
             }
-            if profile == OsrmProfile::Bike || w.duration_s == 0 {
-                w.duration_s = dur;
-            }
-            if profile == OsrmProfile::Bike {
-                w.mode = "BIKE".into();
-            } else if w.mode.is_empty() || w.mode.eq_ignore_ascii_case("BIKE") {
-                // Don't leave BIKE on a foot transfer after re-enrich
-                if profile == OsrmProfile::Foot && i != 0 && i + 1 != n_legs {
-                    w.mode = "WALK".into();
-                }
-            }
-            calls += 1;
         }
     }
 }
@@ -566,6 +660,66 @@ pub fn resolve_access_stops_profile(
     osrm_url: Option<&str>,
     profile: OsrmProfile,
 ) -> Vec<AccessStop> {
+    resolve_access_stops_budget(
+        epoch,
+        stop_id,
+        lat,
+        lon,
+        max_walk_m,
+        walk_speed_m_s,
+        limit,
+        osrm_url,
+        profile,
+        &OsrmBudget::per_plan(),
+    )
+}
+
+/// Process-wide spatial index over `epoch.geo_stop_points`, rebuilt only when the
+/// epoch changes (keyed by id, build time and the points slice identity).
+fn cached_stop_grid(
+    epoch: &StaticEpoch,
+    points: &[(usize, f64, f64)],
+) -> std::sync::Arc<crate::link::geo::GeoGrid> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    type Key = (String, i64, usize, usize);
+    static CACHE: OnceLock<Mutex<Option<(Key, Arc<crate::link::geo::GeoGrid>)>>> =
+        OnceLock::new();
+    let key: Key = (
+        epoch.id.clone(),
+        epoch.built_at.timestamp_nanos_opt().unwrap_or(0),
+        points.len(),
+        points.as_ptr() as usize,
+    );
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(g) = cache.lock() {
+        if let Some((k, grid)) = g.as_ref() {
+            if *k == key {
+                return grid.clone();
+            }
+        }
+    }
+    let grid = Arc::new(crate::link::geo::GeoGrid::build(points, 500.0));
+    if let Ok(mut g) = cache.lock() {
+        *g = Some((key, grid.clone()));
+    }
+    grid
+}
+
+/// [`resolve_access_stops_profile`] sharing a per-plan [`OsrmBudget`]; OSRM
+/// refinements of the nearest candidates run concurrently.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_access_stops_budget(
+    epoch: &StaticEpoch,
+    stop_id: Option<&str>,
+    lat: Option<f64>,
+    lon: Option<f64>,
+    max_walk_m: f64,
+    walk_speed_m_s: f64,
+    limit: usize,
+    osrm_url: Option<&str>,
+    profile: OsrmProfile,
+    budget: &OsrmBudget,
+) -> Vec<AccessStop> {
     if let Some(id) = stop_id {
         if let Some(&idx) = epoch.stop_id_to_idx.get(id) {
             let seed = &epoch.stops[idx as usize];
@@ -626,41 +780,48 @@ pub fn resolve_access_stops_profile(
         }
     }
     if let (Some(lat), Some(lon)) = (lat, lon) {
-        // Borrowed when the epoch was packed (production); cloned only in tests.
-        let owned;
-        let points: &[(usize, f64, f64)] = match epoch.geo_stop_points_ref() {
-            Some(p) => p,
+        // Packed epochs: query a cached grid. Unpacked (tests): one-shot linear scan.
+        let near = match epoch.geo_stop_points_ref() {
+            Some(points) => {
+                cached_stop_grid(epoch, points).nearby(points, lat, lon, max_walk_m, limit)
+            }
             None => {
-                owned = epoch.geo_stop_points_view();
-                &owned
+                let owned = epoch.geo_stop_points_view();
+                crate::link::geo::nearby(&owned, lat, lon, max_walk_m, limit)
             }
         };
-        let near = crate::link::geo::nearby(points, lat, lon, max_walk_m, limit);
         let speed = walk_speed_m_s.max(0.1);
-        // Cap OSRM calls: refine at most the nearest few candidates.
-        const OSRM_REFINE_LIMIT: usize = 6;
-        return near
+        let mut out: Vec<AccessStop> = near
             .into_iter()
-            .enumerate()
-            .map(|(rank, (idx, dist))| {
-                let dur = (dist / speed).ceil() as u32;
-                let base = AccessStop {
-                    stop_idx: idx as u32,
-                    duration_s: dur.max(1),
-                    distance_m: dist,
-                    geometry: None,
-                };
-                if rank >= OSRM_REFINE_LIMIT {
-                    return base;
-                }
-                let s = &epoch.stops[idx];
-                let (slat, slon) = match (s.lat, s.lon) {
-                    (Some(a), Some(b)) => (a, b),
-                    _ => return base,
-                };
-                refine_with_osrm(osrm_url, profile, lat, lon, slat, slon, base)
+            .map(|(idx, dist)| AccessStop {
+                stop_idx: idx as u32,
+                duration_s: ((dist / speed).ceil() as u32).max(1),
+                distance_m: dist,
+                geometry: None,
             })
             .collect();
+        // Refine at most the nearest few candidates with OSRM, concurrently.
+        const OSRM_REFINE_LIMIT: usize = 6;
+        if let Some(base) = osrm_base(osrm_url) {
+            let mut slots = Vec::new();
+            let mut requests = Vec::new();
+            for (rank, a) in out.iter().enumerate().take(OSRM_REFINE_LIMIT) {
+                let s = &epoch.stops[a.stop_idx as usize];
+                if let (Some(slat), Some(slon)) = (s.lat, s.lon) {
+                    slots.push(rank);
+                    requests.push((lat, lon, slat, slon, profile));
+                }
+            }
+            for (rank, res) in slots.into_iter().zip(osrm_batch(base, &requests, budget)) {
+                if let Some((dur, dist, geom)) = res {
+                    let a = &mut out[rank];
+                    a.duration_s = dur;
+                    a.distance_m = dist;
+                    a.geometry = Some(geom);
+                }
+            }
+        }
+        return out;
     }
     Vec::new()
 }
@@ -791,6 +952,25 @@ mod tests {
         assert!(osrm_foot_route("", 48.85, 2.35, 48.86, 2.36).is_none());
         assert!(osrm_foot_route("   ", 48.85, 2.35, 48.86, 2.36).is_none());
         assert!(osrm_bike_route("", 48.85, 2.35, 48.86, 2.36).is_none());
+    }
+
+    #[test]
+    fn exhausted_budget_skips_osrm() {
+        let b = OsrmBudget::new(std::time::Duration::from_millis(0));
+        assert!(b.next_timeout().is_none());
+        // Unroutable host would otherwise block; with no budget nothing is attempted.
+        let res = osrm_batch(
+            "http://192.0.2.1:9",
+            &[(48.85, 2.35, 48.86, 2.36, OsrmProfile::Foot)],
+            &b,
+        );
+        assert_eq!(res.len(), 1);
+        assert!(res[0].is_none());
+        let fresh = OsrmBudget::per_plan().next_timeout().unwrap();
+        assert!(fresh <= OSRM_CALL_TIMEOUT);
+        assert!(osrm_base(Some("  ")).is_none());
+        assert!(osrm_base(None).is_none());
+        assert_eq!(osrm_base(Some("http://x/")), Some("http://x"));
     }
 
     #[test]

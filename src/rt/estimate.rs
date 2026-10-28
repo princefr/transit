@@ -654,9 +654,15 @@ fn interpolate_segment(
                 if pts.len() >= 2 {
                     let d0 = shape_dist_for_seq(epoch, base_key, prev.seq, hint);
                     let d1 = shape_dist_for_seq(epoch, base_key, next.seq, hint);
-                    if let (Some(d0), Some(d1)) = (d0, d1) {
+                    // shape_dist_traveled is in the feed's own unit (m, km, ft…):
+                    // convert through the trip's measured unit map before using it as
+                    // arc length in metres.
+                    let affine = crate::routing::geometry::trip_shape_dist_affine(epoch, trip);
+                    if let (Some(d0), Some(d1), Some(affine)) = (d0, d1, affine) {
                         if let Some((lat, lon, brg)) =
-                            crate::routing::geometry::interpolate_shape_by_dist(pts, d0, d1, frac)
+                            crate::routing::geometry::interpolate_shape_by_feed_dist(
+                                pts, d0, d1, frac, affine,
+                            )
                         {
                             return (lat, lon, Some(brg), PathGeom::Shape);
                         }
