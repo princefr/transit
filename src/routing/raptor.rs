@@ -305,9 +305,7 @@ fn raptor_max_rounds(q: &ItineraryQuery) -> usize {
         .max(q.max_transfers.saturating_add(2))
         .max(4) as usize)
         .min(12)
-        .max(1)
 }
-
 
 /// Cap virtual frequency departures considered per window per board opportunity.
 pub(super) const MAX_FREQ_DEPS_PER_WINDOW: u32 = 32;
@@ -359,9 +357,9 @@ pub(super) fn earliest_freq_board(
             w.start_s
         } else {
             let delta = (t_min as u32).saturating_sub(w.start_s);
-            let steps = (delta + w.headway_s - 1) / w.headway_s;
-            let aligned = w.start_s.saturating_add(steps.saturating_mul(w.headway_s));
-            aligned
+            let steps = delta.div_ceil(w.headway_s);
+
+            w.start_s.saturating_add(steps.saturating_mul(w.headway_s))
         };
         let mut count = 0u32;
         while t < w.end_s && count < MAX_FREQ_DEPS_PER_WINDOW {
@@ -441,14 +439,10 @@ pub fn plan_journeys(epoch: &StaticEpoch, q: &ItineraryQuery) -> ItineraryResult
         return empty_result(epoch, q);
     }
 
-    let egress: HashMap<u32, AccessStop> = targets
-        .iter()
-        .map(|a| (a.stop_idx, a.clone()))
-        .collect();
-    let origin_map: HashMap<u32, AccessStop> = origins
-        .iter()
-        .map(|a| (a.stop_idx, a.clone()))
-        .collect();
+    let egress: HashMap<u32, AccessStop> =
+        targets.iter().map(|a| (a.stop_idx, a.clone())).collect();
+    let origin_map: HashMap<u32, AccessStop> =
+        origins.iter().map(|a| (a.stop_idx, a.clone())).collect();
 
     // Large multi-feed epochs (IDFM): cap k tightly — each extra result re-runs
     // RAPTOR and can starve the server (browser then sees "Failed to fetch").
@@ -549,9 +543,7 @@ pub fn plan_journeys(epoch: &StaticEpoch, q: &ItineraryQuery) -> ItineraryResult
         let n = j.legs.len();
         for (i, leg) in j.legs.iter_mut().enumerate() {
             if let Leg::Walk(w) = leg {
-                if i == 0 && q.bike_from {
-                    w.mode = "BIKE".into();
-                } else if i + 1 == n && q.bike_to {
+                if (i == 0 && q.bike_from) || (i + 1 == n && q.bike_to) {
                     w.mode = "BIKE".into();
                 } else if w.mode.is_empty() {
                     w.mode = "WALK".into();
@@ -597,7 +589,10 @@ fn plan_depart_after(
     let mut journeys = Vec::new();
 
     if let Some(mut j) = pure_walk_journey(epoch, q, origins, targets, dep_s0, midnight) {
-        if arrive_deadline_s.map(|d| journey_arrival_s(&j, midnight) <= d).unwrap_or(true) {
+        if arrive_deadline_s
+            .map(|d| journey_arrival_s(&j, midnight) <= d)
+            .unwrap_or(true)
+        {
             super::fare::apply_fare_estimate(epoch, &mut j);
             journeys.push(j);
         }
@@ -611,6 +606,9 @@ fn plan_depart_after(
     let max_iterations = (pool_cap as u32).saturating_mul(8).max(16);
 
     while journeys.len() < pool_cap && stagnant < 8 && iterations < max_iterations {
+        if crate::routing::cancel::expired() {
+            break;
+        }
         iterations += 1;
         if let Some(deadline) = arrive_deadline_s {
             if dep_s >= deadline {
@@ -618,8 +616,7 @@ fn plan_depart_after(
             }
         }
 
-        let Some((total_arr, target_idx)) =
-            run_raptor(epoch, q, dep_s, origins, egress, scratch)
+        let Some((total_arr, target_idx)) = run_raptor(epoch, q, dep_s, origins, egress, scratch)
         else {
             break;
         };
@@ -736,11 +733,7 @@ fn plan_arrive_by(
             j.arrival = arr;
             j.duration_s = (arr - dep).num_seconds();
             super::fare::apply_fare_estimate(epoch, &mut j);
-            let key = (
-                j.departure.timestamp(),
-                j.arrival.timestamp(),
-                j.transfers,
-            );
+            let key = (j.departure.timestamp(), j.arrival.timestamp(), j.transfers);
             seen_keys.insert(key);
             journeys.push(j);
         }
@@ -766,6 +759,9 @@ fn plan_arrive_by(
     let per_sample = ((pool_cap / samples.len().max(1)) + 2).max(2);
 
     for seed in samples {
+        if crate::routing::cancel::expired() {
+            break;
+        }
         let batch = plan_depart_after(
             epoch,
             q,
@@ -878,7 +874,11 @@ pub(super) fn journey_first_departure(j: &Journey) -> Option<DateTime<Utc>> {
     }
 }
 
-pub(super) fn next_departure_s(journey: &Journey, midnight: DateTime<Utc>, current_dep_s: u32) -> Option<u32> {
+pub(super) fn next_departure_s(
+    journey: &Journey,
+    midnight: DateTime<Utc>,
+    current_dep_s: u32,
+) -> Option<u32> {
     // After the first transit departure (+1s), search again for a later option.
     for leg in &journey.legs {
         if let Leg::Transit(t) = leg {
@@ -957,7 +957,7 @@ pub(super) fn pure_walk_journey(
     {
         let a = origins.iter().find(|a| a.stop_idx == from_idx).unwrap();
         legs.push(Leg::Walk(WalkLegData {
-                    mode: "WALK".into(),
+            mode: "WALK".into(),
             from_name: from_place.name.clone().unwrap_or_else(|| "origin".into()),
             to_name: from.name.clone(),
             from_stop_id: from_place.stop_id.clone(),
@@ -988,7 +988,7 @@ pub(super) fn pure_walk_journey(
             q.wheelchair,
         ) {
             legs.push(Leg::Walk(WalkLegData {
-                    mode: "WALK".into(),
+                mode: "WALK".into(),
                 from_name: from.name.clone(),
                 to_name: to.name.clone(),
                 from_stop_id: Some(from.stop_id.clone()),
@@ -999,9 +999,7 @@ pub(super) fn pure_walk_journey(
                 from_lon: from.lon,
                 to_lat: to.lat,
                 to_lon: to.lon,
-                geometry: super::walk::walk_leg_geometry(
-                    None, from.lat, from.lon, to.lat, to.lon,
-                ),
+                geometry: super::walk::walk_leg_geometry(None, from.lat, from.lon, to.lat, to.lon),
             }));
         }
     }
@@ -1019,9 +1017,12 @@ pub(super) fn pure_walk_journey(
             r
         });
         legs.push(Leg::Walk(WalkLegData {
-                    mode: "WALK".into(),
+            mode: "WALK".into(),
             from_name: to.name.clone(),
-            to_name: to_place.name.clone().unwrap_or_else(|| "destination".into()),
+            to_name: to_place
+                .name
+                .clone()
+                .unwrap_or_else(|| "destination".into()),
             from_stop_id: Some(to.stop_id.clone()),
             to_stop_id: to_place.stop_id.clone(),
             distance_m: e.distance_m,
@@ -1043,7 +1044,7 @@ pub(super) fn pure_walk_journey(
     if legs.is_empty() {
         // Same stop, zero walk — still a trivial journey.
         legs.push(Leg::Walk(WalkLegData {
-                    mode: "WALK".into(),
+            mode: "WALK".into(),
             from_name: from.name.clone(),
             to_name: to.name.clone(),
             from_stop_id: Some(from.stop_id),
@@ -1054,9 +1055,7 @@ pub(super) fn pure_walk_journey(
             from_lon: from.lon,
             to_lat: to.lat,
             to_lon: to.lon,
-            geometry: super::walk::walk_leg_geometry(
-                None, from.lat, from.lon, to.lat, to.lon,
-            ),
+            geometry: super::walk::walk_leg_geometry(None, from.lat, from.lon, to.lat, to.lon),
         }));
     }
 
@@ -1083,9 +1082,7 @@ pub(super) fn rt_effective_dep_s(
     adj: Option<&RtTripAdjust>,
     st: &crate::gtfs::pack::PackedStopTime,
 ) -> u32 {
-    let delay = adj
-        .map(|a| a.dep_delay_for(st.stop_sequence))
-        .unwrap_or(0);
+    let delay = adj.map(|a| a.dep_delay_for(st.stop_sequence)).unwrap_or(0);
     (st.departure_s as i64 + delay as i64).max(0) as u32
 }
 
@@ -1333,6 +1330,9 @@ fn run_raptor(
     };
 
     for round in 0..s.rounds {
+        if crate::routing::cancel::expired() {
+            break;
+        }
         if marked.is_empty() {
             break;
         }
@@ -1474,17 +1474,15 @@ pub(super) fn reconstruct<L: LabelSource + ?Sized>(
     let mut chain: Vec<Reach> = Vec::new();
 
     while round >= 0 {
-        let lab = labels
-            .get(round as usize, stop as usize)
-            .or_else(|| {
-                // Search earlier rounds for a label at this stop with same best arrival.
-                for r in (0..=round as usize).rev() {
-                    if let Some(l) = labels.get(r, stop as usize) {
-                        return Some(l);
-                    }
+        let lab = labels.get(round as usize, stop as usize).or_else(|| {
+            // Search earlier rounds for a label at this stop with same best arrival.
+            for r in (0..=round as usize).rev() {
+                if let Some(l) = labels.get(r, stop as usize) {
+                    return Some(l);
                 }
-                None
-            })?;
+            }
+            None
+        })?;
         chain.push(lab.clone());
         match lab {
             Reach::Access { .. } => break,
@@ -1496,10 +1494,7 @@ pub(super) fn reconstruct<L: LabelSource + ?Sized>(
                 stop = board_stop;
                 round = prev_round as i32;
             }
-            Reach::Walk {
-                from_stop,
-                ..
-            } => {
+            Reach::Walk { from_stop, .. } => {
                 // Walk is written into the same labels row as the transit (or prior
                 // walk) that improved `from_stop` this RAPTOR round (`labels[round+1]`).
                 // Do **not** jump to `prev_round` — that row holds the *previous*
@@ -1553,12 +1548,16 @@ pub(super) fn reconstruct<L: LabelSource + ?Sized>(
                 }));
                 walk_distance += wd;
             }
-            Reach::Transit { board_stop, .. } | Reach::Walk { from_stop: board_stop, .. } => {
+            Reach::Transit { board_stop, .. }
+            | Reach::Walk {
+                from_stop: board_stop,
+                ..
+            } => {
                 if let Some(o) = origins.get(board_stop) {
                     if o.duration_s > 0 {
                         let to = stop_ref(epoch, *board_stop);
                         legs.push(Leg::Walk(WalkLegData {
-                    mode: "WALK".into(),
+                            mode: "WALK".into(),
                             from_name: from_place.name.clone().unwrap_or_else(|| "origin".into()),
                             to_name: to.name.clone(),
                             from_stop_id: from_place.stop_id.clone(),
@@ -1599,10 +1598,8 @@ pub(super) fn reconstruct<L: LabelSource + ?Sized>(
                 ..
             } => {
                 let trip = &epoch.trips[*trip_idx as usize];
-                let st_board =
-                    &epoch.stop_times[(trip.stop_time_start + *board_off) as usize];
-                let st_alight =
-                    &epoch.stop_times[(trip.stop_time_start + *alight_off) as usize];
+                let st_board = &epoch.stop_times[(trip.stop_time_start + *board_off) as usize];
+                let st_alight = &epoch.stop_times[(trip.stop_time_start + *alight_off) as usize];
                 // Frequency trips use template stop_times; wall-clock offset is in time_shift.
                 // Timed trips keep pure GTFS schedule here — RT enrichment applies delays once.
                 let shift = if trip.frequency_windows.is_empty() {
@@ -1645,26 +1642,29 @@ pub(super) fn reconstruct<L: LabelSource + ?Sized>(
                 .collect();
 
                 // Stay-seated: consecutive transit legs share feed + non-empty block_id.
-                let same_vehicle = legs.iter().rev().find_map(|l| match l {
-                    Leg::Transit(prev) => {
-                        let prev_trip = epoch
-                            .trip_id_to_idx
-                            .get(&prev.trip_id)
-                            .and_then(|&i| epoch.trips.get(i as usize));
-                        match prev_trip {
-                            Some(pt)
-                                if pt.feed_id == trip.feed_id
-                                    && pt.block_id.is_some()
-                                    && pt.block_id == trip.block_id =>
-                            {
-                                Some(true)
+                let same_vehicle = legs
+                    .iter()
+                    .rev()
+                    .find_map(|l| match l {
+                        Leg::Transit(prev) => {
+                            let prev_trip = epoch
+                                .trip_id_to_idx
+                                .get(&prev.trip_id)
+                                .and_then(|&i| epoch.trips.get(i as usize));
+                            match prev_trip {
+                                Some(pt)
+                                    if pt.feed_id == trip.feed_id
+                                        && pt.block_id.is_some()
+                                        && pt.block_id == trip.block_id =>
+                                {
+                                    Some(true)
+                                }
+                                _ => Some(false),
                             }
-                            _ => Some(false),
                         }
-                    }
-                    _ => None,
-                })
-                .unwrap_or(false);
+                        _ => None,
+                    })
+                    .unwrap_or(false);
 
                 legs.push(Leg::Transit(TransitLegData {
                     mode: trip.mode.as_str().to_string(),
@@ -1742,7 +1742,7 @@ pub(super) fn reconstruct<L: LabelSource + ?Sized>(
             r
         });
         legs.push(Leg::Walk(WalkLegData {
-                    mode: "WALK".into(),
+            mode: "WALK".into(),
             from_name: from_stop.name.clone(),
             to_name: to_place
                 .name
@@ -1844,8 +1844,7 @@ mod tests {
     use super::*;
     use crate::gtfs::calendar::ServiceCalendar;
     use crate::gtfs::pack::{
-        FrequencyWindow, GlobalTrip, PackedStopTime, RouteMode, StaticEpoch,
-        StopRecord, WalkEdge,
+        FrequencyWindow, GlobalTrip, PackedStopTime, RouteMode, StaticEpoch, StopRecord, WalkEdge,
     };
     use chrono::{TimeZone, Utc};
     use std::collections::HashMap;
@@ -1866,9 +1865,9 @@ mod tests {
             stop_code: None,
             stop_desc: None,
             level_id: None,
-        zone_id: None,
-        stop_url: None,
-        stop_timezone: None,
+            zone_id: None,
+            stop_url: None,
+            stop_timezone: None,
         }
     }
 
@@ -1901,8 +1900,8 @@ mod tests {
                 pickup_type: 0,
                 drop_off_type: 0,
                 stop_headsign_idx: 0,
-            timepoint: 1,
-            shape_dist_traveled: None,
+                timepoint: 1,
+                shape_dist_traveled: None,
             },
             PackedStopTime {
                 stop_idx: 1,
@@ -1912,8 +1911,8 @@ mod tests {
                 pickup_type: 0,
                 drop_off_type: 0,
                 stop_headsign_idx: 0,
-            timepoint: 1,
-            shape_dist_traveled: None,
+                timepoint: 1,
+                shape_dist_traveled: None,
             },
             PackedStopTime {
                 stop_idx: 2,
@@ -1923,8 +1922,8 @@ mod tests {
                 pickup_type: 0,
                 drop_off_type: 0,
                 stop_headsign_idx: 0,
-            timepoint: 1,
-            shape_dist_traveled: None,
+                timepoint: 1,
+                shape_dist_traveled: None,
             },
             // trip2
             PackedStopTime {
@@ -1935,8 +1934,8 @@ mod tests {
                 pickup_type: 0,
                 drop_off_type: 0,
                 stop_headsign_idx: 0,
-            timepoint: 1,
-            shape_dist_traveled: None,
+                timepoint: 1,
+                shape_dist_traveled: None,
             },
             PackedStopTime {
                 stop_idx: 3,
@@ -1946,8 +1945,8 @@ mod tests {
                 pickup_type: 0,
                 drop_off_type: 0,
                 stop_headsign_idx: 0,
-            timepoint: 1,
-            shape_dist_traveled: None,
+                timepoint: 1,
+                shape_dist_traveled: None,
             },
             // Later direct A->C trip3 for k-best
             PackedStopTime {
@@ -1958,8 +1957,8 @@ mod tests {
                 pickup_type: 0,
                 drop_off_type: 0,
                 stop_headsign_idx: 0,
-            timepoint: 1,
-            shape_dist_traveled: None,
+                timepoint: 1,
+                shape_dist_traveled: None,
             },
             PackedStopTime {
                 stop_idx: 2,
@@ -1969,8 +1968,8 @@ mod tests {
                 pickup_type: 0,
                 drop_off_type: 0,
                 stop_headsign_idx: 0,
-            timepoint: 1,
-            shape_dist_traveled: None,
+                timepoint: 1,
+                shape_dist_traveled: None,
             },
         ];
 
@@ -1996,7 +1995,7 @@ mod tests {
                 agency_name: Some("TestBus".into()),
                 stop_time_start: 0,
                 stop_time_len: 3,
-            frequency_windows: vec![],
+                frequency_windows: vec![],
             },
             GlobalTrip {
                 id: "test:t2".into(),
@@ -2019,7 +2018,7 @@ mod tests {
                 agency_name: Some("TestMetro".into()),
                 stop_time_start: 3,
                 stop_time_len: 2,
-            frequency_windows: vec![],
+                frequency_windows: vec![],
             },
             GlobalTrip {
                 id: "test:t3".into(),
@@ -2042,7 +2041,7 @@ mod tests {
                 agency_name: Some("TestBus".into()),
                 stop_time_start: 5,
                 stop_time_len: 2,
-            frequency_windows: vec![],
+                frequency_windows: vec![],
             },
         ];
         for (i, t) in epoch.trips.iter().enumerate() {
@@ -2146,7 +2145,9 @@ mod tests {
         q_late.rt_adjust = HashMap::from([("test:t1".into(), adj)]);
         let res_late = plan_journeys(&epoch, &q_late);
         let used_t1 = res_late.journeys.iter().any(|j| {
-            j.legs.iter().any(|l| matches!(l, crate::routing::Leg::Transit(t) if t.trip_id == "test:t1"))
+            j.legs
+                .iter()
+                .any(|l| matches!(l, crate::routing::Leg::Transit(t) if t.trip_id == "test:t1"))
         });
         assert!(
             !used_t1,
@@ -2159,10 +2160,7 @@ mod tests {
         let epoch = fixture_epoch();
         let q = query("test:A", "test:B", 7, 50);
         let res = plan_journeys(&epoch, &q);
-        assert!(
-            !res.journeys.is_empty(),
-            "expected direct journey A→B"
-        );
+        assert!(!res.journeys.is_empty(), "expected direct journey A→B");
         let j = &res.journeys[0];
         let transit: Vec<_> = j
             .legs
@@ -2371,8 +2369,8 @@ mod tests {
                 pickup_type: 0,
                 drop_off_type: 0,
                 stop_headsign_idx: 0,
-            timepoint: 1,
-            shape_dist_traveled: None,
+                timepoint: 1,
+                shape_dist_traveled: None,
             },
             PackedStopTime {
                 stop_idx: 1,
@@ -2382,8 +2380,8 @@ mod tests {
                 pickup_type: 0,
                 drop_off_type: 1, // no alighting
                 stop_headsign_idx: 0,
-            timepoint: 1,
-            shape_dist_traveled: None,
+                timepoint: 1,
+                shape_dist_traveled: None,
             },
         ];
         epoch.trips = vec![GlobalTrip {
@@ -2407,7 +2405,7 @@ mod tests {
             agency_name: Some("TestBus".into()),
             stop_time_start: 0,
             stop_time_len: 2,
-        frequency_windows: vec![],
+            frequency_windows: vec![],
         }];
         epoch.trip_id_to_idx.insert("test:t_drop".into(), 0);
         epoch.stop_departures = vec![Vec::new(); epoch.stops.len()];
@@ -2546,10 +2544,7 @@ mod tests {
         let front = pareto_front(vec![dominated.clone(), better.clone(), tradeoff.clone()]);
         let ids: HashSet<_> = front.iter().map(|j| j.id.as_str()).collect();
         assert!(ids.contains("better"), "non-dominated better kept");
-        assert!(
-            !ids.contains("worse"),
-            "dominated journey must be removed"
-        );
+        assert!(!ids.contains("worse"), "dominated journey must be removed");
         assert!(
             ids.contains("tradeoff"),
             "trade-off on walk/arrival should survive"
@@ -2602,8 +2597,8 @@ mod tests {
                 pickup_type: 0,
                 drop_off_type: 0,
                 stop_headsign_idx: 0,
-            timepoint: 1,
-            shape_dist_traveled: None,
+                timepoint: 1,
+                shape_dist_traveled: None,
             },
             PackedStopTime {
                 stop_idx: 1,
@@ -2613,8 +2608,8 @@ mod tests {
                 pickup_type: 0,
                 drop_off_type: 0,
                 stop_headsign_idx: 0,
-            timepoint: 1,
-            shape_dist_traveled: None,
+                timepoint: 1,
+                shape_dist_traveled: None,
             },
         ];
         epoch.trips = vec![GlobalTrip {
@@ -2673,7 +2668,10 @@ mod tests {
         // Query at 07:50 → first virtual departure 08:00, arrive B 08:10.
         let q = query("test:A", "test:B", 7, 50);
         let res = plan_journeys(&epoch, &q);
-        assert!(!res.journeys.is_empty(), "frequency trip should be boardable");
+        assert!(
+            !res.journeys.is_empty(),
+            "frequency trip should be boardable"
+        );
         let t = res.journeys[0]
             .legs
             .iter()
@@ -2714,8 +2712,8 @@ mod tests {
                 pickup_type: 0,
                 drop_off_type: 0,
                 stop_headsign_idx: 0,
-            timepoint: 1,
-            shape_dist_traveled: None,
+                timepoint: 1,
+                shape_dist_traveled: None,
             },
             PackedStopTime {
                 stop_idx: 1,
@@ -2725,8 +2723,8 @@ mod tests {
                 pickup_type: 0,
                 drop_off_type: 0,
                 stop_headsign_idx: 0,
-            timepoint: 1,
-            shape_dist_traveled: None,
+                timepoint: 1,
+                shape_dist_traveled: None,
             },
             // t2 B@8:12 -> C@8:25 (after transfer buffer 60s from 8:10)
             PackedStopTime {
@@ -2737,8 +2735,8 @@ mod tests {
                 pickup_type: 0,
                 drop_off_type: 0,
                 stop_headsign_idx: 0,
-            timepoint: 1,
-            shape_dist_traveled: None,
+                timepoint: 1,
+                shape_dist_traveled: None,
             },
             PackedStopTime {
                 stop_idx: 2,
@@ -2748,8 +2746,8 @@ mod tests {
                 pickup_type: 0,
                 drop_off_type: 0,
                 stop_headsign_idx: 0,
-            timepoint: 1,
-            shape_dist_traveled: None,
+                timepoint: 1,
+                shape_dist_traveled: None,
             },
         ];
         let mk = |id: &str, start: u32, len: u32, block: Option<&str>| GlobalTrip {
@@ -3069,10 +3067,7 @@ mod tests {
         let mut q = query("test:P1", "test:P2", 8, 0);
         q.wheelchair = false;
         let res_fast = plan_journeys(&epoch, &q);
-        assert!(
-            !res_fast.journeys.is_empty(),
-            "expected pure walk journey"
-        );
+        assert!(!res_fast.journeys.is_empty(), "expected pure walk journey");
         let walk_s = res_fast.journeys[0]
             .legs
             .iter()
@@ -3099,7 +3094,7 @@ mod tests {
             })
             .sum::<u32>();
         assert!(
-            walk_wc >= 100 && walk_wc < 1000,
+            (100..1000).contains(&walk_wc),
             "wheelchair should prefer elevator (~120s), not stairs×100; got {walk_wc}"
         );
     }

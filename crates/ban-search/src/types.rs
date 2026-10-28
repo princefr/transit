@@ -98,8 +98,8 @@ pub enum BanError {
     Download(String),
     #[error("index: {0}")]
     Index(String),
-    #[error("bincode: {0}")]
-    Bincode(String),
+    #[error("index encoding: {0}")]
+    Encoding(String),
     #[error("http: {0}")]
     Http(#[from] reqwest::Error),
 }
@@ -109,5 +109,3 @@ impl BanError {
         Self::Index(msg.into())
     }
 }
-
-

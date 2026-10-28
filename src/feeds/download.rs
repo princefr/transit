@@ -36,8 +36,8 @@ const REQUIRED_GTFS_FILES: &[&str] = &["stops.txt", "stop_times.txt"];
 /// Validate that zip bytes contain required GTFS tables (case-insensitive basenames).
 pub fn validate_gtfs_zip(bytes: &[u8]) -> Result<()> {
     let cursor = std::io::Cursor::new(bytes);
-    let mut archive = ZipArchive::new(cursor)
-        .map_err(|e| TransitError::Parse(format!("invalid zip: {e}")))?;
+    let mut archive =
+        ZipArchive::new(cursor).map_err(|e| TransitError::Parse(format!("invalid zip: {e}")))?;
 
     let mut found: Vec<String> = Vec::new();
     for i in 0..archive.len() {
@@ -164,7 +164,7 @@ fn body_too_large(url: &str, max_bytes: u64) -> TransitError {
 
 /// Stream the response body, rejecting it as soon as it exceeds `max_bytes`
 /// (also up-front when the server announces a larger `Content-Length`).
-async fn read_body_capped(
+pub(crate) async fn read_body_capped(
     mut resp: reqwest::Response,
     url: &str,
     max_bytes: u64,
@@ -341,8 +341,7 @@ pub fn write_current_zip(data_dir: &Path, feed_id: &str, bytes: &[u8]) -> Result
         // Same directory tree → rename is atomic; fall back to copy across devices.
         std::fs::rename(&incoming, &current).or_else(|_| {
             let tmp = dir.join("current.zip.tmp");
-            let r = std::fs::copy(&incoming, &tmp)
-                .and_then(|_| std::fs::rename(&tmp, &current));
+            let r = std::fs::copy(&incoming, &tmp).and_then(|_| std::fs::rename(&tmp, &current));
             let _ = std::fs::remove_file(&tmp);
             r
         })
@@ -386,8 +385,8 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut zw = ZipWriter::new(std::io::Cursor::new(&mut buf));
-            let opts = SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
+            let opts =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
             for (name, content) in files {
                 zw.start_file(*name, opts).unwrap();
                 zw.write_all(content.as_bytes()).unwrap();
@@ -426,7 +425,10 @@ mod tests {
 
         let good = make_zip_with(&[
             ("stops.txt", "stop_id,stop_name\n1,A\n"),
-            ("stop_times.txt", "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"),
+            (
+                "stop_times.txt",
+                "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n",
+            ),
             ("agency.txt", "x"),
         ]);
         assert!(validate_gtfs_zip(&good).is_ok());
@@ -434,10 +436,7 @@ mod tests {
 
     #[test]
     fn validate_zip_nested_paths() {
-        let good = make_zip_with(&[
-            ("gtfs/stops.txt", "x"),
-            ("gtfs/stop_times.txt", "y"),
-        ]);
+        let good = make_zip_with(&[("gtfs/stops.txt", "x"), ("gtfs/stop_times.txt", "y")]);
         assert!(validate_gtfs_zip(&good).is_ok());
     }
 
@@ -452,10 +451,7 @@ mod tests {
     #[test]
     fn write_current_promotes_good_zip() {
         let dir = tempfile::tempdir().unwrap();
-        let good = make_zip_with(&[
-            ("stops.txt", "s"),
-            ("stop_times.txt", "t"),
-        ]);
+        let good = make_zip_with(&[("stops.txt", "s"), ("stop_times.txt", "t")]);
         let path = write_current_zip(dir.path(), "f", &good).unwrap();
         assert!(path.exists());
         assert_eq!(std::fs::read(&path).unwrap(), good);
@@ -469,7 +465,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let incoming = dir.path().join("f").join("incoming");
         std::fs::create_dir_all(&incoming).unwrap();
-        for name in ["20200101000000.zip", "20200102000000.zip", "20200103000000.zip"] {
+        for name in [
+            "20200101000000.zip",
+            "20200102000000.zip",
+            "20200103000000.zip",
+        ] {
             std::fs::write(incoming.join(name), b"old").unwrap();
         }
         let good = make_zip_with(&[("stops.txt", "s"), ("stop_times.txt", "t")]);

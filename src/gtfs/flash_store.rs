@@ -44,7 +44,10 @@ pub fn flash_path(dir: &Path, hash: &str) -> PathBuf {
 /// [`load_flash`] rejects files whose fingerprint differs.
 pub fn save_flash(path: &Path, epoch: &StaticEpoch, fingerprint: &str) -> io::Result<()> {
     if fingerprint.len() > MAX_FP_LEN {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "fingerprint too long"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "fingerprint too long",
+        ));
     }
     let mut buf: Vec<u8> = Vec::with_capacity(8 << 20);
     buf.extend_from_slice(MAGIC);
@@ -93,7 +96,12 @@ pub fn save_flash(path: &Path, epoch: &StaticEpoch, fingerprint: &str) -> io::Re
 }
 
 /// Decoded flag cache: `(num_cells, arc_flag_pattern, flag_patterns, trip_transfers)`.
-pub type FlashData = (u32, Vec<u32>, Vec<CellBitSet>, Vec<Vec<Vec<TripTransferEntry>>>);
+pub type FlashData = (
+    u32,
+    Vec<u32>,
+    Vec<CellBitSet>,
+    Vec<Vec<Vec<TripTransferEntry>>>,
+);
 
 /// Load flag data previously written by [`save_flash`]. Returns `Ok(None)`
 /// when the file is absent, has an old/unknown format, or was written for a
@@ -105,7 +113,10 @@ pub fn load_flash(path: &Path, fingerprint: &str) -> io::Result<Option<FlashData
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    let mut r = Reader { data: &data, pos: 0 };
+    let mut r = Reader {
+        data: &data,
+        pos: 0,
+    };
     if r.data.len() < MAGIC.len() || &r.data[..MAGIC.len()] != MAGIC {
         return Ok(None);
     }
@@ -160,7 +171,12 @@ pub fn load_flash(path: &Path, fingerprint: &str) -> io::Result<Option<FlashData
         trip_transfers.push(per_alight);
     }
 
-    Ok(Some((num_cells, arc_flag_pattern, flag_patterns, trip_transfers)))
+    Ok(Some((
+        num_cells,
+        arc_flag_pattern,
+        flag_patterns,
+        trip_transfers,
+    )))
 }
 
 /// Check every index in cached flag data against `epoch` (shape and
@@ -173,7 +189,10 @@ pub fn validate_flash(epoch: &StaticEpoch, data: &FlashData) -> Result<(), Strin
         return Err(format!("num_cells {} != {}", num_cells, epoch.num_cells));
     }
     let max_words = (*num_cells as usize).div_ceil(64);
-    if let Some(i) = flag_patterns.iter().position(|p| p.words().len() > max_words) {
+    if let Some(i) = flag_patterns
+        .iter()
+        .position(|p| p.words().len() > max_words)
+    {
         return Err(format!("flag pattern {i} wider than {num_cells} cells"));
     }
     let n_patterns = flag_patterns.len();
@@ -184,7 +203,10 @@ pub fn validate_flash(epoch: &StaticEpoch, data: &FlashData) -> Result<(), Strin
             epoch.walk_edges.len()
         ));
     }
-    if let Some(i) = arc_flag_pattern.iter().position(|&p| p as usize >= n_patterns) {
+    if let Some(i) = arc_flag_pattern
+        .iter()
+        .position(|&p| p as usize >= n_patterns)
+    {
         return Err(format!("walk edge {i} pattern out of range"));
     }
     if trip_transfers.len() != epoch.trips.len() {
@@ -205,7 +227,10 @@ pub fn validate_flash(epoch: &StaticEpoch, data: &FlashData) -> Result<(), Strin
         }
         for e in per_alight.iter().flatten() {
             let Some(target) = epoch.trips.get(e.target_trip as usize) else {
-                return Err(format!("trip {ti}: target_trip {} out of range", e.target_trip));
+                return Err(format!(
+                    "trip {ti}: target_trip {} out of range",
+                    e.target_trip
+                ));
             };
             if e.target_board_off >= target.stop_time_len {
                 return Err(format!(
@@ -214,7 +239,10 @@ pub fn validate_flash(epoch: &StaticEpoch, data: &FlashData) -> Result<(), Strin
                 ));
             }
             if e.flag_pattern as usize >= n_patterns {
-                return Err(format!("trip {ti}: flag_pattern {} out of range", e.flag_pattern));
+                return Err(format!(
+                    "trip {ti}: flag_pattern {} out of range",
+                    e.flag_pattern
+                ));
             }
         }
     }
@@ -227,7 +255,9 @@ pub fn prune_flash_dir(dir: &Path, keep: &str) {
         for e in entries.flatten() {
             let name = e.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with("flash-") && name.ends_with(".bin") && name != format!("flash-{keep}.bin")
+            if name.starts_with("flash-")
+                && name.ends_with(".bin")
+                && name != format!("flash-{keep}.bin")
             {
                 let _ = fs::remove_file(e.path());
             }
@@ -289,9 +319,6 @@ mod tests {
             vec![vec![]],
         ];
 
-        let epoch_like = () // save_flash takes &StaticEpoch; build a minimal one
-        ;
-        let _ = epoch_like;
         let mut epoch = StaticEpoch::empty();
         epoch.num_cells = num_cells;
         epoch.arc_flag_pattern = arc_flag_pattern.clone();
@@ -306,8 +333,8 @@ mod tests {
         assert_eq!(cells, num_cells);
         assert_eq!(ap, arc_flag_pattern);
         assert_eq!(fp.len(), 2);
-        assert_eq!(fp[1].get_bit(200), true);
-        assert_eq!(fp[1].get_bit(8), false);
+        assert!(fp[1].get_bit(200));
+        assert!(!fp[1].get_bit(8));
         assert_eq!(tt, trip_transfers);
 
         // Corrupt magic → treated as absent
@@ -355,7 +382,10 @@ mod tests {
             64,
             vec![],
             vec![CellBitSet::new(64)],
-            vec![vec![vec![entry(1, 2)], vec![]], vec![vec![], vec![], vec![]]],
+            vec![
+                vec![vec![entry(1, 2)], vec![]],
+                vec![vec![], vec![], vec![]],
+            ],
         );
         assert!(validate_flash(&epoch, &good).is_ok());
 

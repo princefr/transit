@@ -3,10 +3,10 @@ use crate::config::Config;
 use crate::equipment::{new_shared_equipment, EquipmentCatalog, SharedEquipment};
 use crate::gtfs::pack::StaticEpoch;
 use crate::prim::poller::{new_shared_prim, PrimCatalog, SharedPrim};
+use crate::prim::PrimClient;
 use crate::rt::overlay::RealtimeOverlay;
 use arc_swap::ArcSwap;
 use ban_search::BanIndex;
-use crate::prim::PrimClient;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{broadcast, Semaphore};
 use tracing::{info, warn};
@@ -51,7 +51,8 @@ impl AppState {
             let dir = config.ban.resolved_data_dir(&config.runtime.data_dir);
             let depts = config.ban.resolved_departments();
             let index_path = dir.join("index.bin");
-            if !index_path.exists() {
+            // Also rebuild when a present file failed to load (old format / corrupt).
+            if !index_path.exists() || ban.load().address_count() == 0 {
                 let ban2 = ban.clone();
                 let _ = std::thread::Builder::new()
                     .name("ban-provision".into())
@@ -62,9 +63,7 @@ impl AppState {
             config.runtime.effective_max_concurrent_plans(),
         ));
         let ws_slots = Arc::new(Semaphore::new(config.server.max_ws_connections.max(1)));
-        let http_slots = Arc::new(Semaphore::new(
-            config.server.max_concurrent_requests.max(1),
-        ));
+        let http_slots = Arc::new(Semaphore::new(config.server.max_concurrent_requests.max(1)));
         let epoch = Arc::new(ArcSwap::from_pointee(StaticEpoch::empty()));
         // Lets `prim::stop_board` validate on-demand stop ids against the live epoch.
         crate::prim::stop_board::install_epoch_source(epoch.clone());

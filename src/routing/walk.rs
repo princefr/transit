@@ -217,10 +217,7 @@ pub fn osrm_route_timeout(
     let route = body.get("routes")?.as_array()?.first()?;
     let duration = route.get("duration")?.as_f64()?;
     let distance = route.get("distance")?.as_f64()?;
-    let coords = route
-        .get("geometry")?
-        .get("coordinates")?
-        .as_array()?;
+    let coords = route.get("geometry")?.get("coordinates")?.as_array()?;
     let mut geometry = Vec::with_capacity(coords.len());
     for c in coords {
         let arr = c.as_array()?;
@@ -243,7 +240,14 @@ pub fn osrm_foot_route(
     to_lat: f64,
     to_lon: f64,
 ) -> Option<(u32, f64, Vec<(f64, f64)>)> {
-    osrm_route(base_url, OsrmProfile::Foot, from_lat, from_lon, to_lat, to_lon)
+    osrm_route(
+        base_url,
+        OsrmProfile::Foot,
+        from_lat,
+        from_lon,
+        to_lat,
+        to_lon,
+    )
 }
 
 /// OSRM **bike** route (access / pure bike legs).
@@ -254,7 +258,14 @@ pub fn osrm_bike_route(
     to_lat: f64,
     to_lon: f64,
 ) -> Option<(u32, f64, Vec<(f64, f64)>)> {
-    osrm_route(base_url, OsrmProfile::Bike, from_lat, from_lon, to_lat, to_lon)
+    osrm_route(
+        base_url,
+        OsrmProfile::Bike,
+        from_lat,
+        from_lon,
+        to_lat,
+        to_lon,
+    )
 }
 
 /// Run OSRM requests concurrently (one scoped thread each) under `budget`.
@@ -541,9 +552,7 @@ fn expand_place_access(
                 continue;
             }
             let dist = match (seed_lat, seed_lon, s.lat, s.lon) {
-                (Some(a), Some(b), Some(c), Some(d)) => {
-                    crate::link::geo::haversine_m(a, b, c, d)
-                }
+                (Some(a), Some(b), Some(c), Some(d)) => crate::link::geo::haversine_m(a, b, c, d),
                 _ => 80.0,
             };
             if dist > 8_000.0 {
@@ -554,7 +563,11 @@ fn expand_place_access(
             } else {
                 (dist / speed).ceil() as u32
             };
-            let dur = if dist < 250.0 { dur.min(90) } else { dur.max(30) };
+            let dur = if dist < 250.0 {
+                dur.min(90)
+            } else {
+                dur.max(30)
+            };
             push(i, dur, dist);
         }
     }
@@ -578,10 +591,10 @@ fn expand_place_access(
         if let Some(children) = epoch.children_by_parent.get(p) {
             for &i in children {
                 let s = &epoch.stops[i as usize];
-                if s.parent_id.as_deref() == Some(p.as_str()) || s.id == *p {
-                    if has_departures(epoch, i as usize) || is_idfm_place_stop(s) {
-                        push(i, 60, 50.0);
-                    }
+                if (s.parent_id.as_deref() == Some(p.as_str()) || s.id == *p)
+                    && (has_departures(epoch, i as usize) || is_idfm_place_stop(s))
+                {
+                    push(i, 60, 50.0);
                 }
             }
         }
@@ -682,8 +695,7 @@ fn cached_stop_grid(
 ) -> std::sync::Arc<crate::link::geo::GeoGrid> {
     use std::sync::{Arc, Mutex, OnceLock};
     type Key = (String, i64, usize, usize);
-    static CACHE: OnceLock<Mutex<Option<(Key, Arc<crate::link::geo::GeoGrid>)>>> =
-        OnceLock::new();
+    static CACHE: OnceLock<Mutex<Option<(Key, Arc<crate::link::geo::GeoGrid>)>>> = OnceLock::new();
     let key: Key = (
         epoch.id.clone(),
         epoch.built_at.timestamp_nanos_opt().unwrap_or(0),
@@ -726,7 +738,7 @@ pub fn resolve_access_stops_budget(
             // Full place-cluster expansion only for real station shells (IDFM monomodal etc.).
             // Plain GTFS quays keep classic expansion so unit fixtures still transfer at B.
             if is_idfm_place_stop(seed) || seed.location_type == 1 {
-                let cap = limit.max(24).min(64);
+                let cap = limit.clamp(24, 64);
                 return cached_place_access(epoch, idx, max_walk_m, walk_speed_m_s, cap);
             }
             // Classic: seed + parent/child siblings — via the precomputed
@@ -977,23 +989,20 @@ mod tests {
     fn walk_leg_geometry_endpoints_fallback() {
         let g = walk_leg_geometry(None, Some(1.0), Some(2.0), Some(3.0), Some(4.0));
         assert_eq!(g, vec![(1.0, 2.0), (3.0, 4.0)]);
-        let g2 = walk_leg_geometry(Some(&[(5.0, 6.0), (7.0, 8.0)]), Some(1.0), Some(2.0), None, None);
+        let g2 = walk_leg_geometry(
+            Some(&[(5.0, 6.0), (7.0, 8.0)]),
+            Some(1.0),
+            Some(2.0),
+            None,
+            None,
+        );
         assert_eq!(g2, vec![(5.0, 6.0), (7.0, 8.0)]);
     }
 
     #[test]
     fn stop_id_access_zero_walk() {
         let epoch = tiny_epoch();
-        let access = resolve_access_stops(
-            &epoch,
-            Some("t:a"),
-            None,
-            None,
-            2000.0,
-            1.2,
-            8,
-            None,
-        );
+        let access = resolve_access_stops(&epoch, Some("t:a"), None, None, 2000.0, 1.2, 8, None);
         assert_eq!(access.len(), 1);
         assert_eq!(access[0].duration_s, 0);
         assert!(access[0].geometry.is_none());

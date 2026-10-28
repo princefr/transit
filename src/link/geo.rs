@@ -212,8 +212,15 @@ mod tests {
             }
         }
         let grid = GeoGrid::build(&points, 500.0);
-        for &(lat, lon, r) in &[(48.03, 2.04, 300.0), (48.01, 2.01, 1200.0), (47.0, 1.0, 500.0)] {
-            assert_eq!(grid.nearby(&points, lat, lon, r, 25), nearby(&points, lat, lon, r, 25));
+        for &(lat, lon, r) in &[
+            (48.03, 2.04, 300.0),
+            (48.01, 2.01, 1200.0),
+            (47.0, 1.0, 500.0),
+        ] {
+            assert_eq!(
+                grid.nearby(&points, lat, lon, r, 25),
+                nearby(&points, lat, lon, r, 25)
+            );
         }
     }
 

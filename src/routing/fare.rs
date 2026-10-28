@@ -639,14 +639,20 @@ mod tests {
     #[test]
     fn mixed_route_journey_sums_per_leg_products() {
         let (mut epoch, j) = two_leg_setup();
-        epoch.fares.extend([fare("test:bus", 2.0, Some(0), None), fare("test:tram", 3.0, Some(0), None)]);
+        epoch.fares.extend([
+            fare("test:bus", 2.0, Some(0), None),
+            fare("test:tram", 3.0, Some(0), None),
+        ]);
         epoch.fare_rules.extend([
             route_rule("test:bus", Some("test:r1")),
             route_rule("test:tram", Some("test:r2")),
         ]);
         let est = estimate_journey_fare(&epoch, &j).expect("fare");
         assert!((est.amount - 5.0).abs() < 1e-9);
-        assert_eq!(est.fare_ids, vec!["test:bus".to_string(), "test:tram".to_string()]);
+        assert_eq!(
+            est.fare_ids,
+            vec!["test:bus".to_string(), "test:tram".to_string()]
+        );
     }
 
     #[test]
@@ -663,7 +669,9 @@ mod tests {
     fn same_fare_with_transfer_allowance_charged_once() {
         let (mut epoch, j) = two_leg_setup();
         // One transfer within 90 minutes: second boarding is 70 min after the first.
-        epoch.fares.push(fare("test:flat", 2.0, Some(1), Some(5400)));
+        epoch
+            .fares
+            .push(fare("test:flat", 2.0, Some(1), Some(5400)));
         epoch.fare_rules.push(route_rule("test:flat", None));
         let est = estimate_journey_fare(&epoch, &j).expect("fare");
         assert!((est.amount - 2.0).abs() < 1e-9);
@@ -678,7 +686,9 @@ mod tests {
     fn unmatched_leg_returns_none() {
         let (mut epoch, j) = two_leg_setup();
         epoch.fares.push(fare("test:bus", 2.0, None, None));
-        epoch.fare_rules.push(route_rule("test:bus", Some("test:r1")));
+        epoch
+            .fare_rules
+            .push(route_rule("test:bus", Some("test:r1")));
         assert!(estimate_journey_fare(&epoch, &j).is_none());
     }
 
@@ -753,7 +763,7 @@ mod tests {
             walk_distance_m: 100.0,
             realtime_status: "SCHEDULED".into(),
             legs: vec![Leg::Walk(WalkLegData {
-                    mode: "WALK".into(),
+                mode: "WALK".into(),
                 from_name: "A".into(),
                 to_name: "B".into(),
                 from_stop_id: Some("test:A".into()),

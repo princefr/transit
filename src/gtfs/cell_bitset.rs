@@ -3,14 +3,14 @@
 ///
 /// Hashable so flag patterns can be deduplicated into a compressed table
 /// (FLASH-TB §5.2 flag-pattern compression).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct CellBitSet {
     words: Vec<u64>,
 }
 
 impl CellBitSet {
     pub fn new(num_cells: u32) -> Self {
-        let n_words = (num_cells as usize + 63) / 64;
+        let n_words = (num_cells as usize).div_ceil(64);
         Self {
             words: vec![0; n_words],
         }
@@ -18,7 +18,7 @@ impl CellBitSet {
 
     /// Grow to hold `num_cells` bits when currently empty (lazy init after pack).
     pub fn ensure_sized(&mut self, num_cells: u32) {
-        let n_words = (num_cells as usize + 63) / 64;
+        let n_words = (num_cells as usize).div_ceil(64);
         if self.words.len() < n_words {
             self.words.resize(n_words, 0);
         }
@@ -72,11 +72,5 @@ impl CellBitSet {
     /// Rebuild from serialized words (`words()` round-trip).
     pub fn from_words(words: Vec<u64>) -> Self {
         Self { words }
-    }
-}
-
-impl Default for CellBitSet {
-    fn default() -> Self {
-        Self { words: Vec::new() }
     }
 }

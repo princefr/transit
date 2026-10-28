@@ -1,9 +1,9 @@
 use crate::state::AppState;
 use axum::extract::{ConnectInfo, Request};
-use axum::Extension;
-use std::net::SocketAddr;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
+use axum::Extension;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 /// True when `/metrics` may answer this peer: always with
@@ -76,10 +76,25 @@ pub async fn metrics(Extension(state): Extension<Arc<AppState>>, req: Request) -
 
     (
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
         body,
     )
         .into_response()
+}
+
+fn sanitize_label(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -97,16 +112,4 @@ mod tests {
         assert!(!metrics_peer_allowed(false, None));
         assert!(metrics_peer_allowed(true, Some(remote)));
     }
-}
-
-fn sanitize_label(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }

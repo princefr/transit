@@ -106,14 +106,11 @@ pub fn finalize_realtime_overlay(rt: &mut RealtimeOverlay) {
         .feeds
         .values()
         .flat_map(|f| {
-            f.trips
-                .iter()
-                .filter(|(_, t)| t.canceled)
-                .map(|(id, _)| {
-                    id.rsplit_once('@')
-                        .map(|(b, _)| b.to_string())
-                        .unwrap_or_else(|| id.clone())
-                })
+            f.trips.iter().filter(|(_, t)| t.canceled).map(|(id, _)| {
+                id.rsplit_once('@')
+                    .map(|(b, _)| b.to_string())
+                    .unwrap_or_else(|| id.clone())
+            })
         })
         .collect();
     rt.rt_adjust = rt_adjust_map_from_feeds(&rt.feeds);
@@ -422,17 +419,14 @@ fn route_refs_match(leg_route_id: &str, informed: &str) -> bool {
     }
     // Exact trailing raw id after last colon (no substring games).
     let leg_tail = leg_route_id
-        .rsplit(|c| c == ':' || c == '/')
+        .rsplit([':', '/'])
         .find(|p| !p.is_empty())
         .unwrap_or(leg_route_id);
     let inf_tail = informed
-        .rsplit(|c| c == ':' || c == '/')
+        .rsplit([':', '/'])
         .find(|p| !p.is_empty())
         .unwrap_or(informed);
-    if !leg_tail.is_empty()
-        && leg_tail.len() >= 3
-        && leg_tail.eq_ignore_ascii_case(inf_tail)
-    {
+    if !leg_tail.is_empty() && leg_tail.len() >= 3 && leg_tail.eq_ignore_ascii_case(inf_tail) {
         return true;
     }
     false
@@ -484,7 +478,15 @@ pub fn alert_applies_to_leg(
     from_stop_id: &str,
     to_stop_id: &str,
 ) -> bool {
-    alert_applies_to_leg_with_mode(a, trip_id, route_id, route_short, from_stop_id, to_stop_id, "")
+    alert_applies_to_leg_with_mode(
+        a,
+        trip_id,
+        route_id,
+        route_short,
+        from_stop_id,
+        to_stop_id,
+        "",
+    )
 }
 
 /// Same as [`alert_applies_to_leg`] with mode (filters road traffic off rail modes).
@@ -515,7 +517,7 @@ pub fn alert_applies_to_leg_with_mode(
 
     // Stops: require last significant id segment equality (no loose substring).
     let stop_tail = |sid: &str| -> String {
-        sid.rsplit(|c| c == ':' || c == '/')
+        sid.rsplit([':', '/'])
             .find(|p| !p.is_empty() && p.chars().any(|c| c.is_ascii_alphanumeric()))
             .unwrap_or(sid)
             .to_string()
@@ -549,7 +551,7 @@ pub fn alert_applies_to_leg_with_mode(
             if !short.is_empty() {
                 for r in &a.informed_route_ids {
                     let tail = r
-                        .rsplit(|c| c == ':' || c == '/')
+                        .rsplit([':', '/'])
                         .find(|p| !p.is_empty())
                         .unwrap_or(r.as_str());
                     // Informed ref is exactly the commercial name ("B", "14"), not a code.
@@ -631,7 +633,9 @@ fn alert_text_compatible_with_leg(
     // Mentioned only as diversion / saturation target, while other products are
     // the actual subject (e.g. travaux RER B/D … saturation sur 4 et 5).
     if is_secondary_line_context(&blob, &su) {
-        let others_primary = mentioned.iter().any(|m| m != &su && is_primary_context(&blob, m));
+        let others_primary = mentioned
+            .iter()
+            .any(|m| m != &su && is_primary_context(&blob, m));
         if others_primary {
             return false;
         }
@@ -835,8 +839,8 @@ pub fn enrich_with_realtime(
                 t.direction_id,
                 t.scheduled_departure,
             );
-            let trip_canceled = trip_rt.map(|tr| tr.canceled).unwrap_or(false)
-                || rt.is_trip_canceled(&t.trip_id);
+            let trip_canceled =
+                trip_rt.map(|tr| tr.canceled).unwrap_or(false) || rt.is_trip_canceled(&t.trip_id);
 
             let dep = apply_stop_realtime(
                 rt,
@@ -954,7 +958,11 @@ pub fn enrich_with_realtime(
             journey.departure = rd;
         }
     }
-    if let Some(Leg::Transit(last)) = journey.legs.iter().rev().find(|l| matches!(l, Leg::Transit(_)))
+    if let Some(Leg::Transit(last)) = journey
+        .legs
+        .iter()
+        .rev()
+        .find(|l| matches!(l, Leg::Transit(_)))
     {
         if let Some(ra) = last.realtime_arrival {
             journey.arrival = ra;

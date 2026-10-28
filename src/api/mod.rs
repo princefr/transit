@@ -132,15 +132,21 @@ async fn ws_handler(
 /// then `503`) and a wall-clock timeout (`504`). Implemented as middleware
 /// instead of tower layers so the `/ws` upgrade route stays untouched.
 async fn http_guard(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
-    let permit =
-        match tokio::time::timeout(HTTP_SLOT_WAIT, state.http_slots.clone().acquire_owned()).await
-        {
-            Ok(Ok(p)) => p,
-            _ => {
-                return (StatusCode::SERVICE_UNAVAILABLE, "server busy, retry shortly")
-                    .into_response()
-            }
-        };
+    let permit = match tokio::time::timeout(
+        HTTP_SLOT_WAIT,
+        state.http_slots.clone().acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(p)) => p,
+        _ => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server busy, retry shortly",
+            )
+                .into_response()
+        }
+    };
     let timeout = state
         .config
         .server
@@ -192,12 +198,10 @@ async fn graphiql() -> impl IntoResponse {
 pub fn router(state: Arc<AppState>, schema: ServiceSchema) -> Router {
     let server = state.config.server.clone();
 
-    let mut http = Router::new()
-        .route("/health", get(health::health))
-        .route(
-            "/graphql",
-            post(graphql_handler).layer(DefaultBodyLimit::max(server.max_body_bytes.max(1024))),
-        );
+    let mut http = Router::new().route("/health", get(health::health)).route(
+        "/graphql",
+        post(graphql_handler).layer(DefaultBodyLimit::max(server.max_body_bytes.max(1024))),
+    );
     if server.metrics_enabled {
         http = http.route("/metrics", get(metrics::metrics));
     }
@@ -245,7 +249,10 @@ mod tests {
         // Same-origin (GraphiQL served by this server) allowed.
         assert!(ws_origin_allowed(
             &cfg,
-            &headers(Some("http://transit.example:8080"), Some("transit.example:8080"))
+            &headers(
+                Some("http://transit.example:8080"),
+                Some("transit.example:8080")
+            )
         ));
         // Foreign site rejected.
         assert!(!ws_origin_allowed(

@@ -105,14 +105,17 @@ fn best_match_kind(haystack: &str, needle: &str) -> MatchKind {
     let mut i = 0usize;
     while i + n.len() <= bytes.len() {
         if bytes[i..].starts_with(n) {
-            let at_boundary = i == 0
-                || !bytes[i - 1].is_ascii_alphanumeric();
+            let at_boundary = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
             if at_boundary {
                 return MatchKind::WordBoundary;
             }
         }
         // advance one UTF-8 char if possible, else one byte
-        let ch = haystack[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        let ch = haystack[i..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(1);
         i += ch;
     }
     if haystack.contains(needle) {
@@ -157,12 +160,7 @@ pub fn is_idfm_place_stop(s: &StopRecord) -> bool {
 pub fn place_name_key(name: &str) -> String {
     let mut s = strip_accents(name).to_lowercase();
     for prefix in [
-        "gare de ",
-        "gare d'",
-        "gare d'",
-        "station ",
-        "arret ",
-        "arrêt ",
+        "gare de ", "gare d'", "gare d'", "station ", "arret ", "arrêt ",
     ] {
         if let Some(rest) = s.strip_prefix(prefix) {
             s = rest.to_string();
@@ -366,9 +364,9 @@ mod tests {
             stop_code: None,
             stop_desc: None,
             level_id: None,
-        zone_id: None,
-        stop_url: None,
-        stop_timezone: None,
+            zone_id: None,
+            stop_url: None,
+            stop_timezone: None,
         }
     }
 
@@ -484,9 +482,9 @@ mod tests {
                 stop_code: None,
                 stop_desc: None,
                 level_id: None,
-            zone_id: None,
-            stop_url: None,
-            stop_timezone: None,
+                zone_id: None,
+                stop_url: None,
+                stop_timezone: None,
             },
         ]);
         let all = search_stops_filtered(&e, "alpha", None, 10, false);

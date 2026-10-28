@@ -26,7 +26,8 @@ fn gtfs_zip(files: &[(&str, &str)]) -> Vec<u8> {
 const AGENCY: &str = "agency_id,agency_name,agency_timezone\na1,Test,Europe/Paris\n";
 const ROUTES: &str = "route_id,route_short_name,route_long_name,route_type,agency_id\n\
 r1,1,Line 1,3,a1\nr2,2,Line 2,3,a1\nr3,3,Line 3,3,a1\nr4,4,Line 4,3,a1\nr5,5,Line 5,3,a1\n";
-const CAL_ALL: &str = "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\n\
+const CAL_ALL: &str =
+    "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\n\
 S1,1,1,1,1,1,1,1,20260101,20261231\n";
 
 fn epoch_from(stops: &str, trips: &str, stop_times: &str, calendar: &str) -> StaticEpoch {
@@ -93,7 +94,8 @@ fn utc(y: i32, m: u32, d: u32, h: u32, mi: u32) -> DateTime<Utc> {
 const NIGHT_STOPS: &str = "stop_id,stop_name,stop_lat,stop_lon\n\
 A,Alpha,48.80,2.30\nB,Beta,48.90,2.40\n";
 // Friday-only service; trip leaves A at 24:45:00 (Saturday 00:45 local).
-const CAL_FRIDAY: &str = "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\n\
+const CAL_FRIDAY: &str =
+    "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\n\
 FRI,0,0,0,0,1,0,0,20260101,20261231\n";
 const NIGHT_TRIPS: &str = "route_id,service_id,trip_id\nr1,FRI,night\n";
 const NIGHT_ST: &str = "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n\
@@ -114,7 +116,9 @@ fn friday_trip_after_midnight_found_on_saturday_morning() {
         // 00:45 / 01:15 CEST on Saturday.
         assert_eq!(j.departure, utc(2026, 7, 24, 22, 45), "tbr={tbr}");
         assert_eq!(j.arrival, utc(2026, 7, 24, 23, 15), "tbr={tbr}");
-        let Leg::Transit(t) = &j.legs[0] else { panic!() };
+        let Leg::Transit(t) = &j.legs[0] else {
+            panic!()
+        };
         assert_eq!(t.scheduled_departure, utc(2026, 7, 24, 22, 45));
     }
 }
@@ -146,8 +150,9 @@ fn after_midnight_trip_not_offered_on_wrong_day() {
     for tbr in [false, true] {
         let res = plan_journeys(&epoch, &query("test:A", "test:B", at, tbr));
         assert!(
-            res.journeys.iter().all(|j| transit_trips(j).is_empty()
-                || j.departure >= utc(2026, 7, 31, 0, 0)),
+            res.journeys
+                .iter()
+                .all(|j| transit_trips(j).is_empty() || j.departure >= utc(2026, 7, 31, 0, 0)),
             "tbr={tbr}: unexpected {:?}",
             res.journeys
         );
@@ -166,7 +171,10 @@ fn dst_spring_forward_day_uses_noon_minus_12h_anchor() {
     let epoch = epoch_from(NIGHT_STOPS, trips, st, CAL_ALL);
     // 2026-03-29 (CET→CEST). 08:00 CEST == 06:00 UTC.
     for tbr in [false, true] {
-        let res = plan_journeys(&epoch, &query("test:A", "test:B", utc(2026, 3, 29, 6, 0), tbr));
+        let res = plan_journeys(
+            &epoch,
+            &query("test:A", "test:B", utc(2026, 3, 29, 6, 0), tbr),
+        );
         let j = res.journeys.first().expect("journey");
         // 08:30 CEST == 06:30 UTC (local-midnight + 8h30 would give 07:30 UTC).
         assert_eq!(j.departure, utc(2026, 3, 29, 6, 30), "tbr={tbr}");
@@ -174,7 +182,10 @@ fn dst_spring_forward_day_uses_noon_minus_12h_anchor() {
     }
     // 2026-10-25 (CEST→CET). 08:00 CET == 07:00 UTC; 08:30 CET == 07:30 UTC.
     for tbr in [false, true] {
-        let res = plan_journeys(&epoch, &query("test:A", "test:B", utc(2026, 10, 25, 7, 0), tbr));
+        let res = plan_journeys(
+            &epoch,
+            &query("test:A", "test:B", utc(2026, 10, 25, 7, 0), tbr),
+        );
         let j = res.journeys.first().expect("journey");
         assert_eq!(j.departure, utc(2026, 10, 25, 7, 30), "tbr={tbr}");
     }
@@ -350,6 +361,10 @@ fn walk_first_departure_is_board_minus_walk() {
             "tbr={tbr}"
         );
         assert_eq!(j.duration_s, (j.arrival - j.departure).num_seconds());
-        assert!(j.duration_s < 3600, "duration must exclude idle wait: {}", j.duration_s);
+        assert!(
+            j.duration_s < 3600,
+            "duration must exclude idle wait: {}",
+            j.duration_s
+        );
     }
 }

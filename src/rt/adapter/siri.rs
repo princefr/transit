@@ -60,7 +60,9 @@ fn text_list_first(v: &Value) -> Option<String> {
             }
         }
     }
-    v.get("value").and_then(|x| x.as_str()).map(|s| s.to_string())
+    v.get("value")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
 }
 
 /// Last meaningful segment of a SIRI LineRef / VehicleRef / journey ref for UI labels.
@@ -83,7 +85,7 @@ fn humanize_siri_ref(raw: &str) -> Option<String> {
         "S",
     ];
     let parts: Vec<&str> = raw
-        .split(|c| c == ':' || c == '/')
+        .split([':', '/'])
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .collect();
@@ -192,7 +194,10 @@ fn as_array_or_one(v: &Value) -> Vec<&Value> {
 fn service_delivery(root: &Value) -> &Value {
     root.get("Siri")
         .or_else(|| root.get("siri"))
-        .and_then(|s| s.get("ServiceDelivery").or_else(|| s.get("serviceDelivery")))
+        .and_then(|s| {
+            s.get("ServiceDelivery")
+                .or_else(|| s.get("serviceDelivery"))
+        })
         .unwrap_or(root)
 }
 
@@ -228,14 +233,14 @@ pub fn ingest_siri_estimated_timetable(feed_id: &str, bytes: &[u8]) -> Result<Fe
                 .map(as_array_or_one)
                 .unwrap_or_default();
             for j in journeys {
-                let Some(trip_raw) = j
-                    .get("DatedVehicleJourneyRef")
-                    .and_then(ref_value)
-                    .or_else(|| {
-                        j.get("FramedVehicleJourneyRef")
-                            .and_then(|f| f.get("DatedVehicleJourneyRef"))
-                            .and_then(ref_value)
-                    })
+                let Some(trip_raw) =
+                    j.get("DatedVehicleJourneyRef")
+                        .and_then(ref_value)
+                        .or_else(|| {
+                            j.get("FramedVehicleJourneyRef")
+                                .and_then(|f| f.get("DatedVehicleJourneyRef"))
+                                .and_then(ref_value)
+                        })
                 else {
                     continue;
                 };
@@ -343,10 +348,16 @@ pub fn ingest_siri_estimated_timetable(feed_id: &str, bytes: &[u8]) -> Result<Fe
                 let loc = j.get("VehicleLocation");
                 let lat = loc
                     .and_then(|l| l.get("Latitude").or_else(|| l.get("latitude")))
-                    .and_then(|x| x.as_f64().or_else(|| x.as_str().and_then(|s| s.parse().ok())));
+                    .and_then(|x| {
+                        x.as_f64()
+                            .or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+                    });
                 let lon = loc
                     .and_then(|l| l.get("Longitude").or_else(|| l.get("longitude")))
-                    .and_then(|x| x.as_f64().or_else(|| x.as_str().and_then(|s| s.parse().ok())));
+                    .and_then(|x| {
+                        x.as_f64()
+                            .or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+                    });
                 if let (Some(lat), Some(lon)) = (lat, lon) {
                     let label = _display_hint.clone().or_else(|| {
                         line.as_ref()
@@ -429,16 +440,13 @@ pub fn ingest_siri_stop_monitoring(feed_id: &str, bytes: &[u8]) -> Result<FeedRt
             .unwrap_or_default();
 
         for visit in visits {
-            let mon_ref = visit
-                .get("MonitoringRef")
-                .and_then(ref_value)
-                .or_else(|| {
-                    visit
-                        .get("MonitoredVehicleJourney")
-                        .and_then(|m| m.get("MonitoredCall"))
-                        .and_then(|c| c.get("StopPointRef"))
-                        .and_then(ref_value)
-                });
+            let mon_ref = visit.get("MonitoringRef").and_then(ref_value).or_else(|| {
+                visit
+                    .get("MonitoredVehicleJourney")
+                    .and_then(|m| m.get("MonitoredCall"))
+                    .and_then(|c| c.get("StopPointRef"))
+                    .and_then(ref_value)
+            });
 
             let mvj = visit
                 .get("MonitoredVehicleJourney")
@@ -470,9 +478,8 @@ pub fn ingest_siri_stop_monitoring(feed_id: &str, bytes: &[u8]) -> Result<FeedRt
                 .get("MonitoredCall")
                 .or_else(|| mvj.get("monitoredCall"));
 
-            let stop_raw = mon_ref.or_else(|| {
-                call.and_then(|c| c.get("StopPointRef").and_then(ref_value))
-            });
+            let stop_raw =
+                mon_ref.or_else(|| call.and_then(|c| c.get("StopPointRef").and_then(ref_value)));
             let stop_id = stop_raw.as_ref().map(|s| ns(feed_id, s));
 
             let dep_status = call
@@ -514,15 +521,18 @@ pub fn ingest_siri_stop_monitoring(feed_id: &str, bytes: &[u8]) -> Result<FeedRt
             let seq = *seq_by_trip.entry(trip_id.clone()).or_insert(1);
             *seq_by_trip.get_mut(&trip_id).unwrap() = seq.saturating_add(1);
 
-            let entry = state.trips.entry(trip_id.clone()).or_insert_with(|| TripRt {
-                delay: departure_delay.or(arrival_delay),
-                canceled,
-                start_date: None,
-                route_id: line.clone(),
-                direction_id: None,
-                start_time: None,
-                stop_updates: HashMap::new(),
-            });
+            let entry = state
+                .trips
+                .entry(trip_id.clone())
+                .or_insert_with(|| TripRt {
+                    delay: departure_delay.or(arrival_delay),
+                    canceled,
+                    start_date: None,
+                    route_id: line.clone(),
+                    direction_id: None,
+                    start_time: None,
+                    stop_updates: HashMap::new(),
+                });
             if canceled {
                 entry.canceled = true;
             }
@@ -556,10 +566,16 @@ pub fn ingest_siri_stop_monitoring(feed_id: &str, bytes: &[u8]) -> Result<FeedRt
                 .or_else(|| visit.get("VehicleLocation"));
             let lat = loc
                 .and_then(|l| l.get("Latitude").or_else(|| l.get("latitude")))
-                .and_then(|x| x.as_f64().or_else(|| x.as_str().and_then(|s| s.parse().ok())));
+                .and_then(|x| {
+                    x.as_f64()
+                        .or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+                });
             let lon = loc
                 .and_then(|l| l.get("Longitude").or_else(|| l.get("longitude")))
-                .and_then(|x| x.as_f64().or_else(|| x.as_str().and_then(|s| s.parse().ok())));
+                .and_then(|x| {
+                    x.as_f64()
+                        .or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+                });
 
             if let (Some(lat), Some(lon)) = (lat, lon) {
                 let label = siri_vehicle_label(mvj, &trip_raw).or_else(|| {
@@ -587,7 +603,7 @@ pub fn ingest_siri_stop_monitoring(feed_id: &str, bytes: &[u8]) -> Result<FeedRt
                         } else {
                             "IN_TRANSIT_TO".into()
                         }),
-                        current_stop_sequence: Some(seq as u32),
+                        current_stop_sequence: Some(seq),
                         congestion: None,
                     },
                 );
@@ -676,7 +692,9 @@ pub fn ingest_siri_general_message(feed_id: &str, bytes: &[u8]) -> Result<FeedRt
             let mut long_msg: Option<String> = None;
 
             // IDFM: Content.Message[] with MessageType SHORT_MESSAGE / TEXT_ONLY / ...
-            if let Some(msgs) = content.and_then(|c| c.get("Message")).or_else(|| msg.get("Message"))
+            if let Some(msgs) = content
+                .and_then(|c| c.get("Message"))
+                .or_else(|| msg.get("Message"))
             {
                 for m in as_array_or_one(msgs) {
                     let mtype = m
@@ -718,15 +736,12 @@ pub fn ingest_siri_general_message(feed_id: &str, bytes: &[u8]) -> Result<FeedRt
             }
 
             if description.is_none() {
-                description = long_msg
-                    .clone()
-                    .or_else(|| short_msg.clone())
-                    .or_else(|| {
-                        content
-                            .and_then(|c| c.get("MessageContent"))
-                            .and_then(|x| x.as_str())
-                            .map(|s| s.to_string())
-                    });
+                description = long_msg.clone().or_else(|| short_msg.clone()).or_else(|| {
+                    content
+                        .and_then(|c| c.get("MessageContent"))
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.to_string())
+                });
             }
             header = short_msg
                 .clone()
@@ -786,7 +801,10 @@ pub fn ingest_siri_general_message(feed_id: &str, bytes: &[u8]) -> Result<FeedRt
             }
 
             let mut periods = Vec::new();
-            if let Some(vp) = msg.get("ValididyPeriod").or_else(|| msg.get("ValidityPeriod")) {
+            if let Some(vp) = msg
+                .get("ValididyPeriod")
+                .or_else(|| msg.get("ValidityPeriod"))
+            {
                 for p in as_array_or_one(vp) {
                     let start = p
                         .get("StartTime")
@@ -1034,7 +1052,10 @@ mod tests {
 
     #[test]
     fn humanize_line_and_journey_refs() {
-        assert_eq!(humanize_siri_ref("STIF:Line::C01371:").as_deref(), Some("C01371"));
+        assert_eq!(
+            humanize_siri_ref("STIF:Line::C01371:").as_deref(),
+            Some("C01371")
+        );
         assert_eq!(
             humanize_siri_ref("RATP-SIV:VehicleJourney::42").as_deref(),
             Some("42")

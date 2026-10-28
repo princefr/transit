@@ -317,11 +317,7 @@ pub fn load_gtfs_bytes_with_horizon(
                 .get("end_date")
                 .and_then(|s| parse_date(s))
                 .unwrap_or_else(|| NaiveDate::from_ymd_opt(2099, 12, 31).unwrap());
-            let flag = |k: &str| {
-                rec.get(k)
-                    .map(|s| s.trim() == "1")
-                    .unwrap_or(false)
-            };
+            let flag = |k: &str| rec.get(k).map(|s| s.trim() == "1").unwrap_or(false);
             calendar.add_regular(
                 sid,
                 start,
@@ -371,29 +367,28 @@ pub fn load_gtfs_bytes_with_horizon(
         }
     }
 
-    let active_services: Option<std::collections::HashSet<String>> =
-        static_horizon_days.map(|n| {
-            // "Today" in the feed's local timezone, not UTC: around local
-            // midnight the UTC date is off by one. Start the window one day
-            // earlier so yesterday's after-midnight (> 24:00) trips survive.
-            let tz = feed_timezone(agency_csv.as_deref());
-            let today = Utc::now().with_timezone(&tz).date_naive();
-            let start = today.pred_opt().unwrap_or(today);
-            let end = today
-                .checked_add_days(chrono::Days::new(n as u64))
-                .unwrap_or(today);
-            let set = calendar.services_active_in_range(start, end);
-            info!(
-                feed_id = %feed_id,
-                horizon_days = n,
-                timezone = %tz,
-                from = %start,
-                to = %end,
-                active_services = set.len(),
-                "static horizon: filtering trips to services active in window"
-            );
-            set
-        });
+    let active_services: Option<std::collections::HashSet<String>> = static_horizon_days.map(|n| {
+        // "Today" in the feed's local timezone, not UTC: around local
+        // midnight the UTC date is off by one. Start the window one day
+        // earlier so yesterday's after-midnight (> 24:00) trips survive.
+        let tz = feed_timezone(agency_csv.as_deref());
+        let today = Utc::now().with_timezone(&tz).date_naive();
+        let start = today.pred_opt().unwrap_or(today);
+        let end = today
+            .checked_add_days(chrono::Days::new(n as u64))
+            .unwrap_or(today);
+        let set = calendar.services_active_in_range(start, end);
+        info!(
+            feed_id = %feed_id,
+            horizon_days = n,
+            timezone = %tz,
+            from = %start,
+            to = %end,
+            active_services = set.len(),
+            "static horizon: filtering trips to services active in window"
+        );
+        set
+    });
 
     let mut stops = Vec::new();
     let mut stop_id_to_idx: HashMap<String, u32> = HashMap::new();
@@ -425,7 +420,7 @@ pub fn load_gtfs_bytes_with_horizon(
             let lat = rec
                 .get("stop_lat")
                 .and_then(|s| s.parse::<f64>().ok())
-                .filter(|v| v.abs() > 0.0 || rec.get("stop_lon").is_some());
+                .filter(|v| v.abs() > 0.0 || rec.contains_key("stop_lon"));
             let lon = rec.get("stop_lon").and_then(|s| s.parse::<f64>().ok());
             let location_type = rec
                 .get("location_type")
@@ -435,10 +430,7 @@ pub fn load_gtfs_bytes_with_horizon(
                 .get("wheelchair_boarding")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0u8);
-            let platform_code = rec
-                .get("platform_code")
-                .cloned()
-                .filter(|s| !s.is_empty());
+            let platform_code = rec.get("platform_code").cloned().filter(|s| !s.is_empty());
             let name = rec
                 .get("stop_name")
                 .cloned()
@@ -447,14 +439,8 @@ pub fn load_gtfs_bytes_with_horizon(
             let idx = stops.len() as u32;
             stop_id_to_idx.insert(id.clone(), idx);
             raw_to_ns_stop.insert(raw_id.clone(), id.clone());
-            let stop_code = rec
-                .get("stop_code")
-                .cloned()
-                .filter(|s| !s.is_empty());
-            let stop_desc = rec
-                .get("stop_desc")
-                .cloned()
-                .filter(|s| !s.is_empty());
+            let stop_code = rec.get("stop_code").cloned().filter(|s| !s.is_empty());
+            let stop_desc = rec.get("stop_desc").cloned().filter(|s| !s.is_empty());
             let level_id = rec
                 .get("level_id")
                 .cloned()
@@ -467,10 +453,7 @@ pub fn load_gtfs_bytes_with_horizon(
                 .filter(|s| !s.is_empty())
                 .map(|raw| ns(feed_id, &raw));
             let stop_url = rec.get("stop_url").cloned().filter(|s| !s.is_empty());
-            let stop_timezone = rec
-                .get("stop_timezone")
-                .cloned()
-                .filter(|s| !s.is_empty());
+            let stop_timezone = rec.get("stop_timezone").cloned().filter(|s| !s.is_empty());
             stops.push(StopRecord {
                 id,
                 feed_id: feed_id.to_string(),
@@ -508,10 +491,7 @@ pub fn load_gtfs_bytes_with_horizon(
                 .get("route_type")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(3);
-            let color = rec
-                .get("route_color")
-                .cloned()
-                .filter(|s| !s.is_empty());
+            let color = rec.get("route_color").cloned().filter(|s| !s.is_empty());
             let text_color = rec
                 .get("route_text_color")
                 .cloned()
@@ -595,10 +575,7 @@ pub fn load_gtfs_bytes_with_horizon(
                 .cloned()
                 .filter(|s| !s.is_empty())
                 .map(|s| ns(feed_id, &s));
-            let block_id = rec
-                .get("block_id")
-                .cloned()
-                .filter(|s| !s.is_empty());
+            let block_id = rec.get("block_id").cloned().filter(|s| !s.is_empty());
             let service_id = rec.get("service_id").cloned().unwrap_or_default();
             if let Some(ref active) = active_services {
                 if !active.contains(&service_id) {
@@ -717,31 +694,32 @@ pub fn load_gtfs_bytes_with_horizon(
                 .get("timepoint")
                 .and_then(|s| s.trim().parse().ok())
                 .unwrap_or(1u8);
-            let shape_dist_traveled = rec
-                .get("shape_dist_traveled")
-                .and_then(|s| {
-                    let t = s.trim();
-                    if t.is_empty() {
-                        None
-                    } else {
-                        t.parse::<f32>().ok()
-                    }
-                });
-            times_by_trip.entry(raw_trip).or_default().push(RawStopTime {
-                arr: arr_raw.or(dep_raw),
-                dep: dep_raw.or(arr_raw),
-                st: PackedStopTime {
-                    stop_idx,
-                    arrival_s: 0,
-                    departure_s: 0,
-                    stop_sequence: seq,
-                    pickup_type,
-                    drop_off_type,
-                    stop_headsign_idx,
-                    timepoint,
-                    shape_dist_traveled,
-                },
+            let shape_dist_traveled = rec.get("shape_dist_traveled").and_then(|s| {
+                let t = s.trim();
+                if t.is_empty() {
+                    None
+                } else {
+                    t.parse::<f32>().ok()
+                }
             });
+            times_by_trip
+                .entry(raw_trip)
+                .or_default()
+                .push(RawStopTime {
+                    arr: arr_raw.or(dep_raw),
+                    dep: dep_raw.or(arr_raw),
+                    st: PackedStopTime {
+                        stop_idx,
+                        arrival_s: 0,
+                        departure_s: 0,
+                        stop_sequence: seq,
+                        pickup_type,
+                        drop_off_type,
+                        stop_headsign_idx,
+                        timepoint,
+                        shape_dist_traveled,
+                    },
+                });
         }
     }
     if bad_seq_rows > 0 {
@@ -766,8 +744,7 @@ pub fn load_gtfs_bytes_with_horizon(
     // Deterministic trip order — HashMap iteration is randomly seeded per
     // process, which would otherwise shuffle `epoch.trips`, breaking FLASH-TB
     // disk-cache shape validation and run-to-run reproducibility.
-    let mut ordered_trips: Vec<(String, Vec<RawStopTime>)> =
-        times_by_trip.into_iter().collect();
+    let mut ordered_trips: Vec<(String, Vec<RawStopTime>)> = times_by_trip.into_iter().collect();
     ordered_trips.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut dropped_untimed_trips = 0usize;
@@ -835,8 +812,14 @@ pub fn load_gtfs_bytes_with_horizon(
             .from_reader(tr.as_bytes());
         for rec in rdr.deserialize::<HashMap<String, String>>() {
             let Ok(rec) = rec else { continue };
-            let from = ns(feed_id, rec.get("from_stop_id").map(|s| s.as_str()).unwrap_or(""));
-            let to = ns(feed_id, rec.get("to_stop_id").map(|s| s.as_str()).unwrap_or(""));
+            let from = ns(
+                feed_id,
+                rec.get("from_stop_id").map(|s| s.as_str()).unwrap_or(""),
+            );
+            let to = ns(
+                feed_id,
+                rec.get("to_stop_id").map(|s| s.as_str()).unwrap_or(""),
+            );
             let Some(&from_idx) = stop_id_to_idx.get(&from) else {
                 continue;
             };
@@ -887,7 +870,6 @@ pub fn load_gtfs_bytes_with_horizon(
                 .filter(|s| !s.trim().is_empty());
         }
     }
-
 
     // frequencies.txt: trip_id, start_time, end_time, headway_secs
     let mut frequencies: HashMap<String, Vec<FrequencyWindow>> = HashMap::new();
@@ -981,10 +963,7 @@ pub fn load_gtfs_bytes_with_horizon(
                 .get("level_index")
                 .and_then(|s| s.trim().parse::<f64>().ok())
                 .unwrap_or(0.0);
-            let level_name = rec
-                .get("level_name")
-                .cloned()
-                .filter(|s| !s.is_empty());
+            let level_name = rec.get("level_name").cloned().filter(|s| !s.is_empty());
             let id = ns(feed_id, &raw_id);
             levels.insert(
                 id.clone(),
@@ -1043,10 +1022,7 @@ pub fn load_gtfs_bytes_with_horizon(
             let min_width = rec
                 .get("min_width")
                 .and_then(|s| s.trim().parse::<f64>().ok());
-            let signposted_as = rec
-                .get("signposted_as")
-                .cloned()
-                .filter(|s| !s.is_empty());
+            let signposted_as = rec.get("signposted_as").cloned().filter(|s| !s.is_empty());
             let reversed_signposted_as = rec
                 .get("reversed_signposted_as")
                 .cloned()
@@ -1487,7 +1463,10 @@ mod tests {
         assert_eq!(trip.wheelchair, 1);
         assert_eq!(trip.bikes_allowed, 2);
         assert_eq!(trip.block_id.as_deref(), Some("BLK1"));
-        let freqs = bundle.frequencies.get("test:t1").expect("frequencies for t1");
+        let freqs = bundle
+            .frequencies
+            .get("test:t1")
+            .expect("frequencies for t1");
         assert_eq!(freqs.len(), 1);
         assert_eq!(freqs[0].start_s, 6 * 3600);
         assert_eq!(freqs[0].end_s, 12 * 3600);
@@ -1576,7 +1555,10 @@ mod tests {
         assert_eq!(gt.shape_id.as_deref(), Some("test:sh1"));
         assert!(epoch.shapes.contains_key("test:sh1"));
         let gst0 = &epoch.stop_times[gt.stop_time_start as usize];
-        assert_eq!(epoch.headsign_pool[gst0.stop_headsign_idx as usize], "Vers Lyon");
+        assert_eq!(
+            epoch.headsign_pool[gst0.stop_headsign_idx as usize],
+            "Vers Lyon"
+        );
 
         // leg_geometry should be non-empty (shape slice or stop polyline).
         // from_stop_idx / to_stop_idx are offsets within the trip's stop_times.
@@ -1602,13 +1584,20 @@ mod tests {
         C,C,48.83,2.30\n\
         D,D,48.84,2.30\n";
     const BASE_ROUTES: &str = "route_id,route_short_name,route_long_name,route_type\nr1,1,One,3\n";
-    const BASE_CAL: &str = "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\n\
+    const BASE_CAL: &str =
+        "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\n\
         S1,1,1,1,1,1,1,1,20260101,20261231\n";
 
     #[test]
     fn time_and_date_parsing_rejects_garbage() {
-        assert_eq!(parse_time_to_seconds("08:05:30"), Some(8 * 3600 + 5 * 60 + 30));
-        assert_eq!(parse_time_to_seconds(" 25:30:00 "), Some(25 * 3600 + 30 * 60));
+        assert_eq!(
+            parse_time_to_seconds("08:05:30"),
+            Some(8 * 3600 + 5 * 60 + 30)
+        );
+        assert_eq!(
+            parse_time_to_seconds(" 25:30:00 "),
+            Some(25 * 3600 + 30 * 60)
+        );
         assert_eq!(parse_time_to_seconds("7:00:00"), Some(7 * 3600));
         assert_eq!(parse_time_to_seconds(""), None);
         assert_eq!(parse_time_to_seconds("73:00:00"), None);
@@ -1730,7 +1719,9 @@ mod tests {
         let name = find_zip_entry(&mut archive, "STOPS.TXT").unwrap();
         assert!(read_named_zip_entry(&mut archive, &name, 1024).is_err());
         assert_eq!(
-            read_named_zip_entry(&mut archive, &name, 4096).unwrap().len(),
+            read_named_zip_entry(&mut archive, &name, 4096)
+                .unwrap()
+                .len(),
             2048
         );
     }

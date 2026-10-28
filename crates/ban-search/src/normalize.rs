@@ -6,7 +6,9 @@ pub fn strip_accents(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
-            'à' | 'á' | 'â' | 'ä' | 'ã' | 'å' | 'À' | 'Á' | 'Â' | 'Ä' | 'Ã' | 'Å' => out.push('a'),
+            'à' | 'á' | 'â' | 'ä' | 'ã' | 'å' | 'À' | 'Á' | 'Â' | 'Ä' | 'Ã' | 'Å' => {
+                out.push('a')
+            }
             'è' | 'é' | 'ê' | 'ë' | 'È' | 'É' | 'Ê' | 'Ë' => out.push('e'),
             'ì' | 'í' | 'î' | 'ï' | 'Ì' | 'Í' | 'Î' | 'Ï' => out.push('i'),
             'ò' | 'ó' | 'ô' | 'ö' | 'õ' | 'Ò' | 'Ó' | 'Ô' | 'Ö' | 'Õ' => out.push('o'),
@@ -142,7 +144,9 @@ fn split_num_rep(tok: &str) -> (String, String) {
         i += 1;
     }
     let num = tok[..i].to_string();
-    let rep = tok[i..].trim_matches(|c: char| !c.is_alphanumeric()).to_ascii_lowercase();
+    let rep = tok[i..]
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_ascii_lowercase();
     (num, rep)
 }
 

@@ -82,12 +82,12 @@ impl TripRt {
 
     pub fn stop_update_by_stop_id(&self, stop_id: &str) -> Option<&StopTimeRt> {
         self.stop_updates.values().find(|s| {
-            s.stop_id
-                .as_deref()
-                .is_some_and(|id| id == stop_id || id.ends_with(&format!(":{stop_id}")) || {
+            s.stop_id.as_deref().is_some_and(|id| {
+                id == stop_id || id.ends_with(&format!(":{stop_id}")) || {
                     // raw id match if stored namespaced
                     id.rsplit_once(':').map(|(_, r)| r) == Some(stop_id)
-                })
+                }
+            })
         })
     }
 
@@ -204,7 +204,10 @@ impl TripRt {
             delay_secs,
             skipped,
             canceled,
-            has_rt: delay.is_some() || skipped || canceled || self.find_stop_update(stop_sequence, stop_id).is_some(),
+            has_rt: delay.is_some()
+                || skipped
+                || canceled
+                || self.find_stop_update(stop_sequence, stop_id).is_some(),
         }
     }
 }
@@ -513,8 +516,13 @@ impl FeedRtState {
                 push_idx(i);
             }
         }
-        for key in [route_id, route_id.rsplit_once(':').map(|(_, t)| t).unwrap_or(route_id)]
-        {
+        for key in [
+            route_id,
+            route_id
+                .rsplit_once(':')
+                .map(|(_, t)| t)
+                .unwrap_or(route_id),
+        ] {
             if let Some(idxs) = self.alert_index.by_route.get(key) {
                 for &i in idxs {
                     push_idx(i);
@@ -665,10 +673,7 @@ impl RealtimeOverlay {
 
         if let Some(epoch) = epoch {
             for alias_key in epoch.siri_trip_aliases.keys_for_trip(trip_id) {
-                let candidates = [
-                    alias_key.to_string(),
-                    format!("{feed}:{alias_key}"),
-                ];
+                let candidates = [alias_key.to_string(), format!("{feed}:{alias_key}")];
                 for key in candidates {
                     if let Some(t) = self.get_trip(&key) {
                         return Some(t);
@@ -698,10 +703,7 @@ impl RealtimeOverlay {
         let feed = Self::feed_of(static_trip_id)?;
         if let Some(epoch) = epoch {
             for alias_key in epoch.siri_trip_aliases.keys_for_trip(static_trip_id) {
-                let candidates = [
-                    alias_key.to_string(),
-                    format!("{feed}:{alias_key}"),
-                ];
+                let candidates = [alias_key.to_string(), format!("{feed}:{alias_key}")];
                 for key in candidates {
                     if self.get_trip(&key).is_some() {
                         return Some(key);
@@ -887,10 +889,7 @@ fn max_opt(a: Option<i64>, b: Option<i64>) -> Option<i64> {
 /// Synthetic map key for trip updates without `trip_id`.
 fn incomplete_trip_key(feed_id: &str, trip: &TripRt) -> String {
     let route = trip.route_id.as_deref().unwrap_or("");
-    let dir = trip
-        .direction_id
-        .map(|d| d.to_string())
-        .unwrap_or_default();
+    let dir = trip.direction_id.map(|d| d.to_string()).unwrap_or_default();
     let sd = trip.start_date.as_deref().unwrap_or("");
     let st = trip.start_time.as_deref().unwrap_or("");
     format!("{feed_id}:#r={route}&d={dir}&sd={sd}&st={st}")
@@ -962,10 +961,7 @@ mod tests {
         // No stop-level delay → trip delay
         assert_eq!(t.arrival_delay_secs(Some(99), None), Some(60));
         // By stop_id
-        assert_eq!(
-            t.arrival_delay_secs(None, Some("sncf:STOP_A")),
-            Some(120)
-        );
+        assert_eq!(t.arrival_delay_secs(None, Some("sncf:STOP_A")), Some(120));
         assert_eq!(t.arrival_delay_secs(None, Some("STOP_A")), Some(120));
     }
 

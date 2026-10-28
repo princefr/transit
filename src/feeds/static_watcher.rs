@@ -145,6 +145,7 @@ async fn try_load_initial(
     check_and_update(feed, data_dir, client, timeout, build_sem, tx).await
 }
 
+#[allow(clippy::ptr_arg)] // owned clones move into spawn_blocking
 async fn check_and_update(
     feed: &FeedConfig,
     data_dir: &PathBuf,

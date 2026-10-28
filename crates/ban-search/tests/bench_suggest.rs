@@ -103,7 +103,12 @@ fn bench_suggest() {
     let mut rows: Vec<(u128, &str)> = QUERIES
         .iter()
         .zip(&per_query)
-        .map(|(q, ds)| (ds.iter().map(|d| d.as_nanos()).sum::<u128>() / iters as u128, *q))
+        .map(|(q, ds)| {
+            (
+                ds.iter().map(|d| d.as_nanos()).sum::<u128>() / iters as u128,
+                *q,
+            )
+        })
         .collect();
     rows.sort_unstable_by_key(|a| std::cmp::Reverse(a.0));
     for (us, q) in rows.iter().take(10) {

@@ -1,9 +1,11 @@
+#![allow(deprecated)] // fixtures build pb::Alert, whose active_period is marked deprecated in the proto
 //! Quality / edge-case e2e: alerts (lang + HTML + dedupe), display labels,
 //! multi-stop access for same-complex transfers, tiny GTFS itinerary.
 
 use chrono::{TimeZone, Utc};
 use std::io::{Cursor, Write};
 use std::sync::Arc;
+use transit::api::graphql::{compute_display_label, humanize_rt_ref, map_alert};
 use transit::gtfs::pack::build_epoch;
 use transit::gtfs::parse::load_gtfs_bytes;
 use transit::routing::{plan_journeys, ItineraryQuery};
@@ -12,7 +14,6 @@ use transit::rt::alert_text::{
 };
 use transit::rt::decode::apply_service_alerts;
 use transit::rt::overlay::{AlertRt, FeedRtState};
-use transit::api::graphql::{compute_display_label, humanize_rt_ref, map_alert};
 use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
 
@@ -92,11 +93,11 @@ fn query(from: &str, to: &str) -> ItineraryQuery {
         rt_adjust: Default::default(),
         wheelchair: false,
         osrm_url: None,
-            bike_from: false,
-            bike_to: false,
-            bike_speed_m_s: 4.2,
-            max_bike_meters: 5000,
-            use_tbr: false,
+        bike_from: false,
+        bike_to: false,
+        bike_speed_m_s: 4.2,
+        max_bike_meters: 5000,
+        use_tbr: false,
     }
 }
 
@@ -296,10 +297,7 @@ fn e2e_alert_text_unit_helpers() {
         .as_deref(),
         Some("Bonjour")
     );
-    assert_eq!(
-        clean_alert_text("<p>Hi<br/>there</p>"),
-        "Hi there"
-    );
+    assert_eq!(clean_alert_text("<p>Hi<br/>there</p>"), "Hi there");
     assert!(alert_active_now(&[(Some(0), Some(i64::MAX))], 100));
 }
 

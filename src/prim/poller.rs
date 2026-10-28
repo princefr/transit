@@ -180,7 +180,11 @@ impl DailyQuota {
                 .is_ok()
         {
             self.used.store(0, Ordering::SeqCst);
-            info!(quota = self.name, budget = self.budget(), "PRIM daily quota reset");
+            info!(
+                quota = self.name,
+                budget = self.budget(),
+                "PRIM daily quota reset"
+            );
         }
     }
 
@@ -226,8 +230,12 @@ fn et_batch_size(quota: &DailyQuota, max_per_tick: u32) -> usize {
 
 /// Compact key for the current calendar day in Europe/Paris.
 fn paris_day_ordinal() -> u32 {
-    let d = Utc::now().with_timezone(&chrono_tz::Europe::Paris).date_naive();
-    (d.year() as u32).wrapping_mul(400).wrapping_add(d.ordinal())
+    let d = Utc::now()
+        .with_timezone(&chrono_tz::Europe::Paris)
+        .date_naive();
+    (d.year() as u32)
+        .wrapping_mul(400)
+        .wrapping_add(d.ordinal())
 }
 
 // ---------------------------------------------------------------------------
@@ -430,8 +438,8 @@ pub fn register_viewport_live_interest(
     let mid_lat = (min_lat + max_lat) * 0.5;
     let mid_lon = (min_lon + max_lon) * 0.5;
     // Approx radius from center to corner (m)
-    let radius = crate::link::geo::haversine_m(mid_lat, mid_lon, max_lat, max_lon)
-        .clamp(200.0, 6_000.0);
+    let radius =
+        crate::link::geo::haversine_m(mid_lat, mid_lon, max_lat, max_lon).clamp(200.0, 6_000.0);
     // Soft SM interest near viewport center
     register_nearby_sm_interest(epoch, mid_lat, mid_lon, radius, 12);
 
@@ -468,7 +476,7 @@ pub fn register_viewport_live_interest(
         }
     }
     let mut ranked: Vec<_> = line_tokens.into_iter().collect();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    ranked.sort_by_key(|r| std::cmp::Reverse(r.1));
     for (token, _) in ranked.into_iter().take(40) {
         // Default list uses STIF:Line::TOKEN:
         let lr = if token.starts_with("STIF:") {
@@ -498,7 +506,9 @@ fn extract_stif_line_token(route_id: &str) -> Option<String> {
         let p = part.to_ascii_uppercase();
         if p.len() >= 5
             && p.starts_with('C')
-            && p.chars().skip(1).all(|c| c.is_ascii_digit() || c.is_ascii_alphanumeric())
+            && p.chars()
+                .skip(1)
+                .all(|c| c.is_ascii_digit() || c.is_ascii_alphanumeric())
         {
             return Some(p);
         }
@@ -621,8 +631,8 @@ impl TripAccum {
         for (k, v) in incoming {
             self.trips.insert(k, (v, now));
         }
-        let max_age = chrono::Duration::from_std(self.max_age)
-            .unwrap_or_else(|_| chrono::Duration::hours(1));
+        let max_age =
+            chrono::Duration::from_std(self.max_age).unwrap_or_else(|_| chrono::Duration::hours(1));
         let seen_cutoff = now - max_age;
         let past_cutoff = now.timestamp() - ACCUM_TRIP_PAST_GRACE_SECS;
         self.trips.retain(|_, (t, seen)| {
@@ -715,10 +725,7 @@ impl VehicleAccum {
         self.vehicles.retain(|_, v| v.updated_at >= cutoff);
         if self.vehicles.len() > ACCUM_VEHICLES_CAP {
             let drop_n = self.vehicles.len() - ACCUM_VEHICLES_CAP;
-            let drop = oldest_keys(
-                self.vehicles.iter().map(|(k, v)| (k, v.updated_at)),
-                drop_n,
-            );
+            let drop = oldest_keys(self.vehicles.iter().map(|(k, v)| (k, v.updated_at)), drop_n);
             for k in drop {
                 self.vehicles.remove(&k);
             }
@@ -759,7 +766,10 @@ fn resolve_seed_stops(cfg: &PrimConfig) -> Vec<String> {
             .filter(|s| !s.is_empty())
             .collect();
     }
-    DEFAULT_SEED_STOPS.iter().map(|s| (*s).to_string()).collect()
+    DEFAULT_SEED_STOPS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
 }
 
 /// Spawn continuous SIRI Lite pollers when config + API key allow.
@@ -1203,10 +1213,7 @@ async fn run_siri_sm_poller(
 
     loop {
         if backoff > Duration::ZERO {
-            warn!(
-                secs = backoff.as_secs(),
-                "PRIM SIRI SM rate-limit backoff"
-            );
+            warn!(secs = backoff.as_secs(), "PRIM SIRI SM rate-limit backoff");
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 _ = tokio::time::sleep(backoff) => {}
@@ -1360,8 +1367,9 @@ pub fn spawn_prim_poller(
         info!("PRIM catalog stub (SIRI SM/ET/GM via spawn_prim_pollers)");
         loop {
             prim.store(Arc::new(PrimCatalog {
-                note: "SIRI Lite continuous: stop-monitoring + estimated-timetable + general-message"
-                    .into(),
+                note:
+                    "SIRI Lite continuous: stop-monitoring + estimated-timetable + general-message"
+                        .into(),
                 fetched_at: Some(Utc::now()),
                 error: None,
             }));
@@ -1457,7 +1465,10 @@ mod tests {
         let mut acc = TripAccum::new(Duration::from_secs(30 * 60));
         let mut first = HashMap::new();
         first.insert("a".to_string(), TripRt::default());
-        first.insert("done".to_string(), trip_ending_at(t0.timestamp() - 3 * 3600));
+        first.insert(
+            "done".to_string(),
+            trip_ending_at(t0.timestamp() - 3 * 3600),
+        );
         acc.merge_at(first, t0);
         assert!(acc.trips.contains_key("a"));
         assert!(!acc.trips.contains_key("done"), "ended > 2h ago");
@@ -1560,7 +1571,7 @@ mod tests {
         );
         // Seeds stay tiny on purpose (PRIM short-term rate limit / 429).
         assert!(
-            DEFAULT_SEED_STOPS.len() >= 1 && DEFAULT_SEED_STOPS.len() <= 8,
+            !DEFAULT_SEED_STOPS.is_empty() && DEFAULT_SEED_STOPS.len() <= 8,
             "expect small hub seed set, got {}",
             DEFAULT_SEED_STOPS.len()
         );

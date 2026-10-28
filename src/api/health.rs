@@ -7,9 +7,7 @@ use std::sync::Arc;
 pub async fn health(Extension(state): Extension<Arc<AppState>>) -> Json<Value> {
     let epoch = state.load_epoch();
     let rt = state.load_rt();
-    let cache_key = state
-        .cache
-        .health_key(&epoch.id, rt.version);
+    let cache_key = state.cache.health_key(&epoch.id, rt.version);
 
     if let Some(cached) = state.cache.get_health(&cache_key).await {
         return Json(cached);

@@ -368,8 +368,9 @@ fn apply_rt_delta(
                 }
                 evict_stale_trips(entry, seen, now);
                 entry.trip_update_count = entry.trips.len();
-                entry.trip_updates_fetched_at =
-                    state.trip_updates_fetched_at.or(entry.trip_updates_fetched_at);
+                entry.trip_updates_fetched_at = state
+                    .trip_updates_fetched_at
+                    .or(entry.trip_updates_fetched_at);
                 entry.header_timestamp = state.header_timestamp.or(entry.header_timestamp);
             } else {
                 seen.trips.clear();
@@ -396,11 +397,8 @@ fn apply_rt_delta(
         RtKind::ServiceAlerts => {
             if merge {
                 // Upsert by alert key
-                let mut by_id: HashMap<String, AlertRt> = entry
-                    .alerts
-                    .drain(..)
-                    .map(|a| (a.merge_key(), a))
-                    .collect();
+                let mut by_id: HashMap<String, AlertRt> =
+                    entry.alerts.drain(..).map(|a| (a.merge_key(), a)).collect();
                 for a in state.alerts {
                     let k = a.merge_key();
                     seen.alerts.insert(k.clone(), now);
@@ -643,11 +641,8 @@ fn rebuild_epoch(
     }
     // Preliminary epoch only provides coordinates for hub linking — skip the
     // expensive flag preprocessing entirely.
-    let preliminary = build_epoch_with_flash(
-        list.clone(),
-        vec![],
-        crate::gtfs::pack::FlashMode::Skip,
-    );
+    let preliminary =
+        build_epoch_with_flash(list.clone(), vec![], crate::gtfs::pack::FlashMode::Skip);
     // Hub-link stations **and** monomodal/boardable places so the walk graph is complete
     // (IDFM monomodals are often location_type=0 with trips — still transfer nodes).
     let stop_coords: Vec<(Option<f64>, Option<f64>, bool)> = preliminary
@@ -691,11 +686,7 @@ fn rebuild_epoch(
     } else {
         hub
     };
-    let epoch = build_epoch_with_flash(
-        list,
-        hub,
-        crate::gtfs::pack::FlashMode::Persist(flash_dir),
-    );
+    let epoch = build_epoch_with_flash(list, hub, crate::gtfs::pack::FlashMode::Persist(flash_dir));
     crate::gtfs::load_progress::set_phase(crate::gtfs::load_progress::PHASE_READY);
     info!(
         epoch_id = %epoch.id,
@@ -819,7 +810,14 @@ mod tests {
             trip_ending_at(now.timestamp() - 5 * 3600),
         )]);
         delta.trip_update_count = 1;
-        apply_rt_delta(&mut entry, &mut seen, RtKind::TripUpdates, delta, false, now);
+        apply_rt_delta(
+            &mut entry,
+            &mut seen,
+            RtKind::TripUpdates,
+            delta,
+            false,
+            now,
+        );
         assert!(entry.trips.contains_key("gtfs:old"));
         assert!(seen.trips.is_empty());
     }
@@ -834,7 +832,14 @@ mod tests {
             .vehicles
             .insert("old".into(), vehicle(now - chrono::Duration::minutes(20)));
         delta.vehicles.insert("new".into(), vehicle(now));
-        apply_rt_delta(&mut entry, &mut seen, RtKind::VehiclePositions, delta, true, now);
+        apply_rt_delta(
+            &mut entry,
+            &mut seen,
+            RtKind::VehiclePositions,
+            delta,
+            true,
+            now,
+        );
         assert_eq!(entry.vehicles.keys().collect::<Vec<_>>(), vec!["new"]);
         assert_eq!(entry.vehicle_count, 1);
     }
@@ -851,7 +856,14 @@ mod tests {
             alert("open", None),
             alert("future_end", Some(ts + 3600)),
         ];
-        apply_rt_delta(&mut entry, &mut seen, RtKind::ServiceAlerts, delta, true, t0);
+        apply_rt_delta(
+            &mut entry,
+            &mut seen,
+            RtKind::ServiceAlerts,
+            delta,
+            true,
+            t0,
+        );
         let mut ids: Vec<_> = entry.alerts.iter().map(|a| a.id.as_str()).collect();
         ids.sort();
         assert_eq!(ids, vec!["future_end", "open"]);
@@ -860,7 +872,14 @@ mod tests {
         let t1 = t0 + chrono::Duration::hours(7);
         let mut delta = FeedRtState::new("idfm");
         delta.alerts = vec![alert("open", None)];
-        apply_rt_delta(&mut entry, &mut seen, RtKind::ServiceAlerts, delta, true, t1);
+        apply_rt_delta(
+            &mut entry,
+            &mut seen,
+            RtKind::ServiceAlerts,
+            delta,
+            true,
+            t1,
+        );
         let ids: Vec<_> = entry.alerts.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, vec!["open"]);
         assert_eq!(entry.alert_count, 1);
@@ -873,7 +892,10 @@ mod tests {
         ages.insert("c".to_string(), now);
         ages.insert("a".to_string(), now - chrono::Duration::minutes(10));
         ages.insert("b".to_string(), now - chrono::Duration::minutes(5));
-        assert_eq!(oldest_keys(&ages, 2), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            oldest_keys(&ages, 2),
+            vec!["a".to_string(), "b".to_string()]
+        );
     }
 
     #[test]

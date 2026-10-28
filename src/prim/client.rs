@@ -7,6 +7,9 @@ use std::time::Duration;
 
 pub const DEFAULT_BASE_URL: &str = "https://prim.iledefrance-mobilites.fr";
 
+/// Upper bound on a single PRIM SIRI Lite response body (ET for a busy line is a few MiB).
+const MAX_PRIM_BODY_BYTES: u64 = 32 * 1024 * 1024;
+
 #[derive(Clone)]
 pub struct PrimClient {
     http: reqwest::Client,
@@ -98,17 +101,18 @@ impl PrimClient {
             .get(&url)
             .header("apikey", &self.api_key)
             .header(reqwest::header::USER_AGENT, &self.user_agent)
-            .header(reqwest::header::ACCEPT, "application/json, application/xml, */*")
+            .header(
+                reqwest::header::ACCEPT,
+                "application/json, application/xml, */*",
+            )
             .timeout(self.timeout)
             .send()
             .await
             .map_err(|e| TransitError::Http(format!("PRIM GET {url}: {e}")))?;
         let status = resp.status();
-        let bytes = resp
-            .bytes()
+        let bytes = crate::feeds::download::read_body_capped(resp, &url, MAX_PRIM_BODY_BYTES)
             .await
-            .map_err(|e| TransitError::Http(format!("PRIM body {url}: {e}")))?
-            .to_vec();
+            .map_err(|e| TransitError::Http(format!("PRIM body {url}: {e}")))?;
         if !status.is_success() {
             let hint = String::from_utf8_lossy(&bytes[..bytes.len().min(200)]);
             return Err(TransitError::Http(format!(

@@ -273,7 +273,7 @@ pub fn humanize_rt_ref(raw: &str) -> Option<String> {
         "S",
     ];
     let parts: Vec<&str> = raw
-        .split(|c| c == ':' || c == '/' || c == '@')
+        .split([':', '/', '@'])
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .collect();
@@ -384,8 +384,15 @@ pub fn compute_map_label(
     let long_upper = long.to_ascii_uppercase();
 
     if long_upper.contains("RER ") || long_upper.starts_with("RER") {
-        if let Some(rest) = long.strip_prefix("RER").or_else(|| long.strip_prefix("rer")) {
-            let letter = rest.trim().chars().next().filter(|c| c.is_ascii_alphabetic());
+        if let Some(rest) = long
+            .strip_prefix("RER")
+            .or_else(|| long.strip_prefix("rer"))
+        {
+            let letter = rest
+                .trim()
+                .chars()
+                .next()
+                .filter(|c| c.is_ascii_alphabetic());
             if let Some(l) = letter {
                 return format!("RER {}", l.to_ascii_uppercase());
             }
@@ -444,19 +451,14 @@ pub fn compute_map_label(
         }
     }
 
-    if matches!(mode, Some(Mode::Bus) | Some(Mode::Coach)) && !route.is_empty() {
-        if !route.starts_with('C') || route.len() > 6 {
-            return format!("Bus {route}");
-        }
+    if matches!(mode, Some(Mode::Bus) | Some(Mode::Coach))
+        && !route.is_empty()
+        && (!route.starts_with('C') || route.len() > 6)
+    {
+        return format!("Bus {route}");
     }
 
-    compute_display_label(
-        trip_short_name,
-        label,
-        route_short_name,
-        headsign,
-        trip_id,
-    )
+    compute_display_label(trip_short_name, label, route_short_name, headsign, trip_id)
 }
 
 fn finish_display_label(out: &mut VehiclePosition) {
@@ -644,7 +646,10 @@ pub fn synthetic_vehicle_from_trip_update(
     }
     let su = best?;
     let (lat, lon, stop_id) = resolve_synthetic_stop(epoch, feed_id, trip_key, su)?;
-    let base_key = trip_key.rsplit_once('@').map(|(b, _)| b).unwrap_or(trip_key);
+    let base_key = trip_key
+        .rsplit_once('@')
+        .map(|(b, _)| b)
+        .unwrap_or(trip_key);
     Some(VehiclePos {
         trip_id: Some(base_key.to_string()),
         lat,
@@ -658,7 +663,7 @@ pub fn synthetic_vehicle_from_trip_update(
         license_plate: None,
         occupancy: None,
         current_status: Some("ESTIMATED_FROM_TRIP_UPDATE".into()),
-        current_stop_sequence: Some(su.stop_sequence as u32),
+        current_stop_sequence: Some(su.stop_sequence),
         congestion: None,
         occupancy_percentage: None,
     })
@@ -687,7 +692,10 @@ fn resolve_synthetic_stop(
             }
         }
     }
-    let base = trip_key.rsplit_once('@').map(|(b, _)| b).unwrap_or(trip_key);
+    let base = trip_key
+        .rsplit_once('@')
+        .map(|(b, _)| b)
+        .unwrap_or(trip_key);
     let &trip_idx = epoch.trip_id_to_idx.get(base)?;
     let trip = epoch.trips.get(trip_idx as usize)?;
     for off in 0..trip.stop_time_len {
@@ -736,9 +744,8 @@ pub fn apply_trip_enrichment(
             first_departure_utc: first_dep,
         }
     });
-    let trip = crate::gtfs::resolve_static_trip(epoch, base, hint.as_ref()).or_else(|| {
-        crate::gtfs::resolve_static_trip(epoch, trip_id, hint.as_ref())
-    });
+    let trip = crate::gtfs::resolve_static_trip(epoch, base, hint.as_ref())
+        .or_else(|| crate::gtfs::resolve_static_trip(epoch, trip_id, hint.as_ref()));
     let Some(trip) = trip else {
         // No static trip match: still expose a human line/journey fragment.
         if out.feed_id.is_none() {
@@ -881,11 +888,23 @@ mod display_label_tests {
     #[test]
     fn prefer_label_then_route_headsign() {
         assert_eq!(
-            compute_display_label(None, Some("12 → Châtelet"), Some("12"), Some("Châtelet"), None),
+            compute_display_label(
+                None,
+                Some("12 → Châtelet"),
+                Some("12"),
+                Some("Châtelet"),
+                None
+            ),
             "12 → Châtelet"
         );
         assert_eq!(
-            compute_display_label(None, None, Some("RER A"), Some("Cergy-le-Haut terminus"), None),
+            compute_display_label(
+                None,
+                None,
+                Some("RER A"),
+                Some("Cergy-le-Haut terminus"),
+                None
+            ),
             "RER A → Cergy-le-Haut terminus"
         );
         assert_eq!(
@@ -910,10 +929,7 @@ mod display_label_tests {
             ),
             "99"
         );
-        assert_eq!(
-            compute_display_label(None, None, None, None, None),
-            "train"
-        );
+        assert_eq!(compute_display_label(None, None, None, None, None), "train");
     }
 }
 
@@ -985,14 +1001,9 @@ pub fn map_alert(a: &AlertRt) -> Alert {
 }
 
 /// Map an alert and resolve affected lines from the static epoch when available.
-pub fn map_alert_enriched(
-    a: &AlertRt,
-    epoch: Option<&crate::gtfs::pack::StaticEpoch>,
-) -> Alert {
+pub fn map_alert_enriched(a: &AlertRt, epoch: Option<&crate::gtfs::pack::StaticEpoch>) -> Alert {
     use chrono::TimeZone;
-    let ts = |secs: Option<i64>| {
-        secs.and_then(|s| Utc.timestamp_opt(s, 0).single())
-    };
+    let ts = |secs: Option<i64>| secs.and_then(|s| Utc.timestamp_opt(s, 0).single());
     let active_start = ts(a.active_start);
     let active_end = ts(a.active_end);
     let active_periods = if a.active_start.is_some() || a.active_end.is_some() {
@@ -1068,11 +1079,7 @@ pub fn resolve_traffic_lines(
     // Always merge lines mentioned in free text. IDFM GeneralMessage is often
     // polled per LineRef (so informed_route_ids is only "4"), while the body
     // also cites "RER B et RER D" — badges should show every product.
-    let blob = format!(
-        "{} {}",
-        header.unwrap_or(""),
-        description.unwrap_or("")
-    );
+    let blob = format!("{} {}", header.unwrap_or(""), description.unwrap_or(""));
     for line in lines_from_alert_text(&blob) {
         push(&mut out, &mut seen_short, line);
     }
@@ -1097,9 +1104,7 @@ fn resolve_one_route_line(
                     || id.ends_with(route_ref)
                     || route_ref.ends_with(id)
                     || (!token.is_empty()
-                        && (id.contains(&token)
-                            || r.id.contains(&token)
-                            || id.ends_with(&token)));
+                        && (id.contains(&token) || r.id.contains(&token) || id.ends_with(&token)));
                 if !matches {
                     continue;
                 }
@@ -1110,7 +1115,8 @@ fn resolve_one_route_line(
                 } else {
                     humanize_rt_ref(id).unwrap_or_else(|| id.clone())
                 };
-                let (color, text_color) = line_colors_for(&short, r.color.clone(), r.text_color.clone());
+                let (color, text_color) =
+                    line_colors_for(&short, r.color.clone(), r.text_color.clone());
                 return Some(TrafficLine {
                     route_id: id.clone(),
                     short_name: short,
@@ -1122,16 +1128,13 @@ fn resolve_one_route_line(
         }
         // Trip table may have short_name when routes map is sparse.
         for t in &epoch.trips {
-            if !token.is_empty()
-                && (t.route_id.contains(&token) || t.route_id.ends_with(&token))
-            {
+            if !token.is_empty() && (t.route_id.contains(&token) || t.route_id.ends_with(&token)) {
                 let short = if !t.route_short_name.is_empty() {
                     t.route_short_name.clone()
                 } else {
                     token.clone()
                 };
-                let (color, text_color) =
-                    line_colors_for(&short, t.route_color.clone(), None);
+                let (color, text_color) = line_colors_for(&short, t.route_color.clone(), None);
                 return Some(TrafficLine {
                     route_id: t.route_id.clone(),
                     short_name: short,
@@ -1439,7 +1442,12 @@ pub fn trip_realtime_for_with_epoch(
             let epoch = epoch?;
             let updated = Utc::now();
             let pos = synthetic_vehicle_from_trip_update(feed, trip_id, trip, epoch, updated)?;
-            Some(map_vehicle_enriched(&pos, Some(feed), Some(epoch), Some(trip)))
+            Some(map_vehicle_enriched(
+                &pos,
+                Some(feed),
+                Some(epoch),
+                Some(trip),
+            ))
         });
     let alerts = rt
         .alerts_for_trip(trip_id)
@@ -1895,12 +1903,7 @@ pub fn map_place(p: &CorePlace) -> Place {
 }
 
 fn stop_ref_to_gql(sr: &crate::routing::journey::StopRef) -> GqlStop {
-    let feed_id = sr
-        .stop_id
-        .split(':')
-        .next()
-        .unwrap_or("")
-        .to_string();
+    let feed_id = sr.stop_id.split(':').next().unwrap_or("").to_string();
     GqlStop {
         id: ID(sr.stop_id.clone()),
         feed_id,

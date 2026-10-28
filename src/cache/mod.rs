@@ -7,8 +7,7 @@ mod dto;
 
 use crate::config::RedisConfig;
 use dto::{
-    CachedAddressSuggestion, CachedPlaceSuggestion, CachedStop, CachedStopConnection,
-    CachedVehicle,
+    CachedAddressSuggestion, CachedPlaceSuggestion, CachedStop, CachedStopConnection, CachedVehicle,
 };
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
@@ -117,12 +116,8 @@ impl TransitCache {
         near: Option<&NearInput>,
         limit: i32,
     ) -> String {
-        let near_part = near.map(|n| {
-            format!(
-                "near:{:.5}:{:.5}:{:.0}",
-                n.lat, n.lon, n.radius_meters
-            )
-        });
+        let near_part =
+            near.map(|n| format!("near:{:.5}:{:.5}:{:.0}", n.lat, n.lon, n.radius_meters));
         let digest = hash_parts(&[
             normalize_search_key(search),
             near_part.unwrap_or_default(),
@@ -195,12 +190,8 @@ impl TransitCache {
             names.sort();
             names.join(",")
         });
-        let near_part = near.map(|n| {
-            format!(
-                "near:{:.4}:{:.4}:{:.0}",
-                n.lat, n.lon, n.radius_meters
-            )
-        });
+        let near_part =
+            near.map(|n| format!("near:{:.4}:{:.4}:{:.0}", n.lat, n.lon, n.radius_meters));
         let bbox_part = bbox.map(|b| {
             format!(
                 "bbox:{:.3}:{:.3}:{:.3}:{:.3}",
@@ -326,9 +317,7 @@ impl TransitCache {
             }
         };
         self.inner.connected.store(true, Ordering::Relaxed);
-        let Some(raw) = raw else {
-            return None;
-        };
+        let raw = raw?;
         match serde_json::from_str(&raw) {
             Ok(v) => {
                 debug!(key, "redis cache hit");

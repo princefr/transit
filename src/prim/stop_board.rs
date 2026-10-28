@@ -12,9 +12,9 @@ use std::time::{Duration, Instant};
 use super::client::PrimClient;
 use crate::error::{Result, TransitError};
 use crate::gtfs::pack::{RouteMode, StaticEpoch, StopRecord};
-use crate::state::AppState;
 use crate::rt::adapter::ingest_siri_stop_monitoring;
 use crate::rt::overlay::FeedRtState;
+use crate::state::AppState;
 
 /// One live departure row for GraphQL / UI.
 #[derive(Debug, Clone)]
@@ -74,7 +74,10 @@ pub fn monitoring_ref_from_stop_id(stop_id: &str) -> Option<String> {
         return Some(format!("STIF:StopPoint:Q:{raw}:"));
     }
     // IDFM:12345 style quay
-    if let Some(rest) = raw.strip_prefix("IDFM:").or_else(|| raw.strip_prefix("idfm:")) {
+    if let Some(rest) = raw
+        .strip_prefix("IDFM:")
+        .or_else(|| raw.strip_prefix("idfm:"))
+    {
         if rest.chars().all(|c| c.is_ascii_digit()) && rest.len() >= 4 {
             return Some(format!("STIF:StopPoint:Q:{rest}:"));
         }
@@ -105,9 +108,11 @@ fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
 }
 
 fn ref_val(v: &Value) -> Option<String> {
-    v.as_str()
-        .map(|s| s.to_string())
-        .or_else(|| v.get("value").and_then(|x| x.as_str()).map(|s| s.to_string()))
+    v.as_str().map(|s| s.to_string()).or_else(|| {
+        v.get("value")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string())
+    })
 }
 
 fn text_first(v: &Value) -> Option<String> {
@@ -116,7 +121,10 @@ fn text_first(v: &Value) -> Option<String> {
     }
     if let Some(arr) = v.as_array() {
         for it in arr {
-            if let Some(s) = it.as_str().or_else(|| it.get("value").and_then(|x| x.as_str())) {
+            if let Some(s) = it
+                .as_str()
+                .or_else(|| it.get("value").and_then(|x| x.as_str()))
+            {
                 return Some(s.to_string());
             }
         }
@@ -214,7 +222,8 @@ impl TokenBucket {
 fn on_demand_try_take() -> bool {
     let now = Instant::now();
     let mut g = ON_DEMAND_BUCKET.lock().unwrap_or_else(|e| e.into_inner());
-    g.get_or_insert_with(|| TokenBucket::full(now)).try_take(now)
+    g.get_or_insert_with(|| TokenBucket::full(now))
+        .try_take(now)
 }
 
 /// Register the live static-epoch handle so on-demand lookups can be validated.
@@ -231,8 +240,7 @@ pub fn shared_client(state: &AppState) -> Option<Arc<PrimClient>> {
     state
         .prim_client
         .get_or_init(|| {
-            let timeout =
-                Duration::from_secs(state.config.runtime.rt_request_timeout_secs.max(10));
+            let timeout = Duration::from_secs(state.config.runtime.rt_request_timeout_secs.max(10));
             PrimClient::from_env(
                 &state.config.prim.base_url,
                 &state.config.prim.api_key_env,
@@ -480,11 +488,17 @@ async fn fetch_live_board_uncached(
 
             let call = mvj.get("MonitoredCall");
             let exp = call
-                .and_then(|c| c.get("ExpectedDepartureTime").or_else(|| c.get("ExpectedArrivalTime")))
+                .and_then(|c| {
+                    c.get("ExpectedDepartureTime")
+                        .or_else(|| c.get("ExpectedArrivalTime"))
+                })
                 .and_then(|x| x.as_str())
                 .and_then(parse_ts);
             let aimed = call
-                .and_then(|c| c.get("AimedDepartureTime").or_else(|| c.get("AimedArrivalTime")))
+                .and_then(|c| {
+                    c.get("AimedDepartureTime")
+                        .or_else(|| c.get("AimedArrivalTime"))
+                })
                 .and_then(|x| x.as_str())
                 .and_then(parse_ts);
             let status = call
@@ -501,7 +515,10 @@ async fn fetch_live_board_uncached(
             };
             let when = exp.or(aimed).unwrap_or_else(Utc::now);
             let platform = call
-                .and_then(|c| c.get("DeparturePlatformName").or_else(|| c.get("ArrivalPlatformName")))
+                .and_then(|c| {
+                    c.get("DeparturePlatformName")
+                        .or_else(|| c.get("ArrivalPlatformName"))
+                })
                 .and_then(text_first);
 
             out.push(LiveDeparture {
@@ -564,7 +581,9 @@ fn crate_url_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 2);
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }

@@ -10,7 +10,7 @@
 //! `[[lat, lon], ...]` or a list of `{lat, lon}` objects and document the order
 //! for map clients.
 
-use crate::gtfs::pack::{PackedStopTime, StopRecord, TripRecord, StaticEpoch};
+use crate::gtfs::pack::{PackedStopTime, StaticEpoch, StopRecord, TripRecord};
 use crate::link::geo::haversine_m;
 use crate::routing::journey::Leg;
 use std::collections::HashMap;
@@ -203,7 +203,9 @@ pub fn trip_shape_dist_affine(
     let mut first: Option<(f64, (f64, f64))> = None;
     let mut last: Option<(f64, (f64, f64))> = None;
     for off in 0..trip.stop_time_len {
-        let st = epoch.stop_times.get((trip.stop_time_start + off) as usize)?;
+        let st = epoch
+            .stop_times
+            .get((trip.stop_time_start + off) as usize)?;
         let Some(d) = st.shape_dist_traveled else {
             continue;
         };
@@ -272,7 +274,10 @@ pub fn backfill_shape_dist_traveled(
         let Some(sts) = stop_times.get_mut(start..end) else {
             continue;
         };
-        let missing = sts.iter().filter(|st| st.shape_dist_traveled.is_none()).count();
+        let missing = sts
+            .iter()
+            .filter(|st| st.shape_dist_traveled.is_none())
+            .count();
         if missing == 0 {
             continue;
         }
@@ -468,7 +473,9 @@ pub fn journey_geometry(legs: &[Leg]) -> Vec<[f64; 2]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gtfs::pack::{GlobalTrip, PackedStopTime, RouteMode, StaticEpoch, StopRecord, TripRecord};
+    use crate::gtfs::pack::{
+        GlobalTrip, PackedStopTime, RouteMode, StaticEpoch, StopRecord, TripRecord,
+    };
     use std::collections::HashMap;
 
     fn stop(id: &str, lat: f64, lon: f64) -> StopRecord {
@@ -486,9 +493,9 @@ mod tests {
             stop_code: None,
             stop_desc: None,
             level_id: None,
-        zone_id: None,
-        stop_url: None,
-        stop_timezone: None,
+            zone_id: None,
+            stop_url: None,
+            stop_timezone: None,
         }
     }
 
@@ -533,8 +540,8 @@ mod tests {
                 pickup_type: 0,
                 drop_off_type: 0,
                 stop_headsign_idx: 0,
-            timepoint: 1,
-            shape_dist_traveled: None,
+                timepoint: 1,
+                shape_dist_traveled: None,
             },
             PackedStopTime {
                 stop_idx: 1,
@@ -544,8 +551,8 @@ mod tests {
                 pickup_type: 0,
                 drop_off_type: 0,
                 stop_headsign_idx: 0,
-            timepoint: 1,
-            shape_dist_traveled: None,
+                timepoint: 1,
+                shape_dist_traveled: None,
             },
         ];
         epoch.trips = vec![base_trip(None, 2)];
@@ -570,10 +577,8 @@ mod tests {
 
     #[test]
     fn backfill_shape_dist_from_geometry() {
-        let shapes = HashMap::from([(
-            "t:sh".into(),
-            vec![(48.0, 2.0), (48.01, 2.0), (48.02, 2.0)],
-        )]);
+        let shapes =
+            HashMap::from([("t:sh".into(), vec![(48.0, 2.0), (48.01, 2.0), (48.02, 2.0)])]);
         let stops = vec![stop("t:a", 48.0, 2.0), stop("t:b", 48.02, 2.0)];
         let trips = vec![TripRecord {
             id: "t:trip".into(),
@@ -618,8 +623,7 @@ mod tests {
         assert!(stop_times[0].shape_dist_traveled.is_some());
         assert!(stop_times[1].shape_dist_traveled.is_some());
         assert!(
-            stop_times[1].shape_dist_traveled.unwrap()
-                > stop_times[0].shape_dist_traveled.unwrap()
+            stop_times[1].shape_dist_traveled.unwrap() > stop_times[0].shape_dist_traveled.unwrap()
         );
     }
 
@@ -674,7 +678,10 @@ mod tests {
         backfill_shape_dist_traveled(&[trip_rec(3)], &mut sts, &stops, &shapes);
         let mid = sts[1].shape_dist_traveled.expect("filled");
         // Half-way, in km (≈ 2.22), not metres (≈ 2224).
-        assert!((mid - len_km / 2.0).abs() < 0.05, "mid={mid} len_km={len_km}");
+        assert!(
+            (mid - len_km / 2.0).abs() < 0.05,
+            "mid={mid} len_km={len_km}"
+        );
     }
 
     #[test]
@@ -745,18 +752,10 @@ mod tests {
     #[test]
     fn slices_shape_between_stops() {
         let mut epoch = StaticEpoch::empty();
-        epoch.stops = vec![
-            stop("t:a", 48.86, 2.35),
-            stop("t:b", 45.76, 4.86),
-        ];
+        epoch.stops = vec![stop("t:a", 48.86, 2.35), stop("t:b", 45.76, 4.86)];
         epoch.shapes.insert(
             "t:sh".into(),
-            vec![
-                (48.86, 2.35),
-                (47.5, 3.0),
-                (46.5, 4.0),
-                (45.76, 4.86),
-            ],
+            vec![(48.86, 2.35), (47.5, 3.0), (46.5, 4.0), (45.76, 4.86)],
         );
         epoch.stop_times = vec![
             PackedStopTime {
@@ -767,8 +766,8 @@ mod tests {
                 pickup_type: 0,
                 drop_off_type: 0,
                 stop_headsign_idx: 0,
-            timepoint: 1,
-            shape_dist_traveled: None,
+                timepoint: 1,
+                shape_dist_traveled: None,
             },
             PackedStopTime {
                 stop_idx: 1,
@@ -778,8 +777,8 @@ mod tests {
                 pickup_type: 0,
                 drop_off_type: 0,
                 stop_headsign_idx: 0,
-            timepoint: 1,
-            shape_dist_traveled: None,
+                timepoint: 1,
+                shape_dist_traveled: None,
             },
         ];
         epoch.trips = vec![base_trip(Some("t:sh".into()), 2)];

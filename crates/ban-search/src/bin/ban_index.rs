@@ -54,6 +54,7 @@ fn main() -> ExitCode {
             "--download" => do_download = true,
             "--force" => force = true,
             "--all" => all = true,
+            "--build" => do_build = true,
             "--suggest" => {
                 i += 1;
                 suggest = Some(args.get(i).expect("--suggest value").clone());

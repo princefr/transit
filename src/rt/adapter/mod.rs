@@ -153,10 +153,8 @@ pub fn merge_delta_into(target: &mut FeedRtState, delta: &RealtimeDelta) {
             if !delta.state.alerts.is_empty() {
                 target.alerts = delta.state.alerts.clone();
                 target.alert_count = target.alerts.len();
-                target.alerts_fetched_at = delta
-                    .state
-                    .alerts_fetched_at
-                    .or(target.alerts_fetched_at);
+                target.alerts_fetched_at =
+                    delta.state.alerts_fetched_at.or(target.alerts_fetched_at);
             }
         }
     }

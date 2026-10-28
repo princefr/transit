@@ -34,9 +34,7 @@ impl SiriTripAliases {
         if key.is_empty() {
             return;
         }
-        self.to_trip_id
-            .entry(key)
-            .or_insert_with(|| trip_id.into());
+        self.to_trip_id.entry(key).or_insert_with(|| trip_id.into());
     }
 
     pub fn lookup(&self, key: &str) -> Option<&str> {
@@ -108,7 +106,10 @@ fn register_code_keys(aliases: &mut SiriTripAliases, code: &str, namespaced_trip
         aliases.insert(&jid, namespaced_trip);
         if is_uuid(&jid) {
             aliases.insert(format!("IDFM:TN:SNCF:{jid}"), namespaced_trip);
-            aliases.insert(super::pack::ns("idfm", &format!("IDFM:TN:SNCF:{jid}")), namespaced_trip);
+            aliases.insert(
+                super::pack::ns("idfm", &format!("IDFM:TN:SNCF:{jid}")),
+                namespaced_trip,
+            );
             for op in ["SNCF_MAGENTA_PRD", "SNCF"] {
                 aliases.insert(format!("{op}:VehicleJourney::{jid}:LOC"), namespaced_trip);
                 aliases.insert(format!("{op}:VehicleJourney::{jid}"), namespaced_trip);
@@ -559,8 +560,30 @@ trip,IDFM:TN:SNCF:9e1f3cec-e963-4c83-878e-b924db62121d,source,SNCF:ServiceJourne
         let mut cal = ServiceCalendar::new();
         let from = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
         let to = NaiveDate::from_ymd_opt(2026, 12, 31).unwrap();
-        cal.add_regular("WD".into(), from, to, true, true, true, true, true, false, false);
-        cal.add_regular("WE".into(), from, to, false, false, false, false, false, true, true);
+        cal.add_regular(
+            "WD".into(),
+            from,
+            to,
+            true,
+            true,
+            true,
+            true,
+            true,
+            false,
+            false,
+        );
+        cal.add_regular(
+            "WE".into(),
+            from,
+            to,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            true,
+        );
         epoch
             .calendars
             .insert("idfm".into(), std::sync::Arc::new(cal));

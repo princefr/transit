@@ -24,8 +24,8 @@ pub mod stop_board;
 pub use client::PrimClient;
 pub use poller::{
     confirm_sm_interest, new_shared_prim, register_et_line_interest, register_nearby_sm_interest,
-    register_sm_interest, register_viewport_live_interest, sm_try_consume_quota,
-    spawn_prim_poller, spawn_prim_pollers, PrimCatalog, SharedPrim,
+    register_sm_interest, register_viewport_live_interest, sm_try_consume_quota, spawn_prim_poller,
+    spawn_prim_pollers, PrimCatalog, SharedPrim,
 };
 pub use stop_board::{
     fetch_live_board, fetch_live_departures, monitoring_ref_from_stop_id, LiveBoardResult,

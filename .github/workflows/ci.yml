@@ -56,19 +56,20 @@ jobs:
       - run: cargo test --locked --workspace --all-targets
 
   web:
-    name: web (wasm32 check)
+    name: web (wasm32 clippy)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
+          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: web
-      - name: cargo check (wasm32-unknown-unknown)
+      - name: cargo clippy (wasm32-unknown-unknown)
         working-directory: web
-        run: cargo check --locked --target wasm32-unknown-unknown
+        run: cargo clippy --locked --target wasm32-unknown-unknown -- -D warnings
 
   audit:
     name: cargo audit

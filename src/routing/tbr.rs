@@ -48,9 +48,7 @@
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
 
-use super::journey::{
-    ItineraryQuery, ItineraryResult, Journey, Leg, Place, RtTripAdjust,
-};
+use super::journey::{ItineraryQuery, ItineraryResult, Journey, Leg, Place, RtTripAdjust};
 use super::walk::AccessStop;
 use crate::gtfs::pack::{RouteMode, StaticEpoch};
 
@@ -164,7 +162,11 @@ impl<'a> super::raptor::LabelSource for TbrLabelSource<'a> {
     }
     #[inline]
     fn get(&self, round: usize, stop: usize) -> Option<super::raptor::Reach> {
-        self.rows.get(round)?.get(stop)?.as_ref().map(|l| l.to_reach())
+        self.rows
+            .get(round)?
+            .get(stop)?
+            .as_ref()
+            .map(|l| l.to_reach())
     }
 }
 
@@ -465,7 +467,6 @@ fn tbr_max_rounds(q: &ItineraryQuery) -> usize {
         .max(q.max_transfers.saturating_add(2))
         .max(4) as usize)
         .min(12)
-        .max(1)
 }
 
 /// Phase timings for one planning call. Printed when `TRANSIT_PROFILE=1`.
@@ -554,14 +555,10 @@ pub fn plan_journeys_tbr(epoch: &StaticEpoch, q: &ItineraryQuery) -> ItineraryRe
         return empty_result(epoch, q);
     }
 
-    let egress: HashMap<u32, AccessStop> = targets
-        .iter()
-        .map(|a| (a.stop_idx, a.clone()))
-        .collect();
-    let origin_map: HashMap<u32, AccessStop> = origins
-        .iter()
-        .map(|a| (a.stop_idx, a.clone()))
-        .collect();
+    let egress: HashMap<u32, AccessStop> =
+        targets.iter().map(|a| (a.stop_idx, a.clone())).collect();
+    let origin_map: HashMap<u32, AccessStop> =
+        origins.iter().map(|a| (a.stop_idx, a.clone())).collect();
 
     let max_k = if epoch.trip_count() > 80_000 {
         (q.max_results.max(1) as usize).min(4)
@@ -596,13 +593,32 @@ pub fn plan_journeys_tbr(epoch: &StaticEpoch, q: &ItineraryQuery) -> ItineraryRe
         let run = |scratch: &mut TbrScratch, prof: &mut TbrProfile| {
             if q.arrive_by {
                 plan_arrive_by_tbr(
-                    epoch, q, dep_s0, midnight, &origins, &targets, &egress, &origin_map,
-                    pool_cap, scratch, prof,
+                    epoch,
+                    q,
+                    dep_s0,
+                    midnight,
+                    &origins,
+                    &targets,
+                    &egress,
+                    &origin_map,
+                    pool_cap,
+                    scratch,
+                    prof,
                 )
             } else {
                 plan_depart_after_tbr(
-                    epoch, q, dep_s0, midnight, &origins, &targets, &egress, &origin_map,
-                    pool_cap, None, scratch, prof,
+                    epoch,
+                    q,
+                    dep_s0,
+                    midnight,
+                    &origins,
+                    &targets,
+                    &egress,
+                    &origin_map,
+                    pool_cap,
+                    None,
+                    scratch,
+                    prof,
                 )
             }
         };
@@ -658,9 +674,7 @@ pub fn plan_journeys_tbr(epoch: &StaticEpoch, q: &ItineraryQuery) -> ItineraryRe
         let n = j.legs.len();
         for (i, leg) in j.legs.iter_mut().enumerate() {
             if let Leg::Walk(w) = leg {
-                if i == 0 && q.bike_from {
-                    w.mode = "BIKE".into();
-                } else if i + 1 == n && q.bike_to {
+                if (i == 0 && q.bike_from) || (i + 1 == n && q.bike_to) {
                     w.mode = "BIKE".into();
                 } else if w.mode.is_empty() {
                     w.mode = "WALK".into();
@@ -717,7 +731,10 @@ fn plan_depart_after_tbr(
     let mut journeys = Vec::new();
 
     if let Some(mut j) = pure_walk_journey(epoch, q, origins, targets, dep_s0, midnight) {
-        if arrive_deadline_s.map(|d| journey_arrival_s(&j, midnight) <= d).unwrap_or(true) {
+        if arrive_deadline_s
+            .map(|d| journey_arrival_s(&j, midnight) <= d)
+            .unwrap_or(true)
+        {
             super::fare::apply_fare_estimate(epoch, &mut j);
             journeys.push(j);
         }
@@ -736,6 +753,9 @@ fn plan_depart_after_tbr(
     };
 
     while journeys.len() < pool_cap && stagnant < 8 && iterations < max_iterations {
+        if crate::routing::cancel::expired() {
+            break;
+        }
         iterations += 1;
         if let Some(deadline) = arrive_deadline_s {
             if dep_s >= deadline {
@@ -781,7 +801,11 @@ fn plan_depart_after_tbr(
                 continue;
             };
             let j_dep = journey_first_departure(&journey).unwrap_or(journey.departure);
-            let key = (j_dep.timestamp(), journey.arrival.timestamp(), journey.transfers);
+            let key = (
+                j_dep.timestamp(),
+                journey.arrival.timestamp(),
+                journey.transfers,
+            );
             if !seen_keys.insert(key) {
                 continue;
             }
@@ -910,11 +934,7 @@ fn plan_arrive_by_tbr(
             j.arrival = arr;
             j.duration_s = (arr - dep).num_seconds();
             super::fare::apply_fare_estimate(epoch, &mut j);
-            let key = (
-                j.departure.timestamp(),
-                j.arrival.timestamp(),
-                j.transfers,
-            );
+            let key = (j.departure.timestamp(), j.arrival.timestamp(), j.transfers);
             seen_keys.insert(key);
             journeys.push(j);
         }
@@ -936,6 +956,9 @@ fn plan_arrive_by_tbr(
     let per_sample = ((pool_cap / samples.len().max(1)) + 2).max(2);
 
     for seed in samples {
+        if crate::routing::cancel::expired() {
+            break;
+        }
         let batch = plan_depart_after_tbr(
             epoch,
             q,
@@ -996,7 +1019,7 @@ fn run_tbr(
     // Only transfer edges whose flag pattern intersects the target cells are
     // explored during the walk transfer phase.
     let mut target_cells = crate::gtfs::cell_bitset::CellBitSet::new(epoch.num_cells);
-    for (t_idx, _) in egress {
+    for t_idx in egress.keys() {
         if let Some(&cell) = epoch.stop_partition.get(*t_idx as usize) {
             target_cells.set_bit(cell as usize);
         }
@@ -1053,6 +1076,9 @@ fn run_tbr(
     };
 
     for round in 0..s.rounds {
+        if crate::routing::cancel::expired() {
+            break;
+        }
         if s.reached.is_empty() && (!use_arc_flags || s.seg_queue.is_empty()) {
             break;
         }
@@ -1073,8 +1099,7 @@ fn run_tbr(
                 continue;
             }
             let trip = &epoch.trips[seg_tiu];
-            if q.excluded_trip_ids.contains(&trip.id) || (q.wheelchair && trip.wheelchair == 2)
-            {
+            if q.excluded_trip_ids.contains(&trip.id) || (q.wheelchair && trip.wheelchair == 2) {
                 continue;
             }
             if !mode_ok(trip.mode) {
@@ -1188,7 +1213,10 @@ fn run_tbr(
                 if st_board.pickup_type == 1 {
                     continue;
                 }
-                if adj.as_ref().is_some_and(|a| a.is_skipped(st_board.stop_sequence)) {
+                if adj
+                    .as_ref()
+                    .is_some_and(|a| a.is_skipped(st_board.stop_sequence))
+                {
                     continue;
                 }
 
@@ -1218,9 +1246,7 @@ fn run_tbr(
                     // is better (earlier departure or earlier stop offset).
                     let (_, prev_off, prev_dep, _) =
                         s.trip_boarding[ti].unwrap_or((0, 0, u32::MAX, 0));
-                    if board_dep < prev_dep
-                        || (board_dep == prev_dep && st_off < prev_off)
-                    {
+                    if board_dep < prev_dep || (board_dep == prev_dep && st_off < prev_off) {
                         if prunable {
                             s.record_line_board(line_id, ti, st_off, round_stamp);
                         }
@@ -1276,7 +1302,7 @@ fn run_tbr(
         }
 
         // --- Walk transfer phase ---
-        let transit_reached: Vec<u32> = next_reached.drain(..).collect();
+        let transit_reached: Vec<u32> = std::mem::take(&mut next_reached);
         for stop_idx in &transit_reached {
             let arrival_here = s.earliest[*stop_idx as usize];
             for &ei in epoch
@@ -1459,11 +1485,19 @@ fn scan_trip_forward(
     if use_arc_flags {
         for off in (board_off + 1)..trip.stop_time_len {
             let st = &epoch.stop_times[(trip.stop_time_start + off) as usize];
-            if st.drop_off_type == 1 { continue; }
+            if st.drop_off_type == 1 {
+                continue;
+            }
             let arr = rt_effective_arr_s(adj, st, time_shift);
-            if arr >= *best_dest { break; }
-            
-            if let Some(transfers) = epoch.trip_transfers.get(ti).and_then(|v| v.get(off as usize)) {
+            if arr >= *best_dest {
+                break;
+            }
+
+            if let Some(transfers) = epoch
+                .trip_transfers
+                .get(ti)
+                .and_then(|v| v.get(off as usize))
+            {
                 for entry in transfers {
                     // Arc-flag prune via the compressed pattern table; unknown
                     // patterns are treated as flagged (safe side).
@@ -1490,7 +1524,9 @@ fn scan_trip_forward(
                     let si2 = board_st.stop_idx;
                     if dep2 < s.earliest[si2 as usize] {
                         s.improve(
-                            round, si2, dep2,
+                            round,
+                            si2,
+                            dep2,
                             TbrReach::Walk {
                                 arrival_s: dep2,
                                 from_stop: st.stop_idx,
@@ -1555,12 +1591,12 @@ fn resolve_transfer_target(
         .unwrap_or(&[]);
     let start_pos = s.trip_line_pos.get(target).copied().unwrap_or(u32::MAX) as usize;
     let single = [entry.target_trip];
-    let candidates: &[u32] = if start_pos < line_trips.len() && line_trips[start_pos] == entry.target_trip
-    {
-        &line_trips[start_pos..]
-    } else {
-        &single
-    };
+    let candidates: &[u32] =
+        if start_pos < line_trips.len() && line_trips[start_pos] == entry.target_trip {
+            &line_trips[start_pos..]
+        } else {
+            &single
+        };
     let fifo = s.line_fifo.get(line as usize).copied().unwrap_or(false);
     for &t2 in candidates.iter().take(TRANSFER_LINE_SCAN_CAP) {
         let t2u = t2 as usize;
@@ -1632,8 +1668,7 @@ mod tests {
     use super::*;
     use crate::gtfs::calendar::ServiceCalendar;
     use crate::gtfs::pack::{
-        FrequencyWindow, GlobalTrip, PackedStopTime, RouteMode, StaticEpoch, StopRecord,
-        WalkEdge,
+        FrequencyWindow, GlobalTrip, PackedStopTime, RouteMode, StaticEpoch, StopRecord, WalkEdge,
     };
     use chrono::{TimeZone, Utc};
     use std::collections::HashMap;
@@ -1850,7 +1885,13 @@ mod tests {
             "svc".into(),
             start,
             end,
-            true, true, true, true, true, true, true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
         );
         epoch.calendars = HashMap::from([("test".into(), Arc::new(cal))]);
 
@@ -1917,9 +1958,11 @@ mod tests {
         let arr_r = res_r.journeys[0].arrival;
         let arr_t = res_t.journeys[0].arrival;
         assert_eq!(
-            arr_r, arr_t,
+            arr_r,
+            arr_t,
             "TBR arrival {:?} != RAPTOR arrival {:?} for {}→{}",
-            arr_t, arr_r,
+            arr_t,
+            arr_r,
             q.from_stop_id.as_deref().unwrap_or("?"),
             q.to_stop_id.as_deref().unwrap_or("?")
         );
@@ -1942,9 +1985,11 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            trips_r, trips_t,
+            trips_r,
+            trips_t,
             "TBR trip sequence {:?} != RAPTOR {:?} for {}→{}",
-            trips_t, trips_r,
+            trips_t,
+            trips_r,
             q.from_stop_id.as_deref().unwrap_or("?"),
             q.to_stop_id.as_deref().unwrap_or("?")
         );
@@ -2162,7 +2207,15 @@ mod tests {
         let end = chrono::NaiveDate::from_ymd_opt(2030, 12, 31).unwrap();
         cal.add_regular(
             "svc".into(),
-            start, end, true, true, true, true, true, true, true,
+            start,
+            end,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
         );
         epoch.calendars = HashMap::from([("test".into(), Arc::new(cal))]);
         epoch.walk_adj = vec![Vec::new(); epoch.stops.len()];
