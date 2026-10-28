@@ -1,8 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use transit::api;
 use transit::api::graphql::build_schema;
@@ -11,8 +10,7 @@ use transit::config::Config;
 use transit::feeds::spawn_feed_supervisor;
 use transit::state::AppState;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     // Load .env before config (IDFM PRIM key, etc.). Missing file is fine.
     let dotenv_path = dotenvy::dotenv().ok();
 
@@ -25,6 +23,26 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ref path) = dotenv_path {
         info!(?path, "loaded .env");
     }
+
+    // Config is needed *before* the runtime: `runtime.blocking_threads` sizes
+    // tokio's blocking pool (default would be 512 threads, letting heavy RAPTOR
+    // jobs pile up without bound).
+    let config = Config::load().map_err(|e| anyhow::anyhow!(e))?;
+    let blocking_threads = config.runtime.effective_blocking_threads();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(blocking_threads)
+        .thread_name("transit-worker")
+        .build()?;
+    info!(
+        blocking_threads,
+        max_concurrent_plans = config.runtime.effective_max_concurrent_plans(),
+        "tokio runtime configured"
+    );
+    runtime.block_on(run(config))
+}
+
+async fn run(config: Config) -> anyhow::Result<()> {
     if std::env::var("IDFM_PRIM_API_KEY").is_ok() {
         info!("IDFM_PRIM_API_KEY is set (value not logged)");
     }
@@ -35,7 +53,6 @@ async fn main() -> anyhow::Result<()> {
         info!("PRIM_DATASET_KEY (or legacy DATASETS_API_KEY/DATAGOUV_API_KEY) is set (value not logged)");
     }
 
-    let config = Config::load().map_err(|e| anyhow::anyhow!(e))?;
     std::fs::create_dir_all(&config.runtime.data_dir)?;
 
     info!(
@@ -43,6 +60,12 @@ async fn main() -> anyhow::Result<()> {
         feeds = config.enabled_feeds().count(),
         "starting transit"
     );
+    if config.server.graphql_playground {
+        warn!("graphql_playground is enabled (GraphiQL + introspection) — disable in production");
+    }
+    if config.server.cors_permissive() {
+        warn!("server.cors_allowed_origins contains \"*\" — CORS is permissive");
+    }
 
     let cache = TransitCache::connect(config.redis.clone()).await;
     let state = Arc::new(AppState::new(config.clone(), cache.clone()));
@@ -66,9 +89,9 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let schema = build_schema(state.clone());
-    let app = api::router(state.clone(), schema)
-        .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http());
+    // CORS, body limit, timeouts and concurrency caps are applied inside
+    // `api::router` (per route group, so `/ws` upgrades are unaffected).
+    let app = api::router(state.clone(), schema).layer(TraceLayer::new_for_http());
 
     let addr: SocketAddr = config
         .server
@@ -78,6 +101,11 @@ async fn main() -> anyhow::Result<()> {
 
     info!(%addr, "listening (GraphQL POST /graphql, WS /ws, health GET /health)");
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    // Connect info lets `/metrics` restrict itself to loopback peers.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

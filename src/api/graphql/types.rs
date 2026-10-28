@@ -1271,7 +1271,9 @@ fn line_colors_for(
 
 fn contrast_text_for_hex(hex: &str) -> String {
     let h = hex.trim().trim_start_matches('#');
-    if h.len() != 6 {
+    // Byte-length check alone is not enough: "aé123" is 6 bytes and slicing
+    // at byte 2 would split 'é' and panic. Require ASCII hex digits only.
+    if h.len() != 6 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
         return "FFFFFF".into();
     }
     let ok = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok();
@@ -1812,6 +1814,20 @@ impl BBoxInput {
         lat >= self.min_lat && lat <= self.max_lat && lon >= self.min_lon && lon <= self.max_lon
     }
 
+    /// Expand the box outward to a `step`-degree grid (clamped to valid ranges).
+    /// Used so cache keys built from snapped coordinates cover the requested area
+    /// and nearby viewports share one cache entry.
+    pub fn snapped_outward(&self, step: f64) -> BBoxInput {
+        let down = |v: f64| (v / step).floor() * step;
+        let up = |v: f64| (v / step).ceil() * step;
+        BBoxInput {
+            min_lat: down(self.min_lat).max(-90.0),
+            min_lon: down(self.min_lon).max(-180.0),
+            max_lat: up(self.max_lat).min(90.0),
+            max_lon: up(self.max_lon).min(180.0),
+        }
+    }
+
     pub fn is_valid(&self) -> bool {
         (-90.0..=90.0).contains(&self.min_lat)
             && (-90.0..=90.0).contains(&self.max_lat)
@@ -2252,5 +2268,40 @@ mod traffic_line_tests {
     fn metro_14_palette() {
         let lines = resolve_traffic_lines(None, &[], Some("Métro 14 ralenti"), None);
         assert!(lines.iter().any(|l| l.short_name == "14"));
+    }
+
+    #[test]
+    fn contrast_text_valid_hex() {
+        assert_eq!(contrast_text_for_hex("#FFFFFF"), "000000");
+        assert_eq!(contrast_text_for_hex("000000"), "FFFFFF");
+        assert_eq!(contrast_text_for_hex(" ffcd00 "), "000000");
+    }
+
+    #[test]
+    fn contrast_text_non_ascii_does_not_panic() {
+        // 6 bytes but not 6 ASCII chars: used to panic on a char boundary.
+        assert_eq!("aé123".len(), 6);
+        assert_eq!(contrast_text_for_hex("aé123"), "FFFFFF");
+        assert_eq!(contrast_text_for_hex("#éé12"), "FFFFFF");
+        assert_eq!(contrast_text_for_hex("€abc"), "FFFFFF");
+        assert_eq!(contrast_text_for_hex("zzzzzz"), "FFFFFF");
+        assert_eq!(contrast_text_for_hex("+1+2+3"), "FFFFFF");
+        assert_eq!(contrast_text_for_hex(""), "FFFFFF");
+    }
+
+    #[test]
+    fn bbox_snapped_outward_covers_input() {
+        let b = BBoxInput {
+            min_lat: 48.85661,
+            min_lon: 2.35221,
+            max_lat: 48.86019,
+            max_lon: 2.36004,
+        };
+        let s = b.snapped_outward(1e-3);
+        assert!(s.min_lat <= b.min_lat && s.min_lon <= b.min_lon);
+        assert!(s.max_lat >= b.max_lat && s.max_lon >= b.max_lon);
+        assert!((s.min_lat - 48.856).abs() < 1e-9);
+        assert!((s.max_lon - 2.361).abs() < 1e-9);
+        assert!(s.is_valid());
     }
 }

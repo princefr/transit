@@ -6,8 +6,9 @@ use crate::prim::poller::{new_shared_prim, PrimCatalog, SharedPrim};
 use crate::rt::overlay::RealtimeOverlay;
 use arc_swap::ArcSwap;
 use ban_search::BanIndex;
-use std::sync::Arc;
-use tokio::sync::broadcast;
+use crate::prim::PrimClient;
+use std::sync::{Arc, OnceLock};
+use tokio::sync::{broadcast, Semaphore};
 use tracing::{info, warn};
 
 use crate::feeds::supervisor::RtVersion;
@@ -28,6 +29,15 @@ pub struct AppState {
     pub ban: SharedBan,
     /// Optional Redis cache (no-op when disabled or unreachable).
     pub cache: TransitCache,
+    /// Global cap on concurrent itinerary planning jobs (each occupies one
+    /// blocking-pool thread until RAPTOR finishes — timeouts do not cancel it).
+    pub plan_slots: Arc<Semaphore>,
+    /// Global cap on open `/ws` subscription connections.
+    pub ws_slots: Arc<Semaphore>,
+    /// Global cap on in-flight non-websocket HTTP requests.
+    pub http_slots: Arc<Semaphore>,
+    /// Shared PRIM client (lazily created on first use; `None` when no API key).
+    pub prim_client: Arc<OnceLock<Option<Arc<PrimClient>>>>,
 }
 
 impl AppState {
@@ -48,9 +58,23 @@ impl AppState {
                     .spawn(move || provision_ban_index(ban2, dir, depts));
             }
         }
+        let plan_slots = Arc::new(Semaphore::new(
+            config.runtime.effective_max_concurrent_plans(),
+        ));
+        let ws_slots = Arc::new(Semaphore::new(config.server.max_ws_connections.max(1)));
+        let http_slots = Arc::new(Semaphore::new(
+            config.server.max_concurrent_requests.max(1),
+        ));
+        let epoch = Arc::new(ArcSwap::from_pointee(StaticEpoch::empty()));
+        // Lets `prim::stop_board` validate on-demand stop ids against the live epoch.
+        crate::prim::stop_board::install_epoch_source(epoch.clone());
         Self {
+            plan_slots,
+            ws_slots,
+            http_slots,
+            prim_client: Arc::new(OnceLock::new()),
             config: Arc::new(config),
-            epoch: Arc::new(ArcSwap::from_pointee(StaticEpoch::empty())),
+            epoch,
             rt: Arc::new(ArcSwap::from_pointee(RealtimeOverlay::default())),
             rt_version_tx,
             equipment: new_shared_equipment(),
