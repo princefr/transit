@@ -14,20 +14,49 @@ use super::pack::{
 use super::siri_trip_map::{build_from_object_codes, SiriTripAliases};
 use crate::error::{Result, TransitError};
 
+/// Hours above this in a GTFS time are treated as invalid (GTFS allows > 24h
+/// for after-midnight service, but nothing legitimately runs 3 days past
+/// the service date).
+const MAX_GTFS_TIME_HOURS: u32 = 72;
+
+/// Max decompressed size accepted for `stop_times.txt` (zip-bomb guard).
+pub const MAX_STOP_TIMES_ENTRY_BYTES: u64 = 4 << 30;
+/// Max decompressed size accepted for any other GTFS zip entry.
+pub const MAX_ZIP_ENTRY_BYTES: u64 = 512 << 20;
+
+/// Default timezone when the feed's `agency_timezone` is absent / invalid.
+const DEFAULT_FEED_TZ: chrono_tz::Tz = chrono_tz::Europe::Paris;
+
+/// Parse a GTFS `HH:MM:SS` time (hours may exceed 24) into seconds since
+/// service-day noon-minus-12h. Rejects non-digit input, minutes/seconds
+/// ≥ 60 and hours > [`MAX_GTFS_TIME_HOURS`].
 fn parse_time_to_seconds(s: &str) -> Option<u32> {
-    let parts: Vec<&str> = s.trim().split(':').collect();
-    if parts.len() != 3 {
+    let s = s.trim();
+    let mut parts = s.split(':');
+    let (h, m, sec) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() {
         return None;
     }
-    let h: u32 = parts[0].parse().ok()?;
-    let m: u32 = parts[1].parse().ok()?;
-    let sec: u32 = parts[2].parse().ok()?;
-    Some(h * 3600 + m * 60 + sec)
+    let num = |p: &str, max_len: usize| -> Option<u32> {
+        if p.is_empty() || p.len() > max_len || !p.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        p.parse().ok()
+    };
+    let h = num(h, 3)?;
+    let m = num(m, 2)?;
+    let sec = num(sec, 2)?;
+    if h > MAX_GTFS_TIME_HOURS || m >= 60 || sec >= 60 {
+        return None;
+    }
+    h.checked_mul(3600)?
+        .checked_add(m.checked_mul(60)?)?
+        .checked_add(sec)
 }
 
 fn parse_date(s: &str) -> Option<NaiveDate> {
     let s = s.trim();
-    if s.len() != 8 {
+    if s.len() != 8 || !s.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     let y: i32 = s[0..4].parse().ok()?;
@@ -36,36 +65,196 @@ fn parse_date(s: &str) -> Option<NaiveDate> {
     NaiveDate::from_ymd_opt(y, m, d)
 }
 
-fn read_zip_entry(archive: &mut ZipArchive<Cursor<Vec<u8>>>, name: &str) -> Result<String> {
-    // case-insensitive search
-    let names: Vec<String> = (0..archive.len())
-        .filter_map(|i| archive.by_index(i).ok().map(|f| f.name().to_string()))
-        .collect();
-    let found = names.iter().find(|n| {
-        let base = Path::new(n)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(n);
-        base.eq_ignore_ascii_case(name)
-    });
-    let Some(entry_name) = found else {
-        return Err(TransitError::Parse(format!("missing {name} in GTFS zip")));
+/// Feed timezone from the first valid `agency_timezone` in agency.txt,
+/// falling back to Europe/Paris.
+fn feed_timezone(agency_csv: Option<&str>) -> chrono_tz::Tz {
+    let Some(csv) = agency_csv else {
+        return DEFAULT_FEED_TZ;
     };
-    let mut file = archive
+    let mut rdr = csv::ReaderBuilder::new()
+        .flexible(true)
+        .from_reader(csv.as_bytes());
+    for rec in rdr.deserialize::<HashMap<String, String>>() {
+        let Ok(rec) = rec else { continue };
+        if let Some(tz) = rec
+            .get("agency_timezone")
+            .and_then(|s| s.trim().parse::<chrono_tz::Tz>().ok())
+        {
+            return tz;
+        }
+    }
+    DEFAULT_FEED_TZ
+}
+
+fn zip_entry_cap(name: &str) -> u64 {
+    if name.eq_ignore_ascii_case("stop_times.txt") {
+        MAX_STOP_TIMES_ENTRY_BYTES
+    } else {
+        MAX_ZIP_ENTRY_BYTES
+    }
+}
+
+fn find_zip_entry(archive: &mut ZipArchive<Cursor<Vec<u8>>>, name: &str) -> Option<String> {
+    // case-insensitive search on the basename
+    archive
+        .file_names()
+        .find(|n| {
+            let base = Path::new(n)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(n);
+            base.eq_ignore_ascii_case(name)
+        })
+        .map(|s| s.to_string())
+}
+
+fn read_named_zip_entry(
+    archive: &mut ZipArchive<Cursor<Vec<u8>>>,
+    entry_name: &str,
+    cap: u64,
+) -> Result<String> {
+    let file = archive
         .by_name(entry_name)
         .map_err(|e| TransitError::Parse(e.to_string()))?;
-    let mut buf = String::new();
-    file.read_to_string(&mut buf)
-        .map_err(|e| TransitError::Parse(e.to_string()))?;
+    // Declared size is attacker-controlled but cheap to check first; the
+    // `take` below enforces the cap on the actual decompressed stream.
+    if file.size() > cap {
+        return Err(TransitError::Parse(format!(
+            "{entry_name}: declared size {} exceeds cap {cap} bytes",
+            file.size()
+        )));
+    }
+    let mut bytes = Vec::with_capacity(file.size().min(cap) as usize);
+    file.take(cap + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| TransitError::Parse(format!("{entry_name}: {e}")))?;
+    if bytes.len() as u64 > cap {
+        return Err(TransitError::Parse(format!(
+            "{entry_name}: decompressed size exceeds cap {cap} bytes"
+        )));
+    }
+    let mut buf =
+        String::from_utf8(bytes).map_err(|e| TransitError::Parse(format!("{entry_name}: {e}")))?;
     // strip UTF-8 BOM
     if buf.starts_with('\u{feff}') {
-        buf = buf.trim_start_matches('\u{feff}').to_string();
+        buf.drain(..'\u{feff}'.len_utf8());
     }
     Ok(buf)
 }
 
+fn read_zip_entry(archive: &mut ZipArchive<Cursor<Vec<u8>>>, name: &str) -> Result<String> {
+    let Some(entry_name) = find_zip_entry(archive, name) else {
+        return Err(TransitError::Parse(format!("missing {name} in GTFS zip")));
+    };
+    read_named_zip_entry(archive, &entry_name, zip_entry_cap(name))
+}
+
 fn optional_zip_entry(archive: &mut ZipArchive<Cursor<Vec<u8>>>, name: &str) -> Option<String> {
-    read_zip_entry(archive, name).ok()
+    let entry_name = find_zip_entry(archive, name)?;
+    match read_named_zip_entry(archive, &entry_name, zip_entry_cap(name)) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            warn!(entry = name, error = %e, "skipping unreadable optional GTFS file");
+            None
+        }
+    }
+}
+
+/// Stop time as parsed, before blank-time interpolation.
+struct RawStopTime {
+    /// Arrival (falls back to departure when only that is given).
+    arr: Option<u32>,
+    /// Departure (falls back to arrival when only that is given).
+    dep: Option<u32>,
+    /// Packed row; `arrival_s` / `departure_s` are filled by [`fill_missing_times`].
+    st: PackedStopTime,
+}
+
+fn haversine_m(a: (f64, f64), b: (f64, f64)) -> f64 {
+    let (lat1, lon1) = (a.0.to_radians(), a.1.to_radians());
+    let (lat2, lon2) = (b.0.to_radians(), b.1.to_radians());
+    let dlat = lat2 - lat1;
+    let dlon = lon2 - lon1;
+    let h = (dlat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
+    2.0 * 6_371_000.0 * h.sqrt().asin()
+}
+
+/// Fill blank arrival/departure times of a trip already sorted by
+/// `stop_sequence`, interpolating linearly between the surrounding timed
+/// stops. The interpolation weight is, in order of preference:
+/// `shape_dist_traveled` (when present and non-decreasing over the gap),
+/// straight-line distance between consecutive stops (when all have
+/// coordinates), else stop index. Interpolated rows get `timepoint = 0`.
+///
+/// Returns the number of interpolated rows, or `None` when the first or last
+/// stop has no time (the trip cannot be anchored and must be dropped).
+fn fill_missing_times(list: &mut [RawStopTime], stops: &[StopRecord]) -> Option<usize> {
+    let n = list.len();
+    if n == 0 {
+        return Some(0);
+    }
+    if list[0].dep.is_none() || list[n - 1].arr.is_none() {
+        return None;
+    }
+    let mut interpolated = 0usize;
+    let mut a = 0usize; // last timed index
+    while a < n - 1 {
+        let b = (a + 1..n).find(|&i| list[i].dep.is_some()).unwrap_or(n - 1);
+        if b > a + 1 {
+            let t_a = list[a].dep.unwrap_or(0);
+            let t_b = list[b].arr.unwrap_or(t_a).max(t_a);
+            // Cumulative weights over a..=b (relative to a).
+            let mut w = vec![0.0f64; b - a + 1];
+            let shape_ok = (a..=b).all(|i| list[i].st.shape_dist_traveled.is_some())
+                && (a..b).all(|i| {
+                    list[i + 1].st.shape_dist_traveled.unwrap_or(0.0)
+                        >= list[i].st.shape_dist_traveled.unwrap_or(0.0)
+                })
+                && list[b].st.shape_dist_traveled > list[a].st.shape_dist_traveled;
+            let coord = |i: usize| -> Option<(f64, f64)> {
+                let s = stops.get(list[i].st.stop_idx as usize)?;
+                Some((s.lat?, s.lon?))
+            };
+            let mut filled = false;
+            if shape_ok {
+                let base = list[a].st.shape_dist_traveled.unwrap_or(0.0) as f64;
+                for (k, i) in (a..=b).enumerate() {
+                    w[k] = list[i].st.shape_dist_traveled.unwrap_or(0.0) as f64 - base;
+                }
+                filled = true;
+            } else if (a..=b).all(|i| coord(i).is_some()) {
+                let mut acc = 0.0;
+                for (k, i) in (a + 1..=b).enumerate() {
+                    acc += haversine_m(coord(i - 1).unwrap(), coord(i).unwrap());
+                    w[k + 1] = acc;
+                }
+                filled = acc > 0.0;
+            }
+            if !filled {
+                for (k, wk) in w.iter_mut().enumerate() {
+                    *wk = k as f64;
+                }
+            }
+            let total = w[b - a];
+            for i in a + 1..b {
+                let frac = if total > 0.0 { w[i - a] / total } else { 0.0 };
+                let t = t_a + ((t_b - t_a) as f64 * frac).round() as u32;
+                list[i].arr = Some(t);
+                list[i].dep = Some(t);
+                list[i].st.timepoint = 0;
+                interpolated += 1;
+            }
+        }
+        a = b;
+    }
+    for r in list.iter_mut() {
+        // Both are Some here: endpoints checked above, gaps filled.
+        let arr = r.arr.or(r.dep).unwrap_or(0);
+        let dep = r.dep.or(r.arr).unwrap_or(arr);
+        r.st.arrival_s = arr;
+        r.st.departure_s = dep;
+    }
+    Some(interpolated)
 }
 
 /// Load a GTFS zip from bytes into a namespaced FeedStaticBundle.
@@ -75,7 +264,9 @@ pub fn load_gtfs_bytes(feed_id: &str, bytes: &[u8]) -> Result<FeedStaticBundle> 
 
 /// Like [`load_gtfs_bytes`], but when `static_horizon_days` is `Some(n)`, only
 /// keep trips whose `service_id` is active on at least one day in
-/// `[today_utc, today_utc + n]` (inclusive). Reduces packed RAM for huge feeds.
+/// `[today - 1, today + n]` (inclusive, "today" in the feed's agency
+/// timezone; the extra day keeps yesterday's after-midnight trips).
+/// Reduces packed RAM for huge feeds.
 pub fn load_gtfs_bytes_with_horizon(
     feed_id: &str,
     bytes: &[u8],
@@ -144,6 +335,7 @@ pub fn load_gtfs_bytes_with_horizon(
         }
     }
     if let Some(cd) = calendar_dates_csv.as_ref() {
+        let mut bad_exceptions = 0usize;
         let mut rdr = csv::ReaderBuilder::new()
             .flexible(true)
             .from_reader(cd.as_bytes());
@@ -154,25 +346,46 @@ pub fn load_gtfs_bytes_with_horizon(
                 Some(d) => d,
                 None => continue,
             };
-            let et = rec
+            // Missing / unparseable / out-of-range exception_type: skip the
+            // row rather than guessing "added" (which would run the service).
+            let et = match rec
                 .get("exception_type")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(1u8);
+                .and_then(|s| s.trim().parse::<u8>().ok())
+            {
+                Some(et @ (1 | 2)) => et,
+                _ => {
+                    bad_exceptions += 1;
+                    continue;
+                }
+            };
             calendar.add_exception(sid, date, et);
+        }
+        if bad_exceptions > 0 {
+            warn!(
+                feed_id = %feed_id,
+                rows = bad_exceptions,
+                "calendar_dates: skipped rows with missing/invalid exception_type"
+            );
         }
     }
 
     let active_services: Option<std::collections::HashSet<String>> =
         static_horizon_days.map(|n| {
-            let today = Utc::now().date_naive();
+            // "Today" in the feed's local timezone, not UTC: around local
+            // midnight the UTC date is off by one. Start the window one day
+            // earlier so yesterday's after-midnight (> 24:00) trips survive.
+            let tz = feed_timezone(agency_csv.as_deref());
+            let today = Utc::now().with_timezone(&tz).date_naive();
+            let start = today.pred_opt().unwrap_or(today);
             let end = today
                 .checked_add_days(chrono::Days::new(n as u64))
                 .unwrap_or(today);
-            let set = calendar.services_active_in_range(today, end);
+            let set = calendar.services_active_in_range(start, end);
             info!(
                 feed_id = %feed_id,
                 horizon_days = n,
-                from = %today,
+                timezone = %tz,
+                from = %start,
                 to = %end,
                 active_services = set.len(),
                 "static horizon: filtering trips to services active in window"
@@ -428,7 +641,9 @@ pub fn load_gtfs_bytes_with_horizon(
     let mut headsign_to_idx: HashMap<String, u32> = HashMap::new();
 
     // Group stop_times by trip_id preserving sequence (skip trips dropped by horizon)
-    let mut times_by_trip: HashMap<String, Vec<(u16, PackedStopTime)>> = HashMap::new();
+    let mut times_by_trip: HashMap<String, Vec<RawStopTime>> = HashMap::new();
+    let mut bad_seq_rows = 0usize;
+    let mut bad_time_rows = 0usize;
     {
         let mut rdr = csv::ReaderBuilder::new()
             .flexible(true)
@@ -447,19 +662,31 @@ pub fn load_gtfs_bytes_with_horizon(
             let Some(&stop_idx) = stop_id_to_idx.get(&stop_ns) else {
                 continue;
             };
-            let dep = rec
-                .get("departure_time")
-                .and_then(|s| parse_time_to_seconds(s))
-                .or_else(|| rec.get("arrival_time").and_then(|s| parse_time_to_seconds(s)))
-                .unwrap_or(0);
-            let arr = rec
-                .get("arrival_time")
-                .and_then(|s| parse_time_to_seconds(s))
-                .unwrap_or(dep);
-            let seq = rec
+            // GTFS: arrival/departure may be empty at non-timepoint stops;
+            // keep them missing here and interpolate once the trip is sorted.
+            // A non-empty but malformed time is treated as missing too.
+            let mut time_field = |k: &str| -> Option<u32> {
+                let raw = rec.get(k).map(|s| s.trim()).unwrap_or("");
+                if raw.is_empty() {
+                    return None;
+                }
+                let t = parse_time_to_seconds(raw);
+                if t.is_none() {
+                    bad_time_rows += 1;
+                }
+                t
+            };
+            let dep_raw = time_field("departure_time");
+            let arr_raw = time_field("arrival_time");
+            // Required field: a parse failure must not silently become 0
+            // (that would reorder the trip) — drop the row instead.
+            let Some(seq) = rec
                 .get("stop_sequence")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0u16);
+                .and_then(|s| s.trim().parse::<u32>().ok())
+            else {
+                bad_seq_rows += 1;
+                continue;
+            };
             let pickup_type = rec
                 .get("pickup_type")
                 .and_then(|s| s.parse().ok())
@@ -498,12 +725,13 @@ pub fn load_gtfs_bytes_with_horizon(
                         t.parse::<f32>().ok()
                     }
                 });
-            times_by_trip.entry(raw_trip).or_default().push((
-                seq,
-                PackedStopTime {
+            times_by_trip.entry(raw_trip).or_default().push(RawStopTime {
+                arr: arr_raw.or(dep_raw),
+                dep: dep_raw.or(arr_raw),
+                st: PackedStopTime {
                     stop_idx,
-                    arrival_s: arr,
-                    departure_s: dep,
+                    arrival_s: 0,
+                    departure_s: 0,
                     stop_sequence: seq,
                     pickup_type,
                     drop_off_type,
@@ -511,8 +739,22 @@ pub fn load_gtfs_bytes_with_horizon(
                     timepoint,
                     shape_dist_traveled,
                 },
-            ));
+            });
         }
+    }
+    if bad_seq_rows > 0 {
+        warn!(
+            feed_id = %feed_id,
+            rows = bad_seq_rows,
+            "stop_times: skipped rows with missing/invalid stop_sequence"
+        );
+    }
+    if bad_time_rows > 0 {
+        warn!(
+            feed_id = %feed_id,
+            fields = bad_time_rows,
+            "stop_times: malformed arrival/departure times treated as missing"
+        );
     }
 
     let mut stop_times: Vec<PackedStopTime> = Vec::new();
@@ -522,19 +764,26 @@ pub fn load_gtfs_bytes_with_horizon(
     // Deterministic trip order — HashMap iteration is randomly seeded per
     // process, which would otherwise shuffle `epoch.trips`, breaking FLASH-TB
     // disk-cache shape validation and run-to-run reproducibility.
-    let mut ordered_trips: Vec<(String, Vec<(u16, PackedStopTime)>)> =
+    let mut ordered_trips: Vec<(String, Vec<RawStopTime>)> =
         times_by_trip.into_iter().collect();
     ordered_trips.sort_by(|a, b| a.0.cmp(&b.0));
 
+    let mut dropped_untimed_trips = 0usize;
+    let mut interpolated_stop_times = 0usize;
     for (raw_trip, mut list) in ordered_trips {
-        list.sort_by_key(|(seq, _)| *seq);
+        list.sort_by_key(|r| r.st.stop_sequence);
         let Some(meta) = trip_meta.get(&raw_trip) else {
             continue;
         };
+        let Some(n_interp) = fill_missing_times(&mut list, &stops) else {
+            dropped_untimed_trips += 1;
+            continue;
+        };
+        interpolated_stop_times += n_interp;
         let start = stop_times.len() as u32;
         let len = list.len() as u32;
-        for (_, st) in list {
-            stop_times.push(st);
+        for r in list {
+            stop_times.push(r.st);
         }
         let id = ns(feed_id, &raw_trip);
         let idx = trips.len() as u32;
@@ -554,6 +803,15 @@ pub fn load_gtfs_bytes_with_horizon(
             stop_time_start: start,
             stop_time_len: len,
         });
+    }
+
+    if dropped_untimed_trips > 0 || interpolated_stop_times > 0 {
+        info!(
+            feed_id = %feed_id,
+            dropped_trips = dropped_untimed_trips,
+            interpolated_stop_times,
+            "stop_times: interpolated blank times; dropped trips without first/last time"
+        );
     }
 
     let mut stop_departures: Vec<Vec<(u32, u32)>> = vec![Vec::new(); stops.len()];
@@ -1324,5 +1582,154 @@ mod tests {
         assert!(!geo.is_empty(), "leg_geometry should be non-empty");
         // Leaflet order: [lat, lon]
         assert!((geo[0][0] - 48.86).abs() < 0.01);
+    }
+
+    fn zip_of(files: &[(&str, &str)]) -> Vec<u8> {
+        let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+        let opts = SimpleFileOptions::default();
+        for (name, body) in files {
+            zip.start_file(*name, opts).unwrap();
+            zip.write_all(body.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap().into_inner()
+    }
+
+    const BASE_STOPS: &str = "stop_id,stop_name,stop_lat,stop_lon\n\
+        A,A,48.80,2.30\n\
+        B,B,48.81,2.30\n\
+        C,C,48.83,2.30\n\
+        D,D,48.84,2.30\n";
+    const BASE_ROUTES: &str = "route_id,route_short_name,route_long_name,route_type\nr1,1,One,3\n";
+    const BASE_CAL: &str = "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\n\
+        S1,1,1,1,1,1,1,1,20260101,20261231\n";
+
+    #[test]
+    fn time_and_date_parsing_rejects_garbage() {
+        assert_eq!(parse_time_to_seconds("08:05:30"), Some(8 * 3600 + 5 * 60 + 30));
+        assert_eq!(parse_time_to_seconds(" 25:30:00 "), Some(25 * 3600 + 30 * 60));
+        assert_eq!(parse_time_to_seconds("7:00:00"), Some(7 * 3600));
+        assert_eq!(parse_time_to_seconds(""), None);
+        assert_eq!(parse_time_to_seconds("73:00:00"), None);
+        assert_eq!(parse_time_to_seconds("4294967295:00:00"), None);
+        assert_eq!(parse_time_to_seconds("1193047:00:00"), None);
+        assert_eq!(parse_time_to_seconds("08:60:00"), None);
+        assert_eq!(parse_time_to_seconds("08:00:00:00"), None);
+        assert_eq!(parse_time_to_seconds("+8:00:00"), None);
+        assert_eq!(parse_time_to_seconds("é8:00:00"), None);
+
+        assert_eq!(parse_date("20260315"), NaiveDate::from_ymd_opt(2026, 3, 15));
+        // 8 bytes but non-ASCII: must not panic on a char-boundary slice.
+        assert_eq!("20260é1".len(), 8);
+        assert_eq!(parse_date("20260é1"), None);
+        assert_eq!(parse_date("2026-3-1"), None);
+        assert_eq!(parse_date("+2026031"), None);
+        assert_eq!(parse_date("20261340"), None);
+    }
+
+    #[test]
+    fn blank_stop_times_are_interpolated_and_untimed_trips_dropped() {
+        let bytes = zip_of(&[
+            ("stops.txt", BASE_STOPS),
+            ("routes.txt", BASE_ROUTES),
+            ("calendar.txt", BASE_CAL),
+            (
+                "trips.txt",
+                "route_id,service_id,trip_id\nr1,S1,shape\nr1,S1,geo\nr1,S1,noend\nr1,S1,bigseq\n",
+            ),
+            (
+                "stop_times.txt",
+                "trip_id,arrival_time,departure_time,stop_id,stop_sequence,shape_dist_traveled\n\
+                 shape,08:00:00,08:00:00,A,1,0\n\
+                 shape,,,B,2,100\n\
+                 shape,,,C,3,300\n\
+                 shape,08:40:00,08:41:00,D,4,400\n\
+                 geo,10:00:00,10:00:00,A,1,\n\
+                 geo,,,B,2,\n\
+                 geo,10:30:00,10:30:00,C,3,\n\
+                 noend,09:00:00,09:00:00,A,1,\n\
+                 noend,,,B,2,\n\
+                 bigseq,07:10:00,07:10:00,B,70000,\n\
+                 bigseq,07:00:00,07:00:00,A,5,\n\
+                 bigseq,07:05:00,07:05:00,C,x,\n",
+            ),
+        ]);
+        let bundle = load_gtfs_bytes("t", &bytes).unwrap();
+        let times = |trip: &str| -> Vec<(u32, u32, u32, u8)> {
+            let t = &bundle.trips[bundle.trip_id_to_idx[&format!("t:{trip}")] as usize];
+            let s = t.stop_time_start as usize;
+            bundle.stop_times[s..s + t.stop_time_len as usize]
+                .iter()
+                .map(|st| (st.stop_sequence, st.arrival_s, st.departure_s, st.timepoint))
+                .collect()
+        };
+        let h = |hh: u32, mm: u32| hh * 3600 + mm * 60;
+
+        // Interpolated by shape_dist_traveled: 8:00 → 8:40 over 0..400.
+        let shape = times("shape");
+        assert_eq!(shape.len(), 4);
+        assert_eq!(shape[1], (2, h(8, 10), h(8, 10), 0));
+        assert_eq!(shape[2], (3, h(8, 30), h(8, 30), 0));
+        assert_eq!(shape[3], (4, h(8, 40), h(8, 41), 1));
+
+        // No shape_dist: weighted by straight-line distance (A-B ≈ 1.1 km,
+        // B-C ≈ 2.2 km) → B at about a third of the 30-minute gap.
+        let geo = times("geo");
+        assert!(geo[1].1 > h(10, 9) && geo[1].1 < h(10, 11), "{geo:?}");
+        for w in geo.windows(2) {
+            assert!(w[0].2 <= w[1].1, "times must not go backwards: {geo:?}");
+        }
+
+        // Last stop untimed → trip dropped, never 00:00.
+        assert!(!bundle.trip_id_to_idx.contains_key("t:noend"));
+        assert!(bundle.stop_times.iter().all(|st| st.departure_s != 0));
+
+        // stop_sequence > u16::MAX keeps its value and order; an unparseable
+        // stop_sequence row is skipped instead of becoming 0.
+        let big = times("bigseq");
+        assert_eq!(big.len(), 2, "{big:?}");
+        assert_eq!(big[0].0, 5);
+        assert_eq!(big[1].0, 70000);
+        assert_eq!(big[1].1, h(7, 10));
+    }
+
+    #[test]
+    fn calendar_dates_missing_exception_type_is_skipped() {
+        let bytes = zip_of(&[
+            ("stops.txt", BASE_STOPS),
+            ("routes.txt", BASE_ROUTES),
+            (
+                "calendar_dates.txt",
+                "service_id,date,exception_type\n\
+                 X,20260310,\n\
+                 Y,20260310,abc\n\
+                 Z,20260310,3\n\
+                 OK,20260310,1\n",
+            ),
+            ("trips.txt", "route_id,service_id,trip_id\nr1,OK,t1\n"),
+            (
+                "stop_times.txt",
+                "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n\
+                 t1,08:00:00,08:00:00,A,1\nt1,08:05:00,08:05:00,B,2\n",
+            ),
+        ]);
+        let bundle = load_gtfs_bytes("t", &bytes).unwrap();
+        let d = NaiveDate::from_ymd_opt(2026, 3, 10).unwrap();
+        assert!(bundle.calendar.is_active("OK", d));
+        assert!(!bundle.calendar.is_active("X", d));
+        assert!(!bundle.calendar.is_active("Y", d));
+        assert!(!bundle.calendar.is_active("Z", d));
+    }
+
+    #[test]
+    fn zip_entry_over_cap_is_rejected() {
+        let big = "x".repeat(2048);
+        let bytes = zip_of(&[("stops.txt", big.as_str())]);
+        let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let name = find_zip_entry(&mut archive, "STOPS.TXT").unwrap();
+        assert!(read_named_zip_entry(&mut archive, &name, 1024).is_err());
+        assert_eq!(
+            read_named_zip_entry(&mut archive, &name, 4096).unwrap().len(),
+            2048
+        );
     }
 }

@@ -15,11 +15,11 @@ pub struct RtTripAdjust {
     /// Trip-level delay (s) when stop-level is absent.
     pub trip_delay_s: i32,
     /// stop_sequence → departure delay (s).
-    pub dep_delay: HashMap<u16, i32>,
+    pub dep_delay: HashMap<u32, i32>,
     /// stop_sequence → arrival delay (s).
-    pub arr_delay: HashMap<u16, i32>,
+    pub arr_delay: HashMap<u32, i32>,
     /// stop_sequence marked SKIPPED (no board / no alight).
-    pub skipped: HashSet<u16>,
+    pub skipped: HashSet<u32>,
 }
 
 impl RtTripAdjust {
@@ -42,21 +42,21 @@ impl RtTripAdjust {
         a
     }
 
-    pub fn dep_delay_for(&self, stop_sequence: u16) -> i32 {
+    pub fn dep_delay_for(&self, stop_sequence: u32) -> i32 {
         self.dep_delay
             .get(&stop_sequence)
             .copied()
             .unwrap_or(self.trip_delay_s)
     }
 
-    pub fn arr_delay_for(&self, stop_sequence: u16) -> i32 {
+    pub fn arr_delay_for(&self, stop_sequence: u32) -> i32 {
         self.arr_delay
             .get(&stop_sequence)
             .copied()
             .unwrap_or(self.trip_delay_s)
     }
 
-    pub fn is_skipped(&self, stop_sequence: u16) -> bool {
+    pub fn is_skipped(&self, stop_sequence: u32) -> bool {
         self.skipped.contains(&stop_sequence)
     }
 }
@@ -258,9 +258,9 @@ pub struct TransitLegData {
     pub from: StopRef,
     pub to: StopRef,
     /// GTFS `stop_sequence` at board (for RT stop matching).
-    pub from_stop_sequence: u16,
+    pub from_stop_sequence: u32,
     /// GTFS `stop_sequence` at alight.
-    pub to_stop_sequence: u16,
+    pub to_stop_sequence: u32,
     pub scheduled_departure: DateTime<Utc>,
     pub scheduled_arrival: DateTime<Utc>,
     pub realtime_departure: Option<DateTime<Utc>>,
@@ -774,7 +774,7 @@ fn apply_stop_realtime(
     trip_rt: Option<&TripRt>,
     trip_id: &str,
     scheduled: DateTime<Utc>,
-    stop_sequence: Option<u16>,
+    stop_sequence: Option<u32>,
     stop_id: Option<&str>,
     arrival: bool,
 ) -> crate::rt::overlay::StopRealtime {

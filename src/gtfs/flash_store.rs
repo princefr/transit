@@ -13,7 +13,10 @@ use std::path::{Path, PathBuf};
 use super::cell_bitset::CellBitSet;
 use super::pack::{StaticEpoch, TripTransferEntry};
 
-const MAGIC: &[u8; 6] = b"FLSH1\n";
+/// v2: header carries the pack fingerprint (trip set + pack parameters).
+const MAGIC: &[u8; 6] = b"FLSH2\n";
+/// Max fingerprint length accepted in the header.
+const MAX_FP_LEN: usize = 256;
 
 /// Content hash across all feed bundles (order-independent).
 pub fn feed_content_hash(bundles: &[std::sync::Arc<super::pack::FeedStaticBundle>]) -> String {
@@ -36,10 +39,17 @@ pub fn flash_path(dir: &Path, hash: &str) -> PathBuf {
 }
 
 /// Serialize `arc_flag_pattern`, `flag_patterns` and the pruned
-/// `trip_transfers` from `epoch` to `path`.
-pub fn save_flash(path: &Path, epoch: &StaticEpoch) -> io::Result<()> {
+/// `trip_transfers` from `epoch` to `path`. `fingerprint` identifies the
+/// exact packed trip set and pack parameters (see `pack::flash_pack_fingerprint`);
+/// [`load_flash`] rejects files whose fingerprint differs.
+pub fn save_flash(path: &Path, epoch: &StaticEpoch, fingerprint: &str) -> io::Result<()> {
+    if fingerprint.len() > MAX_FP_LEN {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "fingerprint too long"));
+    }
     let mut buf: Vec<u8> = Vec::with_capacity(8 << 20);
     buf.extend_from_slice(MAGIC);
+    put_u32(&mut buf, fingerprint.len() as u32);
+    buf.extend_from_slice(fingerprint.as_bytes());
     put_u32(&mut buf, epoch.num_cells);
     put_u32(&mut buf, epoch.arc_flag_pattern.len() as u32);
 
@@ -82,11 +92,14 @@ pub fn save_flash(path: &Path, epoch: &StaticEpoch) -> io::Result<()> {
     fs::rename(&tmp, path)
 }
 
-/// Load flag data previously written by [`save_flash`].
-/// Returns `(num_cells, arc_flag_pattern, flag_patterns, trip_transfers)`.
-pub fn load_flash(
-    path: &Path,
-) -> io::Result<Option<(u32, Vec<u32>, Vec<CellBitSet>, Vec<Vec<Vec<TripTransferEntry>>>)>> {
+/// Decoded flag cache: `(num_cells, arc_flag_pattern, flag_patterns, trip_transfers)`.
+pub type FlashData = (u32, Vec<u32>, Vec<CellBitSet>, Vec<Vec<Vec<TripTransferEntry>>>);
+
+/// Load flag data previously written by [`save_flash`]. Returns `Ok(None)`
+/// when the file is absent, has an old/unknown format, or was written for a
+/// different `fingerprint`. Callers must still [`validate_flash`] it against
+/// the epoch before use.
+pub fn load_flash(path: &Path, fingerprint: &str) -> io::Result<Option<FlashData>> {
     let data = match fs::read(path) {
         Ok(d) => d,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -97,6 +110,10 @@ pub fn load_flash(
         return Ok(None);
     }
     r.pos = MAGIC.len();
+    let fp_len = r.u32()? as usize;
+    if fp_len > MAX_FP_LEN || r.bytes(fp_len)? != fingerprint.as_bytes() {
+        return Ok(None);
+    }
     let num_cells = r.u32()?;
     let walk_n = r.u32()? as usize;
 
@@ -144,6 +161,64 @@ pub fn load_flash(
     }
 
     Ok(Some((num_cells, arc_flag_pattern, flag_patterns, trip_transfers)))
+}
+
+/// Check every index in cached flag data against `epoch` (shape and
+/// offsets). Any mismatch means the cache does not belong to this epoch and
+/// must be discarded — the query code indexes `stop_times` /
+/// `flag_patterns` with these values.
+pub fn validate_flash(epoch: &StaticEpoch, data: &FlashData) -> Result<(), String> {
+    let (num_cells, arc_flag_pattern, flag_patterns, trip_transfers) = data;
+    if *num_cells != epoch.num_cells {
+        return Err(format!("num_cells {} != {}", num_cells, epoch.num_cells));
+    }
+    let max_words = (*num_cells as usize).div_ceil(64);
+    if let Some(i) = flag_patterns.iter().position(|p| p.words().len() > max_words) {
+        return Err(format!("flag pattern {i} wider than {num_cells} cells"));
+    }
+    let n_patterns = flag_patterns.len();
+    if arc_flag_pattern.len() != epoch.walk_edges.len() {
+        return Err(format!(
+            "arc_flag_pattern len {} != walk edges {}",
+            arc_flag_pattern.len(),
+            epoch.walk_edges.len()
+        ));
+    }
+    if let Some(i) = arc_flag_pattern.iter().position(|&p| p as usize >= n_patterns) {
+        return Err(format!("walk edge {i} pattern out of range"));
+    }
+    if trip_transfers.len() != epoch.trips.len() {
+        return Err(format!(
+            "trip_transfers len {} != trips {}",
+            trip_transfers.len(),
+            epoch.trips.len()
+        ));
+    }
+    for (ti, per_alight) in trip_transfers.iter().enumerate() {
+        let trip = &epoch.trips[ti];
+        if per_alight.len() != trip.stop_time_len as usize {
+            return Err(format!(
+                "trip {ti}: {} alight slots != stop_time_len {}",
+                per_alight.len(),
+                trip.stop_time_len
+            ));
+        }
+        for e in per_alight.iter().flatten() {
+            let Some(target) = epoch.trips.get(e.target_trip as usize) else {
+                return Err(format!("trip {ti}: target_trip {} out of range", e.target_trip));
+            };
+            if e.target_board_off >= target.stop_time_len {
+                return Err(format!(
+                    "trip {ti}: target_board_off {} >= len {} of trip {}",
+                    e.target_board_off, target.stop_time_len, e.target_trip
+                ));
+            }
+            if e.flag_pattern as usize >= n_patterns {
+                return Err(format!("trip {ti}: flag_pattern {} out of range", e.flag_pattern));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Remove stale flag files in `dir`, keeping only `keep`.
@@ -223,8 +298,11 @@ mod tests {
         epoch.flag_patterns = flag_patterns.clone();
         epoch.trip_transfers = trip_transfers.clone();
 
-        save_flash(&path, &epoch).unwrap();
-        let (cells, ap, fp, tt) = load_flash(&path).unwrap().unwrap();
+        save_flash(&path, &epoch, "fp-a").unwrap();
+        // Different pack fingerprint (e.g. trip set changed under the same
+        // zip SHA) → cache ignored.
+        assert!(load_flash(&path, "fp-b").unwrap().is_none());
+        let (cells, ap, fp, tt) = load_flash(&path, "fp-a").unwrap().unwrap();
         assert_eq!(cells, num_cells);
         assert_eq!(ap, arc_flag_pattern);
         assert_eq!(fp.len(), 2);
@@ -234,6 +312,67 @@ mod tests {
 
         // Corrupt magic → treated as absent
         std::fs::write(&path, b"garbage").unwrap();
-        assert!(load_flash(&path).unwrap().is_none());
+        assert!(load_flash(&path, "fp-a").unwrap().is_none());
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_offsets() {
+        use crate::gtfs::pack::GlobalTrip;
+        use crate::gtfs::pack::RouteMode;
+        let trip = |len: u32| GlobalTrip {
+            id: "t".into(),
+            feed_id: "f".into(),
+            route_id: "r".into(),
+            service_id: "s".into(),
+            headsign: None,
+            short_name: None,
+            direction_id: None,
+            wheelchair: 0,
+            bikes_allowed: 0,
+            block_id: None,
+            shape_id: None,
+            mode: RouteMode::Bus,
+            route_short_name: String::new(),
+            route_long_name: String::new(),
+            route_color: None,
+            route_text_color: None,
+            route_type_raw: 3,
+            agency_name: None,
+            stop_time_start: 0,
+            stop_time_len: len,
+            frequency_windows: vec![],
+        };
+        let mut epoch = StaticEpoch::empty();
+        epoch.num_cells = 64;
+        epoch.trips = vec![trip(2), trip(3)];
+        let entry = |target_trip, target_board_off| TripTransferEntry {
+            target_trip,
+            target_board_off,
+            min_transfer_s: 120,
+            flag_pattern: 0,
+        };
+        let good: FlashData = (
+            64,
+            vec![],
+            vec![CellBitSet::new(64)],
+            vec![vec![vec![entry(1, 2)], vec![]], vec![vec![], vec![], vec![]]],
+        );
+        assert!(validate_flash(&epoch, &good).is_ok());
+
+        let mut bad_off = good.clone();
+        bad_off.3[0][0][0].target_board_off = 3; // trip 1 has 3 stops
+        assert!(validate_flash(&epoch, &bad_off).is_err());
+
+        let mut bad_trip = good.clone();
+        bad_trip.3[0][0][0].target_trip = 2;
+        assert!(validate_flash(&epoch, &bad_trip).is_err());
+
+        let mut bad_pat = good.clone();
+        bad_pat.3[0][0][0].flag_pattern = 1;
+        assert!(validate_flash(&epoch, &bad_pat).is_err());
+
+        let mut bad_len = good;
+        bad_len.3[1].pop();
+        assert!(validate_flash(&epoch, &bad_len).is_err());
     }
 }

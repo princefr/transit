@@ -97,7 +97,7 @@ pub fn apply_trip_updates(feed_id: &str, bytes: &[u8], state: &mut FeedRtState) 
         let mut stop_updates = std::collections::HashMap::new();
         for stu in tu.stop_time_update {
             // stop_sequence optional; 0 is valid but rare — still accept
-            let seq = stu.stop_sequence.unwrap_or(0) as u16;
+            let seq = stu.stop_sequence.unwrap_or(0);
             let stop_id = stu
                 .stop_id
                 .as_ref()

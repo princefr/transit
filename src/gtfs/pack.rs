@@ -215,7 +215,7 @@ pub struct PackedStopTime {
     pub stop_idx: u32,
     pub arrival_s: u32,
     pub departure_s: u32,
-    pub stop_sequence: u16,
+    pub stop_sequence: u32,
     pub pickup_type: u8,
     pub drop_off_type: u8,
     /// Index into feed/epoch `headsign_pool` (0 = none / empty).
@@ -798,55 +798,29 @@ pub fn build_epoch_with_flash(
         FlashMode::Skip => {}
         FlashMode::Persist(dir) => {
             use super::flash_store;
-            use sha2::{Digest, Sha256};
-            // Fingerprint the walk graph layout: flag arrays are indexed by
-            // edge position, so any reordering must invalidate the cache.
-            let mut gh = Sha256::new();
-            gh.update((epoch.walk_edges.len() as u64).to_le_bytes());
-            for e in &epoch.walk_edges {
-                gh.update(e.from_stop_idx.to_le_bytes());
-                gh.update(e.to_stop_idx.to_le_bytes());
-                gh.update(e.duration_s.to_le_bytes());
-            }
-            let graph_fp = format!("{:x}", gh.finalize());
+            // The zip SHA alone is not enough: with a static horizon the
+            // retained trip set shifts daily under the same SHA, and flag
+            // arrays are indexed by walk-edge / trip / stop-time position.
+            let pack_fp = flash_pack_fingerprint(&epoch);
             let hash = format!(
                 "{}-{}",
                 flash_store::feed_content_hash(&bundles),
-                &graph_fp[..12]
+                &pack_fp[..16]
             );
             let path = flash_store::flash_path(dir, &hash);
-            let cached = flash_store::load_flash(&path).ok().flatten().and_then(
-                |(num_cells, arc_flag_pattern, flag_patterns, trip_transfers)| {
-                    // Validate shape against the freshly built epoch.
-                    let shape_ok = num_cells == epoch.num_cells
-                        && arc_flag_pattern.len() == epoch.walk_edges.len()
-                        && trip_transfers.len() == epoch.trip_transfers.len()
-                        && trip_transfers
-                            .iter()
-                            .zip(epoch.trip_transfers.iter())
-                            .all(|(a, b)| a.len() == b.len());
-                    if !shape_ok {
-                        let first_bad = trip_transfers
-                            .iter()
-                            .zip(epoch.trip_transfers.iter())
-                            .position(|(a, b)| a.len() != b.len());
-                        eprintln!(
-                            "[pack] flash cache shape mismatch: cells({} vs {}) walk({}, {}) trips({}, {}) first_bad_trip={:?} bad_lens=({:?}, {:?})",
-                            num_cells, epoch.num_cells,
-                            arc_flag_pattern.len(), epoch.walk_edges.len(),
-                            trip_transfers.len(), epoch.trip_transfers.len(),
-                            first_bad,
-                            first_bad.map(|i| trip_transfers[i].len()),
-                            first_bad.map(|i| epoch.trip_transfers[i].len())
-                        );
+            let cached = flash_store::load_flash(&path, &pack_fp)
+                .ok()
+                .flatten()
+                .and_then(|data| match flash_store::validate_flash(&epoch, &data) {
+                    Ok(()) => {
+                        let (_, ap, fp, tt) = data;
+                        Some((ap, fp, tt))
                     }
-                    if shape_ok {
-                        Some((arc_flag_pattern, flag_patterns, trip_transfers))
-                    } else {
+                    Err(why) => {
+                        eprintln!("[pack] flash cache rejected: {why}");
                         None
                     }
-                },
-            );
+                });
             if std::env::var("TRANSIT_PROFILE").ok().as_deref() == Some("1") {
                 eprintln!("[pack] flash cache key {} -> {}", hash, path.display());
             }
@@ -867,7 +841,7 @@ pub fn build_epoch_with_flash(
                 None => {
                     compute_arc_flags(&mut epoch);
                     if !epoch.flag_patterns.is_empty() {
-                        match flash_store::save_flash(&path, &epoch) {
+                        match flash_store::save_flash(&path, &epoch, &pack_fp) {
                             Ok(()) => {
                                 flash_store::prune_flash_dir(dir, &hash);
                                 eprintln!(
@@ -901,6 +875,52 @@ pub fn build_epoch_with_flash(
 /// Sort each stop's departure list by scheduled departure time so RAPTOR can
 /// binary-search the first boardable entry, and flag stops served by
 /// frequency-based trips (template times break the ordering invariant).
+/// Fingerprint of everything the FLASH-TB flag cache depends on: the walk
+/// graph layout, the packed trip set in order (ids, stop events, times,
+/// pickup/drop-off) and the pack parameters. Hex SHA-256.
+fn flash_pack_fingerprint(epoch: &StaticEpoch) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"flash-pack-v1\n");
+    // Pack parameters.
+    h.update(FLASH_HORIZON_S.to_le_bytes());
+    h.update(FLASH_MIN_TRANSFER_S.to_le_bytes());
+    h.update((FLASH_MAX_ROUNDS as u64).to_le_bytes());
+    for key in ["TRANSIT_FLASH_SOURCES", "TRANSIT_FLASH_SAMPLES"] {
+        let v = std::env::var(key).unwrap_or_default();
+        h.update(key.as_bytes());
+        h.update(b"=");
+        h.update(v.trim().as_bytes());
+        h.update(b"\n");
+    }
+    h.update((epoch.stops.len() as u64).to_le_bytes());
+    h.update(epoch.num_cells.to_le_bytes());
+    // Walk graph layout (flags are indexed by edge position).
+    h.update((epoch.walk_edges.len() as u64).to_le_bytes());
+    for e in &epoch.walk_edges {
+        h.update(e.from_stop_idx.to_le_bytes());
+        h.update(e.to_stop_idx.to_le_bytes());
+        h.update(e.duration_s.to_le_bytes());
+    }
+    // Trip set, in packed order.
+    h.update((epoch.trips.len() as u64).to_le_bytes());
+    for t in &epoch.trips {
+        h.update((t.id.len() as u64).to_le_bytes());
+        h.update(t.id.as_bytes());
+        h.update(t.stop_time_len.to_le_bytes());
+        h.update((t.frequency_windows.len() as u32).to_le_bytes());
+        let start = t.stop_time_start as usize;
+        let end = start + t.stop_time_len as usize;
+        for st in epoch.stop_times.get(start..end).unwrap_or(&[]) {
+            h.update(st.stop_idx.to_le_bytes());
+            h.update(st.arrival_s.to_le_bytes());
+            h.update(st.departure_s.to_le_bytes());
+            h.update([st.pickup_type, st.drop_off_type]);
+        }
+    }
+    format!("{:x}", h.finalize())
+}
+
 fn sort_stop_departures(epoch: &mut StaticEpoch) {
     epoch.stop_has_freq = vec![false; epoch.stops.len()];
     let trips = &epoch.trips;
