@@ -7,6 +7,9 @@ use std::time::Duration;
 
 pub const DEFAULT_BASE_URL: &str = "https://prim.iledefrance-mobilites.fr";
 
+/// Upper bound on a single PRIM SIRI Lite response body (ET for a busy line is a few MiB).
+const MAX_PRIM_BODY_BYTES: u64 = 32 * 1024 * 1024;
+
 #[derive(Clone)]
 pub struct PrimClient {
     http: reqwest::Client,
@@ -40,11 +43,10 @@ impl PrimClient {
                 "empty env {api_key_env} for PRIM apikey"
             )));
         }
-        let http = reqwest::Client::builder()
-            .gzip(true)
-            .pool_max_idle_per_host(4)
-            .build()
-            .map_err(|e| TransitError::Config(format!("prim reqwest: {e}")))?;
+        // One process-wide reqwest client (connection pool + TLS config) shared by
+        // every `PrimClient`, so per-request `from_env` calls are cheap and reuse
+        // keep-alive connections instead of re-handshaking with PRIM.
+        let http = shared_http()?;
         Ok(Self {
             http,
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -74,24 +76,43 @@ impl PrimClient {
     /// Global min gap between PRIM calls (~700ms) so SM+ET+GM never stampede
     /// the short-term rate limit (HTTP 429).
     pub async fn get_bytes(&self, path: &str) -> Result<Vec<u8>> {
-        pace_prim_request().await;
+        pace_prim_request(None).await;
+        self.get_bytes_unpaced(path).await
+    }
+
+    /// Like [`get_bytes`](Self::get_bytes) but gives up (without calling PRIM and
+    /// without reserving a pacer slot) when the shared pacer queue would make
+    /// this request wait longer than `max_wait`. Used by on-demand GraphQL paths
+    /// so user traffic never piles up behind the background pollers.
+    pub async fn get_bytes_bounded(&self, path: &str, max_wait: Duration) -> Result<Vec<u8>> {
+        if !pace_prim_request(Some(max_wait)).await {
+            return Err(TransitError::Http(format!(
+                "PRIM pacer busy (wait > {}ms); skipped",
+                max_wait.as_millis()
+            )));
+        }
+        self.get_bytes_unpaced(path).await
+    }
+
+    async fn get_bytes_unpaced(&self, path: &str) -> Result<Vec<u8>> {
         let url = self.absolute_url(path);
         let resp = self
             .http
             .get(&url)
             .header("apikey", &self.api_key)
             .header(reqwest::header::USER_AGENT, &self.user_agent)
-            .header(reqwest::header::ACCEPT, "application/json, application/xml, */*")
+            .header(
+                reqwest::header::ACCEPT,
+                "application/json, application/xml, */*",
+            )
             .timeout(self.timeout)
             .send()
             .await
             .map_err(|e| TransitError::Http(format!("PRIM GET {url}: {e}")))?;
         let status = resp.status();
-        let bytes = resp
-            .bytes()
+        let bytes = crate::feeds::download::read_body_capped(resp, &url, MAX_PRIM_BODY_BYTES)
             .await
-            .map_err(|e| TransitError::Http(format!("PRIM body {url}: {e}")))?
-            .to_vec();
+            .map_err(|e| TransitError::Http(format!("PRIM body {url}: {e}")))?;
         if !status.is_success() {
             let hint = String::from_utf8_lossy(&bytes[..bytes.len().min(200)]);
             return Err(TransitError::Http(format!(
@@ -102,28 +123,57 @@ impl PrimClient {
     }
 }
 
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
+static SHARED_HTTP: OnceLock<reqwest::Client> = OnceLock::new();
+
+fn shared_http() -> Result<reqwest::Client> {
+    if let Some(c) = SHARED_HTTP.get() {
+        return Ok(c.clone());
+    }
+    let built = reqwest::Client::builder()
+        .gzip(true)
+        .pool_max_idle_per_host(4)
+        .build()
+        .map_err(|e| TransitError::Config(format!("prim reqwest: {e}")))?;
+    // Another thread may have won the race; either client is equivalent.
+    Ok(SHARED_HTTP.get_or_init(|| built).clone())
+}
+
+/// Time slot (start instant) reserved by the most recent PRIM request.
 static LAST_PRIM_AT: Mutex<Option<Instant>> = Mutex::new(None);
 const PRIM_MIN_GAP_MS: u64 = 700;
 
-async fn pace_prim_request() {
-    let wait_ms = {
+/// Compute the next free pacer slot given the last reserved one.
+fn next_prim_slot(prev: Option<Instant>, now: Instant) -> Instant {
+    match prev {
+        Some(p) => (p + Duration::from_millis(PRIM_MIN_GAP_MS)).max(now),
+        None => now,
+    }
+}
+
+/// Reserve the next pacer slot (≥ 700ms after the previously reserved one) and
+/// sleep until it. With `max_wait`, returns `false` without reserving when the
+/// slot is further away than that.
+async fn pace_prim_request(max_wait: Option<Duration>) -> bool {
+    let wait = {
         let mut guard = LAST_PRIM_AT.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
-        let wait = if let Some(prev) = *guard {
-            let elapsed = now.duration_since(prev).as_millis() as u64;
-            PRIM_MIN_GAP_MS.saturating_sub(elapsed)
-        } else {
-            0
-        };
-        *guard = Some(now + Duration::from_millis(wait));
+        let slot = next_prim_slot(*guard, now);
+        let wait = slot.saturating_duration_since(now);
+        if let Some(max) = max_wait {
+            if wait > max {
+                return false;
+            }
+        }
+        *guard = Some(slot);
         wait
     };
-    if wait_ms > 0 {
-        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+    if !wait.is_zero() {
+        tokio::time::sleep(wait).await;
     }
+    true
 }
 
 #[cfg(test)]
@@ -143,5 +193,18 @@ mod tests {
             c.absolute_url("/marketplace/estimated-timetable"),
             "https://prim.example/marketplace/estimated-timetable"
         );
+    }
+
+    #[test]
+    fn pacer_slots_stack_instead_of_collapsing() {
+        let now = Instant::now();
+        let gap = Duration::from_millis(PRIM_MIN_GAP_MS);
+        assert_eq!(next_prim_slot(None, now), now);
+        // Previous slot already reserved in the future → next one is a full gap later.
+        let s1 = now + gap;
+        assert_eq!(next_prim_slot(Some(s1), now), s1 + gap);
+        // Old slot long past → now.
+        let old = now.checked_sub(Duration::from_secs(10)).unwrap_or(now);
+        assert!(next_prim_slot(Some(old), now) >= now);
     }
 }

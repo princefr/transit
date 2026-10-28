@@ -2,6 +2,7 @@ use crate::config::FeedConfig;
 use crate::error::Result;
 use crate::feeds::download::{
     download_conditional_with_headers, read_meta, write_current_zip, write_meta, FeedMeta,
+    MAX_STATIC_ZIP_BYTES,
 };
 use crate::feeds::FeedEvent;
 use crate::gtfs::parse::load_gtfs_bytes_with_horizon;
@@ -71,8 +72,19 @@ async fn try_load_initial(
         let t0 = Instant::now();
         let bytes = tokio::fs::read(&zip_path).await?;
         let nbytes = bytes.len();
+        // Validate + hash (~100 MB) + meta read off the async runtime.
+        let dd = data_dir.clone();
+        let fid = feed.id.clone();
+        let (bytes, valid, meta, disk_sha) = tokio::task::spawn_blocking(move || {
+            let valid = crate::feeds::download::validate_gtfs_zip(&bytes);
+            let meta = read_meta(&dd, &fid);
+            let sha = crate::feeds::download::sha256_hex(&bytes);
+            (bytes, valid, meta, sha)
+        })
+        .await
+        .map_err(|e| crate::error::TransitError::Other(e.into()))?;
         // Validate cached zip before parse; if corrupt, fall through to network
-        if let Err(e) = crate::feeds::download::validate_gtfs_zip(&bytes) {
+        if let Err(e) = valid {
             warn!(
                 feed_id = %feed.id,
                 error = %e,
@@ -80,8 +92,6 @@ async fn try_load_initial(
             );
             return check_and_update(feed, data_dir, client, timeout, build_sem, tx).await;
         }
-        let meta = read_meta(data_dir, &feed.id);
-        let disk_sha = crate::feeds::download::sha256_hex(&bytes);
         if let Some(ref known) = meta.sha256 {
             if known != &disk_sha {
                 warn!(
@@ -135,6 +145,7 @@ async fn try_load_initial(
     check_and_update(feed, data_dir, client, timeout, build_sem, tx).await
 }
 
+#[allow(clippy::ptr_arg)] // owned clones move into spawn_blocking
 async fn check_and_update(
     feed: &FeedConfig,
     data_dir: &PathBuf,
@@ -145,7 +156,13 @@ async fn check_and_update(
 ) -> Result<()> {
     let t0 = Instant::now();
     crate::gtfs::load_progress::set_phase(crate::gtfs::load_progress::PHASE_DOWNLOAD);
-    let meta = read_meta(data_dir, &feed.id);
+    let meta = {
+        let dd = data_dir.clone();
+        let fid = feed.id.clone();
+        tokio::task::spawn_blocking(move || read_meta(&dd, &fid))
+            .await
+            .map_err(|e| crate::error::TransitError::Other(e.into()))?
+    };
     let headers: Vec<(String, String)> = feed.auth_header_pair().into_iter().collect();
     let dl = download_conditional_with_headers(
         client,
@@ -154,6 +171,7 @@ async fn check_and_update(
         meta.etag.as_deref(),
         timeout,
         &headers,
+        MAX_STATIC_ZIP_BYTES,
     )
     .await?;
 
@@ -194,23 +212,17 @@ async fn check_and_update(
         "validating and promoting static GTFS zip"
     );
 
-    // validate + promote (write_current_zip validates stops.txt + stop_times.txt)
-    write_current_zip(data_dir, &feed.id, &dl.bytes)?;
-    write_meta(
-        data_dir,
-        &feed.id,
-        &FeedMeta {
-            etag: dl.etag.clone(),
-            sha256: Some(dl.sha256.clone()),
-            loaded_at: Some(chrono::Utc::now().to_rfc3339()),
-            static_url: Some(feed.static_url.clone()),
-        },
-    )?;
-
     let feed_id = feed.id.clone();
     let bytes = dl.bytes;
     let sha = dl.sha256.clone();
     let horizon = feed.static_horizon_days;
+    let new_meta = FeedMeta {
+        etag: dl.etag.clone(),
+        sha256: Some(dl.sha256.clone()),
+        loaded_at: Some(chrono::Utc::now().to_rfc3339()),
+        static_url: Some(feed.static_url.clone()),
+    };
+    let dd = data_dir.clone();
     let _permit = build_sem
         .acquire()
         .await
@@ -220,10 +232,13 @@ async fn check_and_update(
         feed_id = %feed.id,
         bytes = nbytes,
         horizon_days = ?horizon,
-        "parsing static GTFS (blocking pool)"
+        "promoting + parsing static GTFS (blocking pool)"
     );
     crate::gtfs::load_progress::set_phase(crate::gtfs::load_progress::PHASE_PARSE);
     let bundle = tokio::task::spawn_blocking(move || {
+        // validate + promote (write_current_zip validates stops.txt + stop_times.txt)
+        write_current_zip(&dd, &feed_id, &bytes)?;
+        write_meta(&dd, &feed_id, &new_meta)?;
         load_gtfs_bytes_with_horizon(&feed_id, &bytes, horizon)
     })
     .await

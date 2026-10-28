@@ -1,6 +1,4 @@
-use async_graphql::{
-    Context, EmptyMutation, Object, Result, Schema, Subscription, ID,
-};
+use async_graphql::{Context, EmptyMutation, Object, Result, Schema, Subscription, ID};
 use chrono::Utc;
 use futures_util::Stream;
 use std::sync::Arc;
@@ -21,11 +19,126 @@ pub type ServiceSchema = Schema<QueryRoot, EmptyMutation, SubscriptionRoot>;
 pub fn build_schema(state: Arc<AppState>) -> ServiceSchema {
     let depth = state.config.graphql.max_depth.max(1);
     let complexity = state.config.graphql.max_complexity.max(1);
-    Schema::build(QueryRoot, EmptyMutation, SubscriptionRoot)
+    let playground = state.config.server.graphql_playground;
+    let mut builder = Schema::build(QueryRoot, EmptyMutation, SubscriptionRoot)
         .data(state)
         .limit_depth(depth)
-        .limit_complexity(complexity)
-        .finish()
+        .limit_complexity(complexity);
+    if !playground {
+        // Production: no schema introspection when the playground is off.
+        builder = builder.disable_introspection();
+    }
+    builder.finish()
+}
+
+/// Complexity cost of one `itineraries` field (plus its selection set).
+/// With the default `max_complexity = 300` at most one plan (with a realistic
+/// selection set, ~100 fields for the web UI) fits per request,
+/// so a single POST cannot alias dozens of RAPTOR jobs.
+pub const ITINERARIES_COMPLEXITY: usize = 150;
+/// Cost of `departures` (may trigger an on-demand PRIM call when `live`).
+pub const DEPARTURES_COMPLEXITY: usize = 40;
+/// Cost of free-text search resolvers (`stops`, `addresses`, `places`).
+pub const SEARCH_COMPLEXITY: usize = 20;
+
+/// Age (s) after which trip updates are considered stale for `FeedStatus.ok`.
+const FEED_TU_FRESH_SECS: u64 = 300;
+
+/// One `FeedStatus` per enabled feed — shared by the `health` query and the
+/// `feedStatus` subscription so `ok` means the same thing in both.
+fn feed_statuses(state: &AppState) -> Vec<FeedStatus> {
+    let epoch = state.load_epoch();
+    let rt = state.load_rt();
+    let mut feeds = Vec::new();
+    for f in state.config.enabled_feeds() {
+        let fr = rt.feeds.get(&f.id);
+        let tu_age = fr.and_then(|x| x.trip_updates_age_secs());
+        let bundle = epoch.feeds.get(&f.id);
+        feeds.push(FeedStatus {
+            id: ID(f.id.clone()),
+            static_loaded: bundle.is_some(),
+            trip_updates_age_seconds: tu_age.map(|s| s as i32),
+            vehicle_positions_age_seconds: fr.and_then(|x| x.vehicles_age_secs()).map(|s| s as i32),
+            alerts_age_seconds: fr.and_then(|x| x.alerts_age_secs()).map(|s| s as i32),
+            trip_update_count: fr.map(|x| x.trip_update_count as i32).unwrap_or(0),
+            vehicle_count: fr.map(|x| x.vehicle_count as i32).unwrap_or(0),
+            alert_count: fr.map(|x| x.alert_count as i32).unwrap_or(0),
+            ok: bundle.is_some()
+                && tu_age
+                    .map(|a| (a as u64) < FEED_TU_FRESH_SECS)
+                    .unwrap_or(false),
+            feed_start_date: bundle.and_then(|b| b.feed_start_date.clone()),
+            feed_end_date: bundle.and_then(|b| b.feed_end_date.clone()),
+            publisher: bundle.and_then(|b| b.feed_publisher_name.clone()),
+        });
+    }
+    feeds
+}
+
+/// Per-websocket-connection subscription counter, inserted as connection data
+/// by the `/ws` handler (see `api::ws_handler`).
+#[derive(Clone)]
+pub struct WsSubscriptionBudget {
+    active: Arc<std::sync::atomic::AtomicUsize>,
+    max: usize,
+}
+
+impl WsSubscriptionBudget {
+    pub fn new(max: usize) -> Self {
+        Self {
+            active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max: max.max(1),
+        }
+    }
+
+    /// Reserve one subscription slot; the guard frees it when the stream drops.
+    pub fn try_acquire(&self) -> Option<WsSubscriptionGuard> {
+        use std::sync::atomic::Ordering;
+        let mut cur = self.active.load(Ordering::Relaxed);
+        loop {
+            if cur >= self.max {
+                return None;
+            }
+            match self.active.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Some(WsSubscriptionGuard {
+                        active: self.active.clone(),
+                    })
+                }
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+}
+
+pub struct WsSubscriptionGuard {
+    active: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for WsSubscriptionGuard {
+    fn drop(&mut self) {
+        self.active
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Take a per-connection subscription slot when running under the `/ws`
+/// handler (no budget in context — e.g. tests — means unlimited).
+fn acquire_subscription_slot(ctx: &Context<'_>) -> Result<Option<WsSubscriptionGuard>> {
+    match ctx.data_opt::<WsSubscriptionBudget>() {
+        None => Ok(None),
+        Some(b) => b.try_acquire().map(Some).ok_or_else(|| {
+            gql_err(
+                format!("too many subscriptions on this connection (max {})", b.max),
+                "TOO_MANY_SUBSCRIPTIONS",
+            )
+        }),
+    }
 }
 
 pub struct QueryRoot;
@@ -35,29 +148,7 @@ impl QueryRoot {
     async fn health(&self, ctx: &Context<'_>) -> Result<SystemHealth> {
         let state = ctx.data::<Arc<AppState>>()?;
         let epoch = state.load_epoch();
-        let rt = state.load_rt();
-        let mut feeds = Vec::new();
-        for f in state.config.enabled_feeds() {
-            let fr = rt.feeds.get(&f.id);
-            let tu_age = fr.and_then(|x| x.trip_updates_age_secs());
-            let bundle = epoch.feeds.get(&f.id);
-            feeds.push(FeedStatus {
-                id: ID(f.id.clone()),
-                static_loaded: bundle.is_some(),
-                trip_updates_age_seconds: tu_age.map(|s| s as i32),
-                vehicle_positions_age_seconds: fr
-                    .and_then(|x| x.vehicles_age_secs())
-                    .map(|s| s as i32),
-                alerts_age_seconds: fr.and_then(|x| x.alerts_age_secs()).map(|s| s as i32),
-                trip_update_count: fr.map(|x| x.trip_update_count as i32).unwrap_or(0),
-                vehicle_count: fr.map(|x| x.vehicle_count as i32).unwrap_or(0),
-                alert_count: fr.map(|x| x.alert_count as i32).unwrap_or(0),
-                ok: bundle.is_some() && tu_age.map(|a| a < 300).unwrap_or(false),
-                feed_start_date: bundle.and_then(|b| b.feed_start_date.clone()),
-                feed_end_date: bundle.and_then(|b| b.feed_end_date.clone()),
-                publisher: bundle.and_then(|b| b.feed_publisher_name.clone()),
-            });
-        }
+        let feeds = feed_statuses(state);
         let status = if epoch.trip_count() > 0 {
             "ok".into()
         } else {
@@ -77,6 +168,7 @@ impl QueryRoot {
     /// - `search`: case-insensitive substring (min 2 chars when used alone)
     /// - `near`: lat/lon + radius via haversine neighborhood
     /// When both are set, results are the nearby stops filtered by name.
+    #[graphql(complexity = "SEARCH_COMPLEXITY + child_complexity")]
     async fn stops(
         &self,
         ctx: &Context<'_>,
@@ -87,7 +179,7 @@ impl QueryRoot {
         let state = ctx.data::<Arc<AppState>>()?;
         let epoch = state.load_epoch();
         let limit = limit.unwrap_or(15).clamp(1, 50) as usize;
-        let q = search.unwrap_or_default();
+        let q = crate::cache::clamp_search(&search.unwrap_or_default()).to_string();
         let cache_key = state
             .cache
             .stops_key(&epoch.id, &q, near.as_ref(), limit as i32);
@@ -103,7 +195,13 @@ impl QueryRoot {
             }
             let radius = n.radius_meters.clamp(1.0, 5_000.0);
             let points = epoch.geo_stop_points_view();
-            let hits = nearby(&points, n.lat, n.lon, radius, limit.saturating_mul(4).max(limit));
+            let hits = nearby(
+                &points,
+                n.lat,
+                n.lon,
+                radius,
+                limit.saturating_mul(4).max(limit),
+            );
             let mut out = Vec::new();
             for (idx, _dist) in hits {
                 let s = &epoch.stops[idx];
@@ -146,6 +244,7 @@ impl QueryRoot {
     /// Requires `make ban-index` (downloads IDF BAN CSV + builds `data/ban/index.bin`).
     /// Returns empty when the index is not loaded. Use hits with `lat`/`lon` as
     /// `itineraries(input: { from: { lat, lon, name }, … })` (door-to-door snap).
+    #[graphql(complexity = "SEARCH_COMPLEXITY + child_complexity")]
     async fn addresses(
         &self,
         ctx: &Context<'_>,
@@ -153,7 +252,7 @@ impl QueryRoot {
         limit: Option<i32>,
     ) -> Result<Vec<AddressSuggestion>> {
         let state = ctx.data::<Arc<AppState>>()?;
-        let q = search.trim();
+        let q = crate::cache::clamp_search(&search);
         if q.chars().count() < 2 {
             return Ok(vec![]);
         }
@@ -192,6 +291,7 @@ impl QueryRoot {
     }
 
     /// Unified place search: **stops** + **BAN addresses** for origin/destination fields.
+    #[graphql(complexity = "SEARCH_COMPLEXITY + child_complexity")]
     async fn places(
         &self,
         ctx: &Context<'_>,
@@ -202,7 +302,7 @@ impl QueryRoot {
         let epoch = state.load_epoch();
         let ban = state.load_ban();
         let limit = limit.unwrap_or(12).clamp(1, 30) as usize;
-        let q = search.trim();
+        let q = crate::cache::clamp_search(&search);
         if q.chars().count() < 2 {
             return Ok(vec![]);
         }
@@ -278,11 +378,7 @@ impl QueryRoot {
     }
 
     /// Agencies for a feed (or all feeds when `feedId` is omitted). Empty when not packed.
-    async fn agencies(
-        &self,
-        ctx: &Context<'_>,
-        feed_id: Option<String>,
-    ) -> Result<Vec<Agency>> {
+    async fn agencies(&self, ctx: &Context<'_>, feed_id: Option<String>) -> Result<Vec<Agency>> {
         let state = ctx.data::<Arc<AppState>>()?;
         let epoch = state.load_epoch();
         let mut out = Vec::new();
@@ -305,6 +401,7 @@ impl QueryRoot {
     /// 1. If `live` (default true) and PRIM key is set: try **SIRI Stop Monitoring**
     ///    (raw, not Navitia).
     /// 2. Else / fallback: static GTFS `stop_departures` + RT overlay.
+    #[graphql(complexity = "DEPARTURES_COMPLEXITY + child_complexity")]
     async fn departures(
         &self,
         ctx: &Context<'_>,
@@ -340,17 +437,19 @@ impl QueryRoot {
                 ) {
                     match crate::prim::stop_board::fetch_live_board(&client, &mon, limit).await {
                         Ok(board) => {
-                            // Merge SM trips + VehicleLocation GPS into the live overlay
-                            // so the map can show real dots (not only estimated).
+                            // Hand SM trips + VehicleLocation GPS to the feed supervisor,
+                            // which merges them into its RT state (with eviction) and
+                            // republishes the overlay with a version bump. Storing a
+                            // locally merged overlay here would race with the supervisor.
                             if let Some(delta) = board.rt_delta {
                                 if !delta.vehicles.is_empty() || !delta.trips.is_empty() {
-                                    let mut overlay = (*state.load_rt()).clone();
-                                    overlay.merge_feed_delta("idfm", delta);
-                                    crate::routing::finalize_realtime_overlay(&mut overlay);
-                                    state.rt.store(std::sync::Arc::new(overlay));
+                                    // stop_board ingests SM under the "idfm" namespace.
+                                    crate::feeds::submit_realtime_delta("idfm", delta);
                                 }
                             }
                             if !board.departures.is_empty() {
+                                // PRIM answered with data: keep this stop warm-polled.
+                                crate::prim::confirm_sm_interest(&mon);
                                 let stop_rec =
                                     epoch.get_stop(stop_key).cloned().unwrap_or_else(|| {
                                         crate::prim::stop_board::shell_stop(stop_key, None)
@@ -427,10 +526,7 @@ impl QueryRoot {
                         continue;
                     }
                 }
-                let st = match epoch
-                    .stop_times
-                    .get((trip.stop_time_start + off) as usize)
-                {
+                let st = match epoch.stop_times.get((trip.stop_time_start + off) as usize) {
                     Some(st) => st,
                     None => continue,
                 };
@@ -451,9 +547,7 @@ impl QueryRoot {
             let applied = rt.apply_departure(
                 &trip.id,
                 scheduled,
-                Some(
-                    epoch.stop_times[(trip.stop_time_start + off) as usize].stop_sequence,
-                ),
+                Some(epoch.stop_times[(trip.stop_time_start + off) as usize].stop_sequence),
                 Some(stop_rec.id.as_str()),
             );
             let (realtime_departure, delay_seconds) = if applied.has_rt || applied.canceled {
@@ -584,10 +678,8 @@ impl QueryRoot {
                 Some(s) => s,
                 None => continue,
             };
-            let scheduled_arrival =
-                midnight + chrono::Duration::seconds(st.arrival_s as i64);
-            let scheduled_departure =
-                midnight + chrono::Duration::seconds(st.departure_s as i64);
+            let scheduled_arrival = midnight + chrono::Duration::seconds(st.arrival_s as i64);
+            let scheduled_departure = midnight + chrono::Duration::seconds(st.departure_s as i64);
             let arr = rt.apply_arrival(
                 &trip.id,
                 scheduled_arrival,
@@ -616,11 +708,7 @@ impl QueryRoot {
                 scheduled_arrival,
                 scheduled_departure,
                 realtime_arrival: if arr.has_rt { Some(arr.realtime) } else { None },
-                realtime_departure: if dep.has_rt {
-                    Some(dep.realtime)
-                } else {
-                    None
-                },
+                realtime_departure: if dep.has_rt { Some(dep.realtime) } else { None },
                 delay_seconds,
                 skipped,
                 platform: stop_rec.platform_code.clone(),
@@ -675,13 +763,15 @@ impl QueryRoot {
     async fn shape(&self, ctx: &Context<'_>, shape_id: ID) -> Result<Vec<LatLng>> {
         let state = ctx.data::<Arc<AppState>>()?;
         let epoch = state.load_epoch();
-        Ok(crate::routing::geometry::shape_polyline(&epoch, shape_id.as_str())
-            .into_iter()
-            .map(|p| LatLng {
-                lat: p[0],
-                lon: p[1],
-            })
-            .collect())
+        Ok(
+            crate::routing::geometry::shape_polyline(&epoch, shape_id.as_str())
+                .into_iter()
+                .map(|p| LatLng {
+                    lat: p[0],
+                    lon: p[1],
+                })
+                .collect(),
+        )
     }
 
     /// Realtime delay / cancel / vehicle / alerts for a namespaced trip id.
@@ -699,20 +789,12 @@ impl QueryRoot {
                 "BAD_REQUEST",
             ));
         }
-        Ok(trip_realtime_for_with_epoch(
-            &id,
-            &rt,
-            Some(epoch.as_ref()),
-        ))
+        Ok(trip_realtime_for_with_epoch(&id, &rt, Some(epoch.as_ref())))
     }
 
     /// Soft-register SM stops + ET LineRefs for the map viewport (no PRIM HTTP).
     /// Call when the map pans so warm pollers prefer visible lines/stops.
-    async fn warm_live_viewport(
-        &self,
-        ctx: &Context<'_>,
-        bbox: BBoxInput,
-    ) -> Result<bool> {
+    async fn warm_live_viewport(&self, ctx: &Context<'_>, bbox: BBoxInput) -> Result<bool> {
         let state = ctx.data::<Arc<AppState>>()?;
         if !bbox.is_valid() {
             return Err(gql_err("invalid bbox", "BAD_REQUEST"));
@@ -728,6 +810,7 @@ impl QueryRoot {
         Ok(true)
     }
 
+    #[graphql(complexity = "ITINERARIES_COMPLEXITY + child_complexity")]
     async fn itineraries(
         &self,
         ctx: &Context<'_>,
@@ -750,40 +833,18 @@ impl QueryRoot {
             .or(input.arrive_by)
             .unwrap_or_else(Utc::now);
 
-        let cache_key = state
-            .cache
-            .itinerary_key(&epoch.id, rt.version, &input, cfg);
+        // `departure_at` doubles as "now" for the minute bucket when the client
+        // omitted departureAt/arriveBy, so key and query agree.
+        let cache_key =
+            state
+                .cache
+                .itinerary_key_at(&epoch.id, rt.version, &input, cfg, departure_at);
 
         let modes = input.modes.map(|ms| {
             ms.into_iter()
                 .filter_map(|m| m.to_pack())
                 .collect::<Vec<_>>()
         });
-
-        // Pass RT-cancelled trips so routing skips boarding them.
-        let excluded_trip_ids = if rt.canceled_trip_ids.is_empty() {
-            rt.feeds
-                .values()
-                .flat_map(|f| {
-                    f.trips
-                        .iter()
-                        .filter(|(_, t)| t.canceled)
-                        .map(|(id, _)| {
-                            id.rsplit_once('@')
-                                .map(|(b, _)| b.to_string())
-                                .unwrap_or_else(|| id.clone())
-                        })
-                })
-                .collect()
-        } else {
-            rt.canceled_trip_ids.clone()
-        };
-        // Delays / SKIPPED stops — applied inside RAPTOR (not only on display).
-        let rt_adjust = if rt.rt_adjust.is_empty() {
-            crate::routing::rt_adjust_map_from_overlay(&rt)
-        } else {
-            rt.rt_adjust.clone()
-        };
 
         if let Some(result) = state.cache.get_itinerary(&cache_key).await {
             let age = rt.max_trip_updates_age_secs();
@@ -828,6 +889,49 @@ impl QueryRoot {
             });
         }
 
+        // Cache miss → we need a planning slot. Wait briefly, then shed load
+        // instead of piling more RAPTOR jobs onto the blocking pool.
+        let queue_wait =
+            std::time::Duration::from_millis(state.config.runtime.plan_queue_timeout_ms);
+        let permit = match tokio::time::timeout(
+            queue_wait,
+            state.plan_slots.clone().acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(p)) => p,
+            Ok(Err(_)) => return Err(gql_err("planner unavailable", "INTERNAL")),
+            Err(_) => {
+                return Err(gql_err(
+                    "server busy: too many itinerary requests in progress, retry shortly",
+                    "SERVER_BUSY",
+                ))
+            }
+        };
+
+        // Built only on a cache miss (can be large on IDFM-scale overlays).
+        // Pass RT-cancelled trips so routing skips boarding them.
+        let excluded_trip_ids = if rt.canceled_trip_ids.is_empty() {
+            rt.feeds
+                .values()
+                .flat_map(|f| {
+                    f.trips.iter().filter(|(_, t)| t.canceled).map(|(id, _)| {
+                        id.rsplit_once('@')
+                            .map(|(b, _)| b.to_string())
+                            .unwrap_or_else(|| id.clone())
+                    })
+                })
+                .collect()
+        } else {
+            rt.canceled_trip_ids.clone()
+        };
+        // Delays / SKIPPED stops — applied inside RAPTOR (not only on display).
+        let rt_adjust = if rt.rt_adjust.is_empty() {
+            crate::routing::rt_adjust_map_from_overlay(&rt)
+        } else {
+            rt.rt_adjust.clone()
+        };
+
         let q = ItineraryQuery {
             from_stop_id: input.from.stop_id.map(|i| i.to_string()),
             to_stop_id: input.to.stop_id.map(|i| i.to_string()),
@@ -865,13 +969,24 @@ impl QueryRoot {
 
         let timeout = std::time::Duration::from_secs(state.config.graphql.itinerary_timeout_secs);
         let epoch_c = epoch.clone();
+        // `timeout` only stops *waiting*; the planner polls the same deadline
+        // (routing::cancel) and returns early. The permit moves into the closure
+        // so the slot is released only when planning really finishes.
+        let deadline = std::time::Instant::now() + timeout;
         let result = tokio::time::timeout(
             timeout,
-            tokio::task::spawn_blocking(move || plan_journeys(&epoch_c, &q)),
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                crate::routing::cancel::with_deadline(deadline, || plan_journeys(&epoch_c, &q))
+            }),
         )
         .await
         .map_err(|_| gql_err("itinerary timeout", "TIMEOUT"))?
         .map_err(|e| gql_err(format!("routing task: {e}"), "INTERNAL"))?;
+        // A plan cut short by the deadline is partial: never serve or cache it.
+        if std::time::Instant::now() >= deadline {
+            return Err(gql_err("itinerary timeout", "TIMEOUT"));
+        }
 
         state.cache.set_itinerary(&cache_key, &result).await;
 
@@ -988,9 +1103,11 @@ impl QueryRoot {
                 return Err(gql_err("invalid bbox", "BAD_REQUEST"));
             }
         }
-        let radius = near
-            .as_ref()
-            .map(|n| n.radius_meters.clamp(1.0, 50_000.0));
+        // Snap outward to a ~100 m grid: nearby viewports share one cache key
+        // (bounded Redis key space) and the cached result still covers the
+        // requested window.
+        let bbox = bbox.map(|b| b.snapped_outward(1e-3));
+        let radius = near.as_ref().map(|n| n.radius_meters.clamp(1.0, 50_000.0));
 
         let cacheable = bbox.is_some() || near.is_some();
         let vehicles_cache_key = if cacheable {
@@ -1066,7 +1183,7 @@ impl QueryRoot {
         let synth_cap = |fid: &str| -> usize {
             match fid {
                 "idfm" => limit,
-                "sncf" => (limit / 4).max(20).min(80),
+                "sncf" => (limit / 4).clamp(20, 80),
                 _ => limit / 2,
             }
         };
@@ -1130,13 +1247,10 @@ impl QueryRoot {
                     continue;
                 }
             }
-            let updated_at = fr
-                .trip_updates_fetched_at
-                .unwrap_or_else(Utc::now);
+            let updated_at = fr.trip_updates_fetched_at.unwrap_or_else(Utc::now);
             let cap = synth_cap(fid.as_str());
             // Dedup dated/undated keys within the feed.
-            let mut seen_base: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
+            let mut seen_base: std::collections::HashSet<String> = std::collections::HashSet::new();
             for (trip_key, trip) in &fr.trips {
                 if trip.canceled || trip.stop_updates.is_empty() {
                     continue;
@@ -1176,8 +1290,12 @@ impl QueryRoot {
                 if !passes_geo(synth.lat, synth.lon) {
                     continue;
                 }
-                let mapped =
-                    map_vehicle_enriched(&synth, Some(fid.as_str()), Some(epoch.as_ref()), Some(trip));
+                let mapped = map_vehicle_enriched(
+                    &synth,
+                    Some(fid.as_str()),
+                    Some(epoch.as_ref()),
+                    Some(trip),
+                );
                 if let Some(ref mf) = mode_filter {
                     match mapped.mode {
                         Some(m) if mf.contains(&m) => {}
@@ -1202,11 +1320,7 @@ impl QueryRoot {
     /// GTFS levels for indoor mapping when present on the static epoch.
     ///
     /// Reads `FeedStaticBundle.levels` per feed. Empty when not packed (graceful).
-    async fn levels(
-        &self,
-        ctx: &Context<'_>,
-        feed_id: Option<String>,
-    ) -> Result<Vec<Level>> {
+    async fn levels(&self, ctx: &Context<'_>, feed_id: Option<String>) -> Result<Vec<Level>> {
         let state = ctx.data::<Arc<AppState>>()?;
         let epoch = state.load_epoch();
         let mut out = Vec::new();
@@ -1312,33 +1426,15 @@ impl SubscriptionRoot {
         &self,
         ctx: &Context<'_>,
     ) -> Result<impl Stream<Item = FeedStatus> + 'static> {
+        let slot = acquire_subscription_slot(ctx)?;
         let state = ctx.data::<Arc<AppState>>()?.clone();
         let mut rx = state.rt_version_tx.subscribe();
         Ok(async_stream::stream! {
+            let _slot = slot;
             // emit current snapshot for each enabled feed on each RT version bump
             loop {
-                let epoch = state.load_epoch();
-                let rt = state.load_rt();
-                for f in state.config.enabled_feeds() {
-                    let fr = rt.feeds.get(&f.id);
-                    let tu_age = fr.and_then(|x| x.trip_updates_age_secs());
-                    let bundle = epoch.feeds.get(&f.id);
-                    yield FeedStatus {
-                        id: ID(f.id.clone()),
-                        static_loaded: bundle.is_some(),
-                        trip_updates_age_seconds: tu_age.map(|s| s as i32),
-                        vehicle_positions_age_seconds: fr
-                            .and_then(|x| x.vehicles_age_secs())
-                            .map(|s| s as i32),
-                        alerts_age_seconds: fr.and_then(|x| x.alerts_age_secs()).map(|s| s as i32),
-                        trip_update_count: fr.map(|x| x.trip_update_count as i32).unwrap_or(0),
-                        vehicle_count: fr.map(|x| x.vehicle_count as i32).unwrap_or(0),
-                        alert_count: fr.map(|x| x.alert_count as i32).unwrap_or(0),
-                        ok: bundle.is_some(),
-                        feed_start_date: bundle.and_then(|b| b.feed_start_date.clone()),
-                        feed_end_date: bundle.and_then(|b| b.feed_end_date.clone()),
-                        publisher: bundle.and_then(|b| b.feed_publisher_name.clone()),
-                    };
+                for status in feed_statuses(&state) {
+                    yield status;
                 }
                 match rx.recv().await {
                     Ok(RtVersion(_)) => continue,
@@ -1355,10 +1451,12 @@ impl SubscriptionRoot {
         ctx: &Context<'_>,
         trip_id: ID,
     ) -> Result<impl Stream<Item = VehiclePosition> + 'static> {
+        let slot = acquire_subscription_slot(ctx)?;
         let state = ctx.data::<Arc<AppState>>()?.clone();
         let mut rx = state.rt_version_tx.subscribe();
         let trip_id = trip_id.to_string();
         Ok(async_stream::stream! {
+            let _slot = slot;
             loop {
                 let rt = state.load_rt();
                 if let Some(v) = rt.get_vehicle_for_trip(&trip_id) {
@@ -1392,10 +1490,12 @@ impl SubscriptionRoot {
         if trip_ids.len() > 32 {
             return Err(gql_err("at most 32 tripIds allowed", "BAD_REQUEST"));
         }
+        let slot = acquire_subscription_slot(ctx)?;
         let state = ctx.data::<Arc<AppState>>()?.clone();
         let mut rx = state.rt_version_tx.subscribe();
         let trip_ids: Vec<String> = trip_ids.into_iter().map(|i| i.to_string()).collect();
         Ok(async_stream::stream! {
+            let _slot = slot;
             loop {
                 let rt = state.load_rt();
                 let epoch = state.load_epoch();
@@ -1495,10 +1595,7 @@ mod tests {
             .as_array()
             .or_else(|| data["stop"]["fields"].as_array())
             .expect("Stop type fields");
-        let names: Vec<&str> = fields
-            .iter()
-            .filter_map(|f| f["name"].as_str())
-            .collect();
+        let names: Vec<&str> = fields.iter().filter_map(|f| f["name"].as_str()).collect();
         assert!(names.contains(&"zoneId"));
         assert!(names.contains(&"url"));
         assert!(names.contains(&"timezone"));
@@ -1575,6 +1672,119 @@ mod tests {
         assert!(res.errors.is_empty(), "{:?}", res.errors);
         let data = res.data.into_json().unwrap();
         assert!(data["departures"].as_array().unwrap().is_empty());
+    }
+
+    fn is_too_complex(res: &async_graphql::Response) -> bool {
+        res.errors
+            .iter()
+            .any(|e| e.message.to_ascii_lowercase().contains("too complex"))
+    }
+
+    #[tokio::test]
+    async fn itineraries_aliases_rejected_by_complexity() {
+        let (_state, schema) = test_schema();
+        let one = r#"{ a: itineraries(input: { from: { stopId: "x" }, to: { stopId: "y" } }) { realtimeDegraded } }"#;
+        let res = schema.execute(one).await;
+        assert!(
+            !is_too_complex(&res),
+            "single plan must be allowed: {:?}",
+            res.errors
+        );
+
+        let two = r#"{
+          a: itineraries(input: { from: { stopId: "x" }, to: { stopId: "y" } }) { realtimeDegraded }
+          b: itineraries(input: { from: { stopId: "x" }, to: { stopId: "z" } }) { realtimeDegraded }
+        }"#;
+        let res = schema.execute(two).await;
+        assert!(
+            is_too_complex(&res),
+            "two aliased plans must be rejected: {:?}",
+            res.errors
+        );
+    }
+
+    #[tokio::test]
+    async fn web_ui_itinerary_query_fits_complexity() {
+        // Same selection set as the web UI planner (web/src/lib.rs).
+        let (_state, schema) = test_schema();
+        let q = r#"{
+          itineraries(input: { from: { stopId: "x" }, to: { stopId: "y" } }) {
+            realtimeDegraded
+            journeys {
+              id departure arrival durationSeconds transfers realtimeStatus
+              walkDistanceMeters alertHeaders fareAmount fareCurrency fareNote
+              alerts { id header description severity cause effect lines { shortName color textColor } }
+              legs {
+                __typename
+                ... on TransitLeg {
+                  mode routeShortName routeLongName tripShortName tripId stopHeadsign headsign
+                  routeColor routeTextColor wheelchair bikesAllowed sameVehicle
+                  scheduledDeparture realtimeDeparture delayDepartureSeconds
+                  scheduledArrival realtimeArrival delayArrivalSeconds canceled
+                  fromStop { id name lat lon }
+                  toStop { id name lat lon }
+                  intermediateStops { stop { id name lat lon } scheduledArrival scheduledDeparture realtimeArrival realtimeDeparture }
+                  geometry { lat lon }
+                  vehicle { lat lon bearing label occupancy currentStatus updatedAt }
+                  alerts { id header description severity cause effect lines { shortName color textColor } }
+                }
+                ... on WalkLeg {
+                  mode durationSeconds distanceMeters fromName toName fromLat fromLon toLat toLon
+                  fromStopId toStopId geometry { lat lon }
+                }
+              }
+            }
+          }
+        }"#;
+        let res = schema.execute(q).await;
+        assert!(!is_too_complex(&res), "{:?}", res.errors);
+    }
+
+    #[tokio::test]
+    async fn introspection_disabled_without_playground() {
+        let mut cfg = Config::default();
+        cfg.server.graphql_playground = false;
+        let state = Arc::new(AppState::new(
+            cfg,
+            crate::cache::TransitCache::disabled(crate::config::RedisConfig::default()),
+        ));
+        let schema = build_schema(state);
+        let res = schema.execute("{ __schema { queryType { name } } }").await;
+        let data = res.data.into_json().unwrap();
+        assert!(
+            data["__schema"].is_null(),
+            "introspection must be off: {data}"
+        );
+
+        let (_s, open) = test_schema();
+        let res = open.execute("{ __schema { queryType { name } } }").await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+    }
+
+    #[test]
+    fn ws_subscription_budget_caps_and_frees() {
+        let budget = WsSubscriptionBudget::new(2);
+        let g1 = budget.try_acquire().expect("slot 1");
+        let _g2 = budget.try_acquire().expect("slot 2");
+        assert!(
+            budget.try_acquire().is_none(),
+            "third subscription rejected"
+        );
+        drop(g1);
+        assert!(budget.try_acquire().is_some(), "slot freed on drop");
+    }
+
+    #[test]
+    fn feed_status_ok_requires_fresh_trip_updates() {
+        // Both `health` and `feedStatus` go through `feed_statuses`; with no
+        // static bundle / no TU age, `ok` must be false.
+        let state = AppState::new(
+            Config::default(),
+            crate::cache::TransitCache::disabled(crate::config::RedisConfig::default()),
+        );
+        let feeds = feed_statuses(&state);
+        assert!(!feeds.is_empty());
+        assert!(feeds.iter().all(|f| !f.ok));
     }
 
     #[tokio::test]
@@ -1670,9 +1880,7 @@ mod tests {
 
     #[tokio::test]
     async fn vehicles_enrichment_from_epoch() {
-        use crate::gtfs::pack::{
-            GlobalTrip, PackedStopTime, RouteMode, StaticEpoch, StopRecord,
-        };
+        use crate::gtfs::pack::{GlobalTrip, PackedStopTime, RouteMode, StaticEpoch, StopRecord};
         use crate::rt::overlay::{FeedRtState, RealtimeOverlay, TripRt, VehiclePos};
         use chrono::TimeZone;
 
@@ -1865,9 +2073,7 @@ mod tests {
 
     #[tokio::test]
     async fn vehicles_synthetic_from_trip_update() {
-        use crate::gtfs::pack::{
-            GlobalTrip, PackedStopTime, RouteMode, StaticEpoch, StopRecord,
-        };
+        use crate::gtfs::pack::{GlobalTrip, PackedStopTime, RouteMode, StaticEpoch, StopRecord};
         use crate::rt::overlay::{FeedRtState, RealtimeOverlay, StopTimeRt, TripRt};
         use chrono::TimeZone;
 

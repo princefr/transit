@@ -105,14 +105,17 @@ fn best_match_kind(haystack: &str, needle: &str) -> MatchKind {
     let mut i = 0usize;
     while i + n.len() <= bytes.len() {
         if bytes[i..].starts_with(n) {
-            let at_boundary = i == 0
-                || !bytes[i - 1].is_ascii_alphanumeric();
+            let at_boundary = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
             if at_boundary {
                 return MatchKind::WordBoundary;
             }
         }
         // advance one UTF-8 char if possible, else one byte
-        let ch = haystack[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        let ch = haystack[i..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(1);
         i += ch;
     }
     if haystack.contains(needle) {
@@ -157,12 +160,7 @@ pub fn is_idfm_place_stop(s: &StopRecord) -> bool {
 pub fn place_name_key(name: &str) -> String {
     let mut s = strip_accents(name).to_lowercase();
     for prefix in [
-        "gare de ",
-        "gare d'",
-        "gare d'",
-        "station ",
-        "arret ",
-        "arrêt ",
+        "gare de ", "gare d'", "gare d'", "station ", "arret ", "arrêt ",
     ] {
         if let Some(rest) = s.strip_prefix(prefix) {
             s = rest.to_string();
@@ -310,7 +308,10 @@ pub fn near(
 ) -> Vec<(StopRecord, f64)> {
     let points = epoch.geo_stop_points_view();
 
-    nearby(&points, lat, lon, radius_m, limit)
+    // The station filter runs after the geo query, so truncating there
+    // first would drop stations ranked behind nearer platforms.
+    let geo_limit = if is_station_only { usize::MAX } else { limit };
+    nearby(&points, lat, lon, radius_m, geo_limit)
         .into_iter()
         .filter_map(|(idx, dist)| {
             let s = epoch.stops.get(idx)?;
@@ -319,6 +320,7 @@ pub fn near(
             }
             Some((s.clone(), dist))
         })
+        .take(limit)
         .collect()
 }
 
@@ -362,9 +364,9 @@ mod tests {
             stop_code: None,
             stop_desc: None,
             level_id: None,
-        zone_id: None,
-        stop_url: None,
-        stop_timezone: None,
+            zone_id: None,
+            stop_url: None,
+            stop_timezone: None,
         }
     }
 
@@ -480,9 +482,9 @@ mod tests {
                 stop_code: None,
                 stop_desc: None,
                 level_id: None,
-            zone_id: None,
-            stop_url: None,
-            stop_timezone: None,
+                zone_id: None,
+                stop_url: None,
+                stop_timezone: None,
             },
         ]);
         let all = search_stops_filtered(&e, "alpha", None, 10, false);
@@ -502,5 +504,23 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].0.name, "Near");
         assert!(hits[0].1 < hits[1].1);
+    }
+
+    #[test]
+    fn near_station_only_limit_applies_after_filter() {
+        // Two platforms closer than the only station: limit 1 must still
+        // return the station.
+        let platform = |id: &str, lat: f64| StopRecord {
+            parent_id: Some("st".into()),
+            ..stop(id, id, 0, lat, 2.35)
+        };
+        let e = epoch_with(vec![
+            platform("p1", 48.86001),
+            platform("p2", 48.86002),
+            stop("st", "Station", 1, 48.8610, 2.35),
+        ]);
+        let hits = near(&e, 48.86, 2.35, 1_000.0, 1, true);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0.name, "Station");
     }
 }

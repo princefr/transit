@@ -1,6 +1,24 @@
 [server]
-bind = "0.0.0.0:8080"
-graphql_playground = true
+# Loopback by default. Containers override with TRANSIT__SERVER__BIND=0.0.0.0:8080
+# (set in Dockerfile / docker-compose.yml).
+bind = "127.0.0.1:8080"
+# GraphiQL playground at /graphiql. Off by default; enable for local dev
+# (`make run` / `make run-debug` export TRANSIT__SERVER__GRAPHQL_PLAYGROUND=true).
+graphql_playground = false
+# Browser origins allowed by CORS and on the /ws subscription endpoint.
+# Add your deployed UI origin; a "*" entry allows any origin.
+cors_allowed_origins = ["http://127.0.0.1:8088", "http://localhost:8088"]
+# Prometheus /metrics: loopback peers only unless metrics_public = true.
+metrics_enabled = true
+metrics_public = false
+# HTTP hardening (non-websocket routes). 0 = itinerary timeout + 15s.
+request_timeout_secs = 0
+max_concurrent_requests = 256
+max_body_bytes = 262144
+max_batch_size = 8
+# GraphQL subscriptions over /ws.
+max_ws_connections = 256
+max_subscriptions_per_connection = 16
 
 [runtime]
 # RAPTOR runs on blocking pool; keep a few free for health/stops while planning.
@@ -10,6 +28,10 @@ max_outbound_rt_requests = 8
 rt_request_timeout_secs = 15
 static_download_timeout_secs = 600
 data_dir = "./data"
+# Concurrent itinerary plans (0 = blocking_threads / 2); requests wait up to
+# plan_queue_timeout_ms for a slot, then get SERVER_BUSY.
+max_concurrent_plans = 0
+plan_queue_timeout_ms = 2000
 
 [routing]
 timezone = "Europe/Paris"
@@ -22,9 +44,14 @@ max_walk_meters = 2000
 # Walk links between boardable stops (complete transfer graph). 400m+ for monomodal RER↔Métro.
 hub_link_radius_m = 450
 # OSRM for street-level walk/bike paths on the map (access, egress, transfers).
-# Empty = straight lines only. Public demo (best-effort) or self-host:
-osrm_url = "https://router.project-osrm.org"
-# Or env: TRANSIT_OSRM_URL=https://router.project-osrm.org
+# Empty (default) = straight lines only, no third-party requests.
+# Privacy: when set, users' origin/destination coordinates are sent to this
+# server. The public demo server (https://router.project-osrm.org) is
+# best-effort and its usage policy forbids production use — self-host OSRM
+# (https://github.com/Project-OSRM/osrm-backend) or opt in explicitly, e.g.
+#   osrm_url = "http://127.0.0.1:5000"
+# or env: TRANSIT_OSRM_URL=... (alias of TRANSIT__ROUTING__OSRM_URL)
+osrm_url = ""
 bike_speed_m_s = 4.2
 max_bike_meters = 5000
 

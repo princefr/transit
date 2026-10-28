@@ -10,9 +10,9 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 
 /// Versioned file header. Files without it are rejected on load so schema
-/// drift or truncated writes can never reach bincode (which would otherwise
-/// abort the process trying to allocate garbage length prefixes).
-const MAGIC: &[u8; 8] = b"BANIDX1\n";
+/// drift or truncated writes are rejected before decoding. v2 = MessagePack
+/// payload (v1 was bincode 1, now unmaintained — RUSTSEC-2025-0141).
+const MAGIC: &[u8; 8] = b"BANIDX2\n";
 use std::path::Path;
 use tracing::info;
 
@@ -121,18 +121,20 @@ impl BanIndex {
     ///
     /// Files are prefixed with a magic + format-version header; anything
     /// else (old unversioned files, schema drift, truncated writes) is
-    /// rejected *before* bincode runs — a corrupt payload would otherwise
-    /// deserialize garbage length prefixes and abort the process with a
-    /// multi-TB allocation.
+    /// rejected *before* the payload is decoded. The MessagePack decoder streams
+    /// from the file and serde caps pre-allocation, so a corrupt length prefix
+    /// fails cleanly instead of attempting a huge allocation.
     pub fn load(path: &Path) -> Result<Self, BanError> {
         let mut f = File::open(path)?;
         let mut magic = [0u8; MAGIC.len()];
         use std::io::Read;
         if f.read_exact(&mut magic).is_err() || &magic != MAGIC {
-            return Err(BanError::Bincode("missing or bad BAN index header".into()));
+            return Err(BanError::Encoding(
+                "missing or bad BAN index header (rebuild with `make ban-index`)".into(),
+            ));
         }
-        let data: IndexData = bincode::deserialize_from(BufReader::new(f))
-            .map_err(|e| BanError::Bincode(e.to_string()))?;
+        let data: IndexData = rmp_serde::decode::from_read(BufReader::new(f))
+            .map_err(|e| BanError::Encoding(e.to_string()))?;
         info!(
             path = %path.display(),
             streets = data.streets.len(),
@@ -152,9 +154,9 @@ impl BanIndex {
             let f = File::create(&tmp)?;
             let mut w = BufWriter::new(f);
             w.write_all(MAGIC)
-                .map_err(|e| BanError::Bincode(e.to_string()))?;
-            bincode::serialize_into(&mut w, &self.data)
-                .map_err(|e| BanError::Bincode(e.to_string()))?;
+                .map_err(|e| BanError::Encoding(e.to_string()))?;
+            rmp_serde::encode::write(&mut w, &self.data)
+                .map_err(|e| BanError::Encoding(e.to_string()))?;
             w.flush().ok();
             w.get_ref()
                 .sync_all()
@@ -166,10 +168,7 @@ impl BanIndex {
     }
 
     /// Build from département CSV files in a directory (or explicit department list).
-    pub fn build_from_csv_dir(
-        csv_dir: &Path,
-        departments: &[String],
-    ) -> Result<Self, BanError> {
+    pub fn build_from_csv_dir(csv_dir: &Path, departments: &[String]) -> Result<Self, BanError> {
         let mut files = Vec::new();
         // Empty list = every BAN CSV present (all of France when complete).
         if departments.is_empty() {
@@ -227,7 +226,8 @@ impl BanIndex {
             let i_rep = col("rep");
             let i_voie = col("nom_voie").ok_or_else(|| BanError::index("missing nom_voie"))?;
             let i_cp = col("code_postal").ok_or_else(|| BanError::index("missing code_postal"))?;
-            let i_city = col("nom_commune").ok_or_else(|| BanError::index("missing nom_commune"))?;
+            let i_city =
+                col("nom_commune").ok_or_else(|| BanError::index("missing nom_commune"))?;
             let i_lon = col("lon").ok_or_else(|| BanError::index("missing lon"))?;
             let i_lat = col("lat").ok_or_else(|| BanError::index("missing lat"))?;
 
@@ -346,8 +346,7 @@ impl BanIndex {
         // Sort each street's address ids by number so house-number lookup is a
         // binary search.
         for s in &mut streets {
-            s.address_ids
-                .sort_by_key(|&a| addresses[a as usize].num);
+            s.address_ids.sort_by_key(|&a| addresses[a as usize].num);
         }
 
         let stats = BanStats {
@@ -442,10 +441,7 @@ impl BanIndex {
             .copied()
             .collect();
         let marked = bits.iter().any(|&b| b != 0);
-        if street_q.len() >= 3
-            && !marked
-            && self.data.streets.len() <= FULL_SCAN_STREET_CAP
-        {
+        if street_q.len() >= 3 && !marked && self.data.streets.len() <= FULL_SCAN_STREET_CAP {
             for (i, s) in self.data.streets.iter().enumerate() {
                 if street_matches_exact(
                     &s.name_norm,
@@ -462,32 +458,31 @@ impl BanIndex {
         // Score candidates; keep only (score, street_idx) pairs.
         let want = limit * 3;
         let multi = sig_tokens >= 2;
-        let score_candidate =
-            |bits: &[u8], min_hits: u32, out: &mut Vec<(f32, u32)>| {
-                for (i, &b) in bits.iter().enumerate() {
-                    if b != 0 && (b.count_ones()) >= min_hits {
-                        let street = &self.data.streets[i];
-                        let sscore = street_score(street, &street_q, &tokens);
-                        if sscore <= 0.0 {
-                            continue;
-                        }
-                        match &num_opt {
-                            Some((num, rep)) => {
-                                // Exact house-number lookup via per-street
-                                // sorted index (u32 binary search + odd list).
-                                let qrep = rep_code(rep).unwrap_or(0);
-                                if self.has_number(i as u32, num.parse().ok(), num, qrep) {
-                                    out.push((sscore + 50.0, i as u32));
-                                } else if sscore > 20.0 {
-                                    // Street hit without that number — still useful.
-                                    out.push((sscore, i as u32));
-                                }
+        let score_candidate = |bits: &[u8], min_hits: u32, out: &mut Vec<(f32, u32)>| {
+            for (i, &b) in bits.iter().enumerate() {
+                if b != 0 && (b.count_ones()) >= min_hits {
+                    let street = &self.data.streets[i];
+                    let sscore = street_score(street, &street_q, &tokens);
+                    if sscore <= 0.0 {
+                        continue;
+                    }
+                    match &num_opt {
+                        Some((num, rep)) => {
+                            // Exact house-number lookup via per-street
+                            // sorted index (u32 binary search + odd list).
+                            let qrep = rep_code(rep).unwrap_or(0);
+                            if self.has_number(i as u32, num.parse().ok(), num, qrep) {
+                                out.push((sscore + 50.0, i as u32));
+                            } else if sscore > 20.0 {
+                                // Street hit without that number — still useful.
+                                out.push((sscore, i as u32));
                             }
-                            _ => out.push((sscore.max(1.0), i as u32)),
                         }
+                        _ => out.push((sscore.max(1.0), i as u32)),
                     }
                 }
-            };
+            }
+        };
         let mut scored: Vec<(f32, u32)> = Vec::with_capacity(64);
         if multi {
             // Tier 1: ≥2 distinct token buckets matched.
@@ -573,7 +568,11 @@ impl BanIndex {
                     continue;
                 }
                 let bonus = f32::from(a.rep == qrep && qrep != 0) * 10.0;
-                if best.as_ref().map(|(_, _, _, _, b)| bonus > *b).unwrap_or(true) {
+                if best
+                    .as_ref()
+                    .map(|(_, _, _, _, b)| bonus > *b)
+                    .unwrap_or(true)
+                {
                     best = Some((n.to_string(), a.rep, a.lat, a.lon, bonus));
                 }
             }
@@ -584,7 +583,11 @@ impl BanIndex {
                 continue;
             }
             let bonus = f32::from(o.rep == qrep && qrep != 0) * 10.0;
-            if best.as_ref().map(|(_, _, _, _, b)| bonus > *b).unwrap_or(true) {
+            if best
+                .as_ref()
+                .map(|(_, _, _, _, b)| bonus > *b)
+                .unwrap_or(true)
+            {
                 best = Some((o.raw.clone(), o.rep, o.lat, o.lon, bonus));
             }
         }
@@ -592,7 +595,13 @@ impl BanIndex {
         let rep_disp = REP_TABLE[arep as usize];
         Some(AddressHit {
             id: format!("ban:{si}:{num_disp}{rep_disp}"),
-            label: format_label(&num_disp, rep_disp, &street.name, &street.postcode, &street.city),
+            label: format_label(
+                &num_disp,
+                rep_disp,
+                &street.name,
+                &street.postcode,
+                &street.city,
+            ),
             number: num_disp,
             rep: rep_disp.to_string(),
             street: street.name.clone(),
@@ -624,7 +633,8 @@ fn prefix_key(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
-fn is_street_type_token(t: &str) -> bool {    matches!(
+fn is_street_type_token(t: &str) -> bool {
+    matches!(
         t,
         "rue"
             | "avenue"
@@ -925,13 +935,41 @@ mod tests {
         );
         assert!(hits[0].lat > 48.0);
         let street = idx.suggest("haussmann paris", 5);
-        assert!(street.iter().any(|h| h.street.to_ascii_lowercase().contains("haussmann")));
+        assert!(street
+            .iter()
+            .any(|h| h.street.to_ascii_lowercase().contains("haussmann")));
     }
 
     fn build_sample() -> BanIndex {
         let dir = tempfile::tempdir().unwrap();
         sample_csv(dir.path());
         BanIndex::build_from_csv_dir(dir.path(), &["75".into()]).unwrap()
+    }
+
+    #[test]
+    fn save_load_roundtrip() {
+        let idx = build_sample();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.bin");
+        idx.save(&path).unwrap();
+        let loaded = BanIndex::load(&path).unwrap();
+        assert_eq!(loaded.address_count(), idx.address_count());
+        assert_eq!(loaded.street_count(), idx.street_count());
+        assert_eq!(
+            loaded.suggest("12 rue de rivoli", 3)[0].label,
+            idx.suggest("12 rue de rivoli", 3)[0].label
+        );
+    }
+
+    #[test]
+    fn rejects_old_or_corrupt_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old.bin");
+        std::fs::write(&old, b"BANIDX1\n\xff\xff\xff\xff\xff\xff\xff\xff").unwrap();
+        assert!(BanIndex::load(&old).is_err());
+        let truncated = dir.path().join("trunc.bin");
+        std::fs::write(&truncated, b"BANIDX2\n\xdd\xff\xff\xff\xff").unwrap();
+        assert!(BanIndex::load(&truncated).is_err());
     }
 
     #[test]
@@ -950,10 +988,7 @@ mod tests {
     fn typo_tolerant_and_name_beats_city_only() {
         let idx = build_sample();
         let hits = idx.suggest("rivolli", 5);
-        assert!(
-            !hits.is_empty(),
-            "typo in street name should still match"
-        );
+        assert!(!hits.is_empty(), "typo in street name should still match");
         assert_eq!(hits[0].street, "Rue de Rivoli", "got {:?}", hits[0]);
     }
 

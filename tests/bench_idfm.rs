@@ -6,7 +6,7 @@ use chrono::{TimeZone, Utc};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
-use transit::gtfs::pack::{build_epoch_with_flash, FlashMode};
+use transit::gtfs::pack::build_epoch_with_flash;
 use transit::gtfs::parse::load_gtfs_zip;
 use transit::routing::{plan_journeys, ItineraryQuery};
 use transit::search::search_stops;
@@ -98,9 +98,17 @@ fn bench_idfm_raptor_vs_tbr() {
 
     let test_pairs = vec![
         ("Auber", "Nation", "Central RER A corridor"),
-        ("Gare du Nord", "Massy-Palaiseau", "Suburban North-South RER B"),
+        (
+            "Gare du Nord",
+            "Massy-Palaiseau",
+            "Suburban North-South RER B",
+        ),
         ("Chatelet", "La Defense", "High-frequency urban RER A / M1"),
-        ("Saint-Lazare", "Versailles", "Regional Transilien / Suburban"),
+        (
+            "Saint-Lazare",
+            "Versailles",
+            "Regional Transilien / Suburban",
+        ),
         ("Bercy", "Montparnasse", "Inter-station Metro transfer"),
     ];
 
@@ -191,10 +199,7 @@ fn bench_idfm_raptor_vs_tbr() {
             _ => "MISMATCHED (One found path, other did not)".to_string(),
         };
 
-        eprintln!(
-            "Route: {:<15} -> {:<18} ({})",
-            from_name, to_name, desc
-        );
+        eprintln!("Route: {:<15} -> {:<18} ({})", from_name, to_name, desc);
         eprintln!(
             "  RAPTOR Full API:  {:>8.1} µs/op\n  FLASH-TB Full API: {:>8.1} µs/op | Speedup: {:>5.2}x | {}\n  RAPTOR 1-Shot:     {:>8.1} µs/op\n  FLASH-TB 1-Shot:   {:>8.1} µs/op",
             r_us, t_us, speedup, match_status, r_us_1shot, t_us_1shot

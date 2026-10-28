@@ -136,12 +136,18 @@ const DEFAULT_SEED_STOPS: &[&str] = &[
 ];
 
 // ---------------------------------------------------------------------------
-// Daily soft quota (UTC day)
+// Daily soft quota (Europe/Paris day — PRIM quotas reset at local midnight)
 // ---------------------------------------------------------------------------
+
+/// SM budget used when an on-demand board consumes quota before the pollers
+/// configured it (matches the config default).
+const DEFAULT_SM_DAILY_BUDGET: u32 = 20_000;
+/// Upper bound for `et_lines_per_tick` (PRIM short-term rate limits).
+const MAX_ET_LINES_PER_TICK: u32 = 5;
 
 struct DailyQuota {
     name: &'static str,
-    budget: u32,
+    budget: AtomicU32,
     used: AtomicU32,
     day_ord: AtomicU32,
 }
@@ -150,14 +156,22 @@ impl DailyQuota {
     fn new(name: &'static str, budget: u32) -> Self {
         Self {
             name,
-            budget: budget.max(1),
+            budget: AtomicU32::new(budget.max(1)),
             used: AtomicU32::new(0),
-            day_ord: AtomicU32::new(utc_day_ordinal()),
+            day_ord: AtomicU32::new(paris_day_ordinal()),
         }
     }
 
+    fn budget(&self) -> u32 {
+        self.budget.load(Ordering::Relaxed)
+    }
+
+    fn set_budget(&self, budget: u32) {
+        self.budget.store(budget.max(1), Ordering::Relaxed);
+    }
+
     fn roll_if_needed(&self) {
-        let today = utc_day_ordinal();
+        let today = paris_day_ordinal();
         let prev = self.day_ord.load(Ordering::Relaxed);
         if today != prev
             && self
@@ -166,7 +180,11 @@ impl DailyQuota {
                 .is_ok()
         {
             self.used.store(0, Ordering::SeqCst);
-            info!(quota = self.name, budget = self.budget, "PRIM daily quota reset");
+            info!(
+                quota = self.name,
+                budget = self.budget(),
+                "PRIM daily quota reset"
+            );
         }
     }
 
@@ -175,7 +193,7 @@ impl DailyQuota {
         self.roll_if_needed();
         loop {
             let u = self.used.load(Ordering::Relaxed);
-            if u >= self.budget {
+            if u >= self.budget() {
                 return false;
             }
             if self
@@ -195,38 +213,96 @@ impl DailyQuota {
 
     fn remaining(&self) -> u32 {
         self.roll_if_needed();
-        self.budget
+        self.budget()
             .saturating_sub(self.used.load(Ordering::Relaxed))
     }
 }
 
-/// How many ET LineRefs to fetch this tick without overspending the soft daily budget.
-/// Spreads `remaining` calls evenly over ticks left in the UTC day, capped by `max_per_tick`.
-fn et_batch_size(quota: &DailyQuota, interval: Duration, max_per_tick: u32) -> usize {
-    let rem = quota.remaining() as u64;
+/// How many ET LineRefs to fetch this tick: the configured `max_per_tick`
+/// (clamped to `1..=MAX_ET_LINES_PER_TICK`), never more than the remaining budget.
+fn et_batch_size(quota: &DailyQuota, max_per_tick: u32) -> usize {
+    let rem = quota.remaining();
     if rem == 0 {
         return 0;
     }
-    // Hard cap 1 LineRef per tick — PRIM short-term limits are stricter than daily.
-    let max = max_per_tick.max(1).min(1) as u64;
-    let _ = interval;
-    rem.min(max) as usize
+    rem.min(max_per_tick.clamp(1, MAX_ET_LINES_PER_TICK)) as usize
 }
 
-fn utc_day_ordinal() -> u32 {
-    let d = Utc::now().date_naive();
-    // compact day key
-    (d.year() as u32).wrapping_mul(400).wrapping_add(d.ordinal())
+/// Compact key for the current calendar day in Europe/Paris.
+fn paris_day_ordinal() -> u32 {
+    let d = Utc::now()
+        .with_timezone(&chrono_tz::Europe::Paris)
+        .date_naive();
+    (d.year() as u32)
+        .wrapping_mul(400)
+        .wrapping_add(d.ordinal())
 }
 
 // ---------------------------------------------------------------------------
 // SM interest: GraphQL live boards register here for continuous warm poll
 // ---------------------------------------------------------------------------
 
+/// Max refs kept in the interest set.
+const SM_INTEREST_CAP: usize = 512;
+/// Max refs that have not (yet) produced a successful PRIM response. Such refs
+/// come from arbitrary client input, so they must not be able to flush real ones.
+const SM_UNCONFIRMED_CAP: usize = 64;
+
+#[derive(Clone, Copy)]
+struct SmInterestEntry {
+    /// Last registered / refreshed.
+    last: Instant,
+    /// True once PRIM returned data for this ref (or it comes from config / the
+    /// static timetable). Only confirmed refs are warm-polled.
+    confirmed: bool,
+}
+
 #[derive(Default)]
 struct SmInterestInner {
-    /// MonitoringRef → last registered / refreshed
-    refs: HashMap<String, Instant>,
+    refs: HashMap<String, SmInterestEntry>,
+}
+
+impl SmInterestInner {
+    fn touch(&mut self, mon: &str, confirmed: bool) {
+        let now = Instant::now();
+        let e = self.refs.entry(mon.to_string()).or_insert(SmInterestEntry {
+            last: now,
+            confirmed,
+        });
+        e.last = now;
+        e.confirmed |= confirmed;
+        self.evict();
+    }
+
+    /// LRU eviction: unconfirmed refs first (own, smaller cap), then oldest overall.
+    fn evict(&mut self) {
+        let unconfirmed = self.refs.values().filter(|e| !e.confirmed).count();
+        if unconfirmed > SM_UNCONFIRMED_CAP {
+            self.drop_oldest(unconfirmed - SM_UNCONFIRMED_CAP, Some(false));
+        }
+        if self.refs.len() > SM_INTEREST_CAP {
+            let over = self.refs.len() - SM_INTEREST_CAP;
+            let unconfirmed = self.refs.values().filter(|e| !e.confirmed).count();
+            let n = over.min(unconfirmed);
+            self.drop_oldest(n, Some(false));
+            if over > n {
+                self.drop_oldest(over - n, None);
+            }
+        }
+    }
+
+    fn drop_oldest(&mut self, n: usize, confirmed: Option<bool>) {
+        let mut pairs: Vec<(Instant, String)> = self
+            .refs
+            .iter()
+            .filter(|(_, e)| confirmed.is_none_or(|c| e.confirmed == c))
+            .map(|(k, e)| (e.last, k.clone()))
+            .collect();
+        pairs.sort_unstable();
+        for (_, k) in pairs.into_iter().take(n) {
+            self.refs.remove(&k);
+        }
+    }
 }
 
 /// Process-wide interest set for stop-monitoring warm polling.
@@ -238,23 +314,54 @@ fn sm_interest() -> &'static Mutex<SmInterestInner> {
     SM_INTEREST.get_or_init(|| Mutex::new(SmInterestInner::default()))
 }
 
-/// Register a MonitoringRef for continuous stop-monitoring pulls (e.g. after GraphQL live).
-pub fn register_sm_interest(monitoring_ref: &str) {
+fn sm_quota() -> &'static Arc<DailyQuota> {
+    SM_QUOTA.get_or_init(|| Arc::new(DailyQuota::new("siri-sm", DEFAULT_SM_DAILY_BUDGET)))
+}
+
+/// Same normalisation as the on-demand board (`…:` suffix).
+fn normalize_monitoring_ref(monitoring_ref: &str) -> Option<String> {
     let mon = monitoring_ref.trim();
     if mon.is_empty() {
-        return;
+        return None;
     }
+    let mut s = mon.to_string();
+    if !s.ends_with(':') {
+        s.push(':');
+    }
+    Some(s)
+}
+
+/// Tentatively register a MonitoringRef (e.g. before an on-demand GraphQL live
+/// request). It is only warm-polled once [`confirm_sm_interest`] marks it as
+/// producing data; unconfirmed refs live in a small, separately capped LRU so
+/// junk refs cannot evict real ones.
+pub fn register_sm_interest(monitoring_ref: &str) {
+    let Some(mon) = normalize_monitoring_ref(monitoring_ref) else {
+        return;
+    };
     if let Ok(mut g) = sm_interest().lock() {
-        g.refs.insert(mon.to_string(), Instant::now());
-        // Cap map size (viewport + live boards + seeds)
-        if g.refs.len() > 512 {
-            let mut pairs: Vec<_> = g.refs.iter().map(|(k, v)| (k.clone(), *v)).collect();
-            pairs.sort_by_key(|(_, t)| *t);
-            let drop_n = g.refs.len() - 400;
-            for (k, _) in pairs.into_iter().take(drop_n) {
-                g.refs.remove(&k);
-            }
-        }
+        g.touch(&mon, false);
+    }
+}
+
+/// Mark a MonitoringRef as valid (PRIM returned data for it) so the warm SM
+/// poller keeps it refreshed.
+pub fn confirm_sm_interest(monitoring_ref: &str) {
+    let Some(mon) = normalize_monitoring_ref(monitoring_ref) else {
+        return;
+    };
+    if let Ok(mut g) = sm_interest().lock() {
+        g.touch(&mon, true);
+    }
+}
+
+/// Register a trusted ref (config seeds / stops of the static timetable).
+fn register_trusted_sm_interest(monitoring_ref: &str) {
+    let Some(mon) = normalize_monitoring_ref(monitoring_ref) else {
+        return;
+    };
+    if let Ok(mut g) = sm_interest().lock() {
+        g.touch(&mon, true);
     }
 }
 
@@ -331,8 +438,8 @@ pub fn register_viewport_live_interest(
     let mid_lat = (min_lat + max_lat) * 0.5;
     let mid_lon = (min_lon + max_lon) * 0.5;
     // Approx radius from center to corner (m)
-    let radius = crate::link::geo::haversine_m(mid_lat, mid_lon, max_lat, max_lon)
-        .clamp(200.0, 6_000.0);
+    let radius =
+        crate::link::geo::haversine_m(mid_lat, mid_lon, max_lat, max_lon).clamp(200.0, 6_000.0);
     // Soft SM interest near viewport center
     register_nearby_sm_interest(epoch, mid_lat, mid_lon, radius, 12);
 
@@ -369,7 +476,7 @@ pub fn register_viewport_live_interest(
         }
     }
     let mut ranked: Vec<_> = line_tokens.into_iter().collect();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    ranked.sort_by_key(|r| std::cmp::Reverse(r.1));
     for (token, _) in ranked.into_iter().take(40) {
         // Default list uses STIF:Line::TOKEN:
         let lr = if token.starts_with("STIF:") {
@@ -399,7 +506,9 @@ fn extract_stif_line_token(route_id: &str) -> Option<String> {
         let p = part.to_ascii_uppercase();
         if p.len() >= 5
             && p.starts_with('C')
-            && p.chars().skip(1).all(|c| c.is_ascii_digit() || c.is_ascii_alphanumeric())
+            && p.chars()
+                .skip(1)
+                .all(|c| c.is_ascii_digit() || c.is_ascii_alphanumeric())
         {
             return Some(p);
         }
@@ -429,17 +538,14 @@ pub fn register_nearby_sm_interest(
         if let Some(m) = super::stop_board::monitoring_ref_from_stop_id(&s.raw_id)
             .or_else(|| super::stop_board::monitoring_ref_from_stop_id(&s.id))
         {
-            register_sm_interest(&m);
+            register_trusted_sm_interest(&m);
         }
     }
 }
 
 /// Consume one SM quota unit for on-demand GraphQL boards. Returns false if exhausted.
 pub fn sm_try_consume_quota() -> bool {
-    SM_QUOTA
-        .get()
-        .map(|q| q.try_consume())
-        .unwrap_or(true) // before pollers start, allow
+    sm_quota().try_consume()
 }
 
 fn list_sm_targets(seeds: &[String], max: usize) -> Vec<String> {
@@ -447,7 +553,13 @@ fn list_sm_targets(seeds: &[String], max: usize) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     // Fresh interest first
     if let Ok(g) = sm_interest().lock() {
-        let mut pairs: Vec<_> = g.refs.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        // Only refs that produced data (or are trusted) — never raw client input.
+        let mut pairs: Vec<_> = g
+            .refs
+            .iter()
+            .filter(|(_, e)| e.confirmed)
+            .map(|(k, e)| (k.clone(), e.last))
+            .collect();
         pairs.sort_by_key(|(_, t)| std::cmp::Reverse(*t));
         for (k, _) in pairs {
             if seen.insert(k.clone()) {
@@ -459,12 +571,11 @@ fn list_sm_targets(seeds: &[String], max: usize) -> Vec<String> {
         }
     }
     for s in seeds {
-        let t = s.trim();
-        if t.is_empty() {
+        let Some(t) = normalize_monitoring_ref(s) else {
             continue;
-        }
-        if seen.insert(t.to_string()) {
-            out.push(t.to_string());
+        };
+        if seen.insert(t.clone()) {
+            out.push(t);
         }
         if out.len() >= max {
             break;
@@ -477,8 +588,30 @@ fn list_sm_targets(seeds: &[String], max: usize) -> Vec<String> {
 // Accumulators (merge partial LineRef / MonitoringRef responses)
 // ---------------------------------------------------------------------------
 
+/// Trips whose last stop time is older than this are dropped from accumulators.
+const ACCUM_TRIP_PAST_GRACE_SECS: i64 = 2 * 3600;
+const ACCUM_TRIPS_CAP: usize = 50_000;
+/// Alerts not re-sent by PRIM for this long are dropped.
+const ACCUM_ALERT_MAX_AGE_SECS: i64 = 6 * 3600;
+const ACCUM_ALERTS_CAP: usize = 5_000;
+/// Vehicle positions older than this are dropped.
+const ACCUM_VEHICLE_MAX_AGE_SECS: i64 = 15 * 60;
+const ACCUM_VEHICLES_CAP: usize = 20_000;
+
+/// The `n` keys with the oldest timestamps.
+fn oldest_keys<'a, I>(it: I, n: usize) -> Vec<String>
+where
+    I: Iterator<Item = (&'a String, chrono::DateTime<Utc>)>,
+{
+    let mut v: Vec<(chrono::DateTime<Utc>, &String)> = it.map(|(k, t)| (t, k)).collect();
+    v.sort_unstable();
+    v.into_iter().take(n).map(|(_, k)| k.clone()).collect()
+}
+
 struct TripAccum {
-    trips: HashMap<String, TripRt>,
+    /// Trip key → (latest update, when it was last received).
+    trips: HashMap<String, (TripRt, chrono::DateTime<Utc>)>,
+    /// Drop trips not refreshed by any response for this long.
     max_age: Duration,
 }
 
@@ -491,24 +624,36 @@ impl TripAccum {
     }
 
     fn merge(&mut self, incoming: HashMap<String, TripRt>) {
-        let now = Utc::now();
+        self.merge_at(incoming, Utc::now());
+    }
+
+    fn merge_at(&mut self, incoming: HashMap<String, TripRt>, now: chrono::DateTime<Utc>) {
         for (k, v) in incoming {
-            self.trips.insert(k, v);
+            self.trips.insert(k, (v, now));
         }
-        // Drop very stale trips (no stop-time updates after max_age wall clock from insert — use trip delay time if any)
-        // Simple: cap map size by removing arbitrary oldest keys if huge
-        if self.trips.len() > 50_000 {
-            let drop: Vec<_> = self.trips.keys().take(10_000).cloned().collect();
+        let max_age =
+            chrono::Duration::from_std(self.max_age).unwrap_or_else(|_| chrono::Duration::hours(1));
+        let seen_cutoff = now - max_age;
+        let past_cutoff = now.timestamp() - ACCUM_TRIP_PAST_GRACE_SECS;
+        self.trips.retain(|_, (t, seen)| {
+            *seen >= seen_cutoff && t.last_stop_time().is_none_or(|ts| ts >= past_cutoff)
+        });
+        if self.trips.len() > ACCUM_TRIPS_CAP {
+            let drop_n = self.trips.len() - ACCUM_TRIPS_CAP;
+            let drop = oldest_keys(self.trips.iter().map(|(k, (_, t))| (k, *t)), drop_n);
             for k in drop {
                 self.trips.remove(&k);
             }
         }
-        let _ = (now, self.max_age);
     }
 
     fn snapshot(&self, feed_id: &str) -> FeedRtState {
         let mut s = FeedRtState::new(feed_id);
-        s.trips = self.trips.clone();
+        s.trips = self
+            .trips
+            .iter()
+            .map(|(k, (t, _))| (k.clone(), t.clone()))
+            .collect();
         s.trip_update_count = s.trips.len();
         s.trip_updates_fetched_at = Some(Utc::now());
         s
@@ -516,7 +661,8 @@ impl TripAccum {
 }
 
 struct AlertAccum {
-    by_id: HashMap<String, AlertRt>,
+    /// Alert key → (alert, when it was last received).
+    by_id: HashMap<String, (AlertRt, chrono::DateTime<Utc>)>,
 }
 
 impl AlertAccum {
@@ -527,20 +673,20 @@ impl AlertAccum {
     }
 
     fn merge(&mut self, alerts: Vec<AlertRt>) {
+        self.merge_at(alerts, Utc::now());
+    }
+
+    fn merge_at(&mut self, alerts: Vec<AlertRt>, now: chrono::DateTime<Utc>) {
         for a in alerts {
-            let key = if a.id.is_empty() {
-                format!(
-                    "{}|{}",
-                    a.header.as_deref().unwrap_or(""),
-                    a.description.as_deref().unwrap_or("")
-                )
-            } else {
-                a.id.clone()
-            };
-            self.by_id.insert(key, a);
+            self.by_id.insert(a.merge_key(), (a, now));
         }
-        if self.by_id.len() > 5_000 {
-            let drop: Vec<_> = self.by_id.keys().take(1_000).cloned().collect();
+        let now_ts = now.timestamp();
+        let seen_cutoff = now - chrono::Duration::seconds(ACCUM_ALERT_MAX_AGE_SECS);
+        self.by_id
+            .retain(|_, (a, seen)| *seen >= seen_cutoff && !a.has_ended(now_ts));
+        if self.by_id.len() > ACCUM_ALERTS_CAP {
+            let drop_n = self.by_id.len() - ACCUM_ALERTS_CAP;
+            let drop = oldest_keys(self.by_id.iter().map(|(k, (_, t))| (k, *t)), drop_n);
             for k in drop {
                 self.by_id.remove(&k);
             }
@@ -549,7 +695,7 @@ impl AlertAccum {
 
     fn snapshot(&self, feed_id: &str) -> FeedRtState {
         let mut s = FeedRtState::new(feed_id);
-        s.alerts = self.by_id.values().cloned().collect();
+        s.alerts = self.by_id.values().map(|(a, _)| a.clone()).collect();
         s.alert_count = s.alerts.len();
         s.alerts_fetched_at = Some(Utc::now());
         s
@@ -568,11 +714,18 @@ impl VehicleAccum {
     }
 
     fn merge(&mut self, incoming: HashMap<String, VehiclePos>) {
+        self.merge_at(incoming, Utc::now());
+    }
+
+    fn merge_at(&mut self, incoming: HashMap<String, VehiclePos>, now: chrono::DateTime<Utc>) {
         for (k, v) in incoming {
             self.vehicles.insert(k, v);
         }
-        if self.vehicles.len() > 20_000 {
-            let drop: Vec<_> = self.vehicles.keys().take(5_000).cloned().collect();
+        let cutoff = now - chrono::Duration::seconds(ACCUM_VEHICLE_MAX_AGE_SECS);
+        self.vehicles.retain(|_, v| v.updated_at >= cutoff);
+        if self.vehicles.len() > ACCUM_VEHICLES_CAP {
+            let drop_n = self.vehicles.len() - ACCUM_VEHICLES_CAP;
+            let drop = oldest_keys(self.vehicles.iter().map(|(k, v)| (k, v.updated_at)), drop_n);
             for k in drop {
                 self.vehicles.remove(&k);
             }
@@ -613,7 +766,10 @@ fn resolve_seed_stops(cfg: &PrimConfig) -> Vec<String> {
             .filter(|s| !s.is_empty())
             .collect();
     }
-    DEFAULT_SEED_STOPS.iter().map(|s| (*s).to_string()).collect()
+    DEFAULT_SEED_STOPS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
 }
 
 /// Spawn continuous SIRI Lite pollers when config + API key allow.
@@ -630,12 +786,13 @@ pub fn spawn_prim_pollers(
 
     let et_q = Arc::new(DailyQuota::new("siri-et", prim.et_daily_budget));
     let gm_q = Arc::new(DailyQuota::new("siri-gm", prim.gm_daily_budget));
-    let sm_q = Arc::new(DailyQuota::new("siri-sm", prim.sm_daily_budget));
-    let _ = SM_QUOTA.set(sm_q.clone());
+    // Shared with on-demand boards (which may have initialised it with the default).
+    let sm_q = sm_quota().clone();
+    sm_q.set_budget(prim.sm_daily_budget);
 
     // Seed interest from config
     for s in &seeds {
-        register_sm_interest(s);
+        register_trusted_sm_interest(s);
     }
 
     info!(
@@ -770,11 +927,11 @@ async fn run_siri_et_poller(
     let mut veh_accum = VehicleAccum::new();
     let mut line_idx = 0usize;
     loop {
-        let batch = et_batch_size(&quota, interval, lines_per_tick);
+        let batch = et_batch_size(&quota, lines_per_tick);
         if batch == 0 {
             warn!(
                 used = quota.used(),
-                budget = quota.budget,
+                budget = quota.budget(),
                 "PRIM SIRI ET daily budget exhausted — sleeping 1h"
             );
             tokio::select! {
@@ -790,7 +947,7 @@ async fn run_siri_et_poller(
         let mut gps_this_tick = 0usize;
 
         // Prefer viewport-interested lines (map pan) then rotate the default list.
-        let order = et_line_order(&lines, &mut line_idx, batch as usize);
+        let order = et_line_order(&lines, &mut line_idx, batch);
 
         for line in order {
             if !quota.try_consume() {
@@ -940,7 +1097,7 @@ async fn run_siri_gm_poller(
             if !quota.try_consume() {
                 warn!(
                     used = quota.used(),
-                    budget = quota.budget,
+                    budget = quota.budget(),
                     "PRIM SIRI GM daily budget exhausted — sleeping 1h"
                 );
                 tokio::select! {
@@ -1056,10 +1213,7 @@ async fn run_siri_sm_poller(
 
     loop {
         if backoff > Duration::ZERO {
-            warn!(
-                secs = backoff.as_secs(),
-                "PRIM SIRI SM rate-limit backoff"
-            );
+            warn!(secs = backoff.as_secs(), "PRIM SIRI SM rate-limit backoff");
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 _ = tokio::time::sleep(backoff) => {}
@@ -1069,7 +1223,7 @@ async fn run_siri_sm_poller(
         if !quota.try_consume() {
             warn!(
                 used = quota.used(),
-                budget = quota.budget,
+                budget = quota.budget(),
                 "PRIM SIRI SM daily soft budget exhausted — sleeping 30m"
             );
             tokio::select! {
@@ -1213,8 +1367,9 @@ pub fn spawn_prim_poller(
         info!("PRIM catalog stub (SIRI SM/ET/GM via spawn_prim_pollers)");
         loop {
             prim.store(Arc::new(PrimCatalog {
-                note: "SIRI Lite continuous: stop-monitoring + estimated-timetable + general-message"
-                    .into(),
+                note:
+                    "SIRI Lite continuous: stop-monitoring + estimated-timetable + general-message"
+                        .into(),
                 fetched_at: Some(Utc::now()),
                 error: None,
             }));
@@ -1250,9 +1405,161 @@ mod tests {
 
     #[test]
     fn register_interest_and_list() {
+        // Tentative refs are not polled until PRIM confirmed them.
         register_sm_interest("STIF:StopPoint:Q:1:");
         let t = list_sm_targets(&["STIF:StopPoint:Q:2:".into()], 10);
-        assert!(t.iter().any(|s| s.contains("Q:1")));
+        assert!(!t.iter().any(|s| s.contains("Q:1:")));
+        confirm_sm_interest("STIF:StopPoint:Q:1");
+        let t = list_sm_targets(&["STIF:StopPoint:Q:2:".into()], 10);
+        assert!(t.iter().any(|s| s == "STIF:StopPoint:Q:1:"));
+    }
+
+    #[test]
+    fn junk_refs_cannot_flush_confirmed_interest() {
+        let mut inner = SmInterestInner::default();
+        for i in 0..SM_INTEREST_CAP {
+            inner.touch(&format!("ok:{i}:"), true);
+        }
+        for i in 0..10_000 {
+            inner.touch(&format!("junk:{i}:"), false);
+        }
+        let confirmed = inner.refs.values().filter(|e| e.confirmed).count();
+        let unconfirmed = inner.refs.len() - confirmed;
+        assert!(unconfirmed <= SM_UNCONFIRMED_CAP);
+        assert!(inner.refs.len() <= SM_INTEREST_CAP);
+        // No confirmed ref was evicted by junk.
+        assert_eq!(confirmed, SM_INTEREST_CAP);
+        assert!(inner.refs.contains_key("ok:0:"));
+
+        // A newly confirmed ref evicts the least recently used confirmed one.
+        inner.touch("ok:1:", true);
+        inner.touch("fresh:", true);
+        assert!(inner.refs.contains_key("fresh:"));
+        assert!(inner.refs.contains_key("ok:1:"));
+        assert!(!inner.refs.contains_key("ok:0:"));
+        assert_eq!(inner.refs.len(), SM_INTEREST_CAP);
+    }
+
+    #[test]
+    fn sm_quota_defaults_when_pollers_not_started() {
+        // Before (or without) spawn_prim_pollers the shared quota still exists
+        // and enforces a budget instead of allowing unlimited calls.
+        assert!(sm_quota().budget() >= 1);
+    }
+
+    fn trip_ending_at(ts: i64) -> TripRt {
+        let mut t = TripRt::default();
+        t.stop_updates.insert(
+            1,
+            crate::rt::overlay::StopTimeRt {
+                departure_time: Some(ts),
+                ..Default::default()
+            },
+        );
+        t
+    }
+
+    #[test]
+    fn trip_accum_evicts_by_max_age_and_last_stop() {
+        let t0 = Utc::now();
+        let mut acc = TripAccum::new(Duration::from_secs(30 * 60));
+        let mut first = HashMap::new();
+        first.insert("a".to_string(), TripRt::default());
+        first.insert(
+            "done".to_string(),
+            trip_ending_at(t0.timestamp() - 3 * 3600),
+        );
+        acc.merge_at(first, t0);
+        assert!(acc.trips.contains_key("a"));
+        assert!(!acc.trips.contains_key("done"), "ended > 2h ago");
+
+        let t1 = t0 + chrono::Duration::minutes(31);
+        let mut second = HashMap::new();
+        second.insert("b".to_string(), TripRt::default());
+        acc.merge_at(second, t1);
+        assert!(!acc.trips.contains_key("a"), "not refreshed within max_age");
+        assert!(acc.trips.contains_key("b"));
+        assert_eq!(acc.snapshot("idfm").trip_update_count, 1);
+    }
+
+    #[test]
+    fn trip_accum_cap_evicts_oldest() {
+        let t0 = Utc::now();
+        let mut acc = TripAccum::new(Duration::from_secs(3600));
+        let mut batch = HashMap::new();
+        batch.insert("oldest".to_string(), TripRt::default());
+        acc.merge_at(batch, t0);
+        let mut batch = HashMap::new();
+        for i in 0..ACCUM_TRIPS_CAP {
+            batch.insert(format!("t{i}"), TripRt::default());
+        }
+        acc.merge_at(batch, t0 + chrono::Duration::seconds(1));
+        assert_eq!(acc.trips.len(), ACCUM_TRIPS_CAP);
+        assert!(!acc.trips.contains_key("oldest"));
+    }
+
+    fn alert(id: &str, end: Option<i64>) -> AlertRt {
+        AlertRt {
+            id: id.into(),
+            header: None,
+            description: None,
+            severity: "INFO".into(),
+            informed_stop_ids: vec![],
+            informed_route_ids: vec![],
+            informed_trip_ids: vec![],
+            cause: None,
+            effect: None,
+            url: None,
+            active_start: None,
+            active_end: end,
+            active_periods: vec![],
+            header_translations: vec![],
+        }
+    }
+
+    #[test]
+    fn alert_accum_evicts_ended_and_unseen() {
+        let t0 = Utc::now();
+        let mut acc = AlertAccum::new();
+        acc.merge_at(
+            vec![
+                alert("ended", Some(t0.timestamp() - 1)),
+                alert("a", None),
+                alert("b", None),
+            ],
+            t0,
+        );
+        assert_eq!(acc.by_id.len(), 2);
+        acc.merge_at(vec![alert("b", None)], t0 + chrono::Duration::hours(7));
+        assert_eq!(acc.by_id.keys().collect::<Vec<_>>(), vec!["b"]);
+    }
+
+    #[test]
+    fn vehicle_accum_evicts_stale() {
+        let now = Utc::now();
+        let v = |at| VehiclePos {
+            trip_id: None,
+            lat: 0.0,
+            lon: 0.0,
+            bearing: None,
+            speed: None,
+            updated_at: at,
+            current_stop_id: None,
+            label: None,
+            vehicle_id: None,
+            license_plate: None,
+            occupancy: None,
+            current_status: None,
+            current_stop_sequence: None,
+            congestion: None,
+            occupancy_percentage: None,
+        };
+        let mut acc = VehicleAccum::new();
+        let mut m = HashMap::new();
+        m.insert("old".to_string(), v(now - chrono::Duration::minutes(16)));
+        m.insert("new".to_string(), v(now));
+        acc.merge_at(m, now);
+        assert_eq!(acc.vehicles.keys().collect::<Vec<_>>(), vec!["new"]);
     }
 
     #[test]
@@ -1264,7 +1571,7 @@ mod tests {
         );
         // Seeds stay tiny on purpose (PRIM short-term rate limit / 429).
         assert!(
-            DEFAULT_SEED_STOPS.len() >= 1 && DEFAULT_SEED_STOPS.len() <= 8,
+            !DEFAULT_SEED_STOPS.is_empty() && DEFAULT_SEED_STOPS.len() <= 8,
             "expect small hub seed set, got {}",
             DEFAULT_SEED_STOPS.len()
         );
@@ -1276,13 +1583,18 @@ mod tests {
     #[test]
     fn et_batch_respects_cap() {
         let q = DailyQuota::new("et-batch", 900);
-        // Always hard-capped to 1 LineRef per tick (rate-limit safety).
-        let n = et_batch_size(&q, Duration::from_secs(90), 3);
-        assert_eq!(n, 1, "batch={n}");
-        // Exhaust
-        for _ in 0..900 {
+        // Config value honoured, clamped to 1..=MAX_ET_LINES_PER_TICK.
+        assert_eq!(et_batch_size(&q, 0), 1);
+        assert_eq!(et_batch_size(&q, 1), 1);
+        assert_eq!(et_batch_size(&q, 3), 3);
+        assert_eq!(et_batch_size(&q, 50), MAX_ET_LINES_PER_TICK as usize);
+        // Never more than what is left of the budget.
+        for _ in 0..898 {
             assert!(q.try_consume());
         }
-        assert_eq!(et_batch_size(&q, Duration::from_secs(90), 3), 0);
+        assert_eq!(et_batch_size(&q, 5), 2);
+        assert!(q.try_consume());
+        assert!(q.try_consume());
+        assert_eq!(et_batch_size(&q, 3), 0);
     }
 }

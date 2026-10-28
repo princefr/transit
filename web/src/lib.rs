@@ -100,10 +100,9 @@ fn graphql_ws_url() -> Option<String> {
     let http = graphql_url();
     let ws = if let Some(rest) = http.strip_prefix("https://") {
         format!("wss://{rest}")
-    } else if let Some(rest) = http.strip_prefix("http://") {
-        format!("ws://{rest}")
     } else {
-        return None;
+        let rest = http.strip_prefix("http://")?;
+        format!("ws://{rest}")
     };
     let derived = if ws.ends_with("/graphql") {
         format!("{}ws", ws.trim_end_matches("graphql"))
@@ -134,9 +133,9 @@ const HEALTH_POLL_LOADING_MS: u32 = 3_000;
 const HEALTH_POLL_READY_MS: u32 = 15_000;
 
 thread_local! {
-    static HEALTH_POLL_HANDLE: RefCell<Option<gloo_timers::callback::Interval>> = RefCell::new(None);
-    static STATIC_FEEDS_READY: RefCell<bool> = RefCell::new(false);
-    static HEALTH_POLL_FAST: RefCell<Option<bool>> = RefCell::new(None);
+    static HEALTH_POLL_HANDLE: RefCell<Option<gloo_timers::callback::Interval>> = const { RefCell::new(None) };
+    static STATIC_FEEDS_READY: RefCell<bool> = const { RefCell::new(false) };
+    static HEALTH_POLL_FAST: RefCell<Option<bool>> = const { RefCell::new(None) };
 }
 
 // ─── Domain types ───────────────────────────────────────────────────────────
@@ -337,10 +336,7 @@ async fn fetch_health_snapshot() -> Result<HealthSnapshot, String> {
     if !resp.ok() {
         return Err(format!("health HTTP {}", resp.status()));
     }
-    let body: Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("health JSON: {e}"))?;
+    let body: Value = resp.json().await.map_err(|e| format!("health JSON: {e}"))?;
     let feeds = body
         .get("feeds")
         .and_then(|v| v.as_array())
@@ -354,8 +350,14 @@ async fn fetch_health_snapshot() -> Result<HealthSnapshot, String> {
                             .get("last_static_error")
                             .and_then(|v| v.as_str())
                             .map(str::to_string),
-                        static_stops: f.get("static_stops").and_then(|v| v.as_u64()).map(|n| n as i32),
-                        static_trips: f.get("static_trips").and_then(|v| v.as_u64()).map(|n| n as i32),
+                        static_stops: f
+                            .get("static_stops")
+                            .and_then(|v| v.as_u64())
+                            .map(|n| n as i32),
+                        static_trips: f
+                            .get("static_trips")
+                            .and_then(|v| v.as_u64())
+                            .map(|n| n as i32),
                     })
                 })
                 .collect()
@@ -420,7 +422,10 @@ async fn search_stops(search: &str, limit: i32) -> Result<Vec<Stop>, String> {
                 .get("code")
                 .and_then(|x| x.as_str())
                 .map(|s| s.to_string()),
-            wheelchair: n.get("wheelchair").and_then(|x| x.as_i64()).map(|i| i as i32),
+            wheelchair: n
+                .get("wheelchair")
+                .and_then(|x| x.as_i64())
+                .map(|i| i as i32),
         });
     }
     Ok(out)
@@ -550,7 +555,11 @@ async fn fetch_traffic_messages(limit: i32) -> Result<Value, String> {
             .get("trafficMessages")
             .cloned()
             .unwrap_or(Value::Array(vec![]))),
-        Err(e) if e.contains("informedRouteIds") || e.contains("lines") || e.contains("Unknown field") => {
+        Err(e)
+            if e.contains("informedRouteIds")
+                || e.contains("lines")
+                || e.contains("Unknown field") =>
+        {
             web_sys::console::warn_1(
                 &"traffic: API without lines fields — restart server (make run); using legacy query"
                     .into(),
@@ -663,11 +672,7 @@ async fn plan_itineraries(
     let vars = json!({ "input": input });
     let data = match gql(q, vars.clone()).await {
         Ok(d) => d,
-        Err(e)
-            if e.contains("Unknown field")
-                || e.contains("alerts")
-                || e.contains("lines") =>
-        {
+        Err(e) if e.contains("Unknown field") || e.contains("alerts") || e.contains("lines") => {
             // Older API without journey.alerts — still get status/delays/headers.
             let q_legacy = r#"
               query($input: ItineraryInput!) {
@@ -709,14 +714,15 @@ async fn plan_itineraries(
                 }
               }
             "#;
-            gql(q_legacy, vars).await.map_err(|e2| format!("{e}; legacy: {e2}"))?
+            gql(q_legacy, vars)
+                .await
+                .map_err(|e2| format!("{e}; legacy: {e2}"))?
         }
         Err(e) => return Err(e),
     };
-    Ok(data
-        .get("itineraries")
+    data.get("itineraries")
         .cloned()
-        .ok_or_else(|| "no itineraries field".to_string())?)
+        .ok_or_else(|| "no itineraries field".to_string())
 }
 
 // ─── Map bridge ─────────────────────────────────────────────────────────────
@@ -827,10 +833,7 @@ fn journey_to_map(journey: &Value) -> MapPayload {
     let mut last_pt: Option<(f64, f64, String)> = None;
 
     for (i, leg) in legs.iter().enumerate() {
-        let ty = leg
-            .get("__typename")
-            .and_then(|t| t.as_str())
-            .unwrap_or("");
+        let ty = leg.get("__typename").and_then(|t| t.as_str()).unwrap_or("");
 
         if ty == "WalkLeg" {
             let mut pts = geometry_points(leg);
@@ -880,7 +883,9 @@ fn journey_to_map(journey: &Value) -> MapPayload {
                     dashed: true,
                     points: pts,
                     label: format!(
-                        "{label_mode} {from_n} → {to_n}<br/>{dist:.0} m · {dur}s"
+                        "{label_mode} {} → {}<br/>{dist:.0} m · {dur}s",
+                        escape_html(from_n),
+                        escape_html(to_n)
                     ),
                 });
             }
@@ -923,7 +928,7 @@ fn journey_to_map(journey: &Value) -> MapPayload {
                         lat,
                         lon,
                         kind: "transfer".into(),
-                        title: format!("Correspondance · {name}"),
+                        title: format!("Correspondance · {}", escape_html(name)),
                         mode: Some(mode.clone()),
                         route_color: route_color.clone(),
                         bearing: None,
@@ -943,7 +948,13 @@ fn journey_to_map(journey: &Value) -> MapPayload {
             pts = fallback_points(leg, false);
         }
 
-        let label = format!("<b>{mode}</b> {route} {trip}<br/>{head}");
+        let label = format!(
+            "<b>{}</b> {} {}<br/>{}",
+            escape_html(&mode),
+            escape_html(route),
+            escape_html(trip),
+            escape_html(head)
+        );
         if pts.len() >= 2 {
             legs_out.push(MapLeg {
                 mode: mode.clone(),
@@ -959,16 +970,13 @@ fn journey_to_map(journey: &Value) -> MapPayload {
                 v.get("lat").and_then(|x| x.as_f64()),
                 v.get("lon").and_then(|x| x.as_f64()),
             ) {
-                let lbl = v
-                    .get("label")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("Vehicle");
+                let lbl = v.get("label").and_then(|x| x.as_str()).unwrap_or("Vehicle");
                 let bearing = v.get("bearing").and_then(|x| x.as_f64());
                 markers.push(MapMarker {
                     lat,
                     lon,
                     kind: "vehicle".into(),
-                    title: format!("{lbl} ({mode})"),
+                    title: format!("{} ({})", escape_html(lbl), escape_html(&mode)),
                     mode: Some(mode),
                     route_color,
                     bearing,
@@ -984,7 +992,7 @@ fn journey_to_map(journey: &Value) -> MapPayload {
                 lat,
                 lon,
                 kind: "origin".into(),
-                title: format!("Départ · {title}"),
+                title: format!("Départ · {}", escape_html(&title)),
                 mode: None,
                 route_color: None,
                 bearing: None,
@@ -996,7 +1004,7 @@ fn journey_to_map(journey: &Value) -> MapPayload {
             lat,
             lon,
             kind: "destination".into(),
-            title: format!("Arrivée · {title}"),
+            title: format!("Arrivée · {}", escape_html(&title)),
             mode: None,
             route_color: None,
             bearing: None,
@@ -1030,7 +1038,8 @@ fn set_html(id: &str, html: &str) {
 
 fn set_status(msg: &str, err: bool) {
     if let Some(e) = el("status") {
-        e.set_inner_html(msg);
+        // Plain text: messages may carry server / network error strings.
+        e.set_text_content(Some(msg));
         let _ = e.class_list().toggle_with_force("error", err);
     }
 }
@@ -1125,6 +1134,18 @@ fn escape_html(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// GTFS colour (`RRGGBB`, optional `#`) safe to splice into a `style` attribute;
+/// anything that is not exactly six ASCII hex digits yields `default`.
+fn css_hex(raw: &str, default: &str) -> String {
+    let h = raw.trim().trim_start_matches('#');
+    if h.len() == 6 && h.chars().all(|c| c.is_ascii_hexdigit()) {
+        h.to_string()
+    } else {
+        default.to_string()
+    }
 }
 
 fn mode_icon_path(mode: &str) -> String {
@@ -1489,11 +1510,12 @@ fn format_transit_time_html(
         "time"
     };
     let show = rt.clone().or(sched.clone()).unwrap_or_else(|| "—".into());
-    let mut html = format!(r#"<span class="{time_cls}">{show}</span>"#);
+    let mut html = format!(r#"<span class="{time_cls}">{}</span>"#, escape_html(&show));
     if let (Some(s), Some(r)) = (&sched, &rt) {
         if s != r && !canceled {
             html.push_str(&format!(
-                r#" <span class="time-scheduled" title="Horaire théorique">{s}</span>"#
+                r#" <span class="time-scheduled" title="Horaire théorique">{}</span>"#,
+                escape_html(s)
             ));
         }
     }
@@ -1554,13 +1576,20 @@ fn journey_times_html(j: &Value) -> String {
     let arr_html = format_transit_time_html(arr_sched_iso, arr_rt_iso, arr_delay, canceled);
     // Fallback when legs lack scheduled fields
     if dep_sched_iso.is_none() && _rt_dep.is_none() {
-        return format!(r#"<span class="journey-dep-arr">{sched_dep} → {sched_arr}</span>"#);
+        return format!(
+            r#"<span class="journey-dep-arr">{} → {}</span>"#,
+            escape_html(&sched_dep),
+            escape_html(&sched_arr)
+        );
     }
     format!(r#"<span class="journey-dep-arr">{dep_html} → {arr_html}</span>"#)
 }
 
 fn leg_times_compact_html(leg: &Value) -> String {
-    let canceled = leg.get("canceled").and_then(|x| x.as_bool()).unwrap_or(false);
+    let canceled = leg
+        .get("canceled")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
     let dep_delay = leg.get("delayDepartureSeconds").and_then(|x| x.as_i64());
     let arr_delay = leg.get("delayArrivalSeconds").and_then(|x| x.as_i64());
     let dep = format_transit_time_html(
@@ -1591,10 +1620,7 @@ fn disruption_panel_html(msgs: &[(String, String, String)], open: bool) -> Strin
             h.as_str()
         };
         let body = if !d.is_empty() && d != h {
-            format!(
-                r#"<div class="disruption-body">{}</div>"#,
-                escape_html(d)
-            )
+            format!(r#"<div class="disruption-body">{}</div>"#, escape_html(d))
         } else {
             String::new()
         };
@@ -1640,10 +1666,7 @@ fn journey_tracked_trips(journey: &Value) -> Vec<TrackedTrip> {
         .cloned()
         .unwrap_or_default();
     for leg in legs {
-        let ty = leg
-            .get("__typename")
-            .and_then(|t| t.as_str())
-            .unwrap_or("");
+        let ty = leg.get("__typename").and_then(|t| t.as_str()).unwrap_or("");
         if ty == "WalkLeg" {
             continue;
         }
@@ -1707,7 +1730,7 @@ fn set_live_empty(msg: Option<&str>) {
     if let Some(e) = el("live-vehicles-status") {
         match msg {
             Some(m) if !m.is_empty() => {
-                e.set_inner_html(m);
+                e.set_text_content(Some(m));
                 let _ = e.remove_attribute("hidden");
             }
             _ => {
@@ -1871,9 +1894,7 @@ fn apply_live_snapshot(vehicles: &[LiveVehicle], trips_len: usize) {
         if trips_len == 0 {
             set_live_empty(None);
         } else {
-            set_live_empty(Some(
-                "Aucune position temps réel pour ces courses",
-            ));
+            set_live_empty(Some("Aucune position temps réel pour ces courses"));
         }
     } else {
         set_live_empty(None);
@@ -1900,7 +1921,7 @@ fn try_start_live_ws(gen: u64, trips: &[TrackedTrip]) -> bool {
             return false;
         }
     };
-    let _ = ws.set_binary_type(web_sys::BinaryType::Blob);
+    ws.set_binary_type(web_sys::BinaryType::Blob);
 
     let trip_ids: Vec<String> = trips.iter().map(|t| t.trip_id.clone()).collect();
     let meta_map: HashMap<String, TrackedTrip> = trips
@@ -1982,10 +2003,12 @@ fn try_start_live_ws(gen: u64, trips: &[TrackedTrip]) -> bool {
                     return;
                 };
                 // payload.data.watchTrips is a single TripRealtime per emission
-                let rt = payload
-                    .pointer("/data/watchTrips")
-                    .cloned()
-                    .or_else(|| payload.get("data").and_then(|d| d.get("watchTrips")).cloned());
+                let rt = payload.pointer("/data/watchTrips").cloned().or_else(|| {
+                    payload
+                        .get("data")
+                        .and_then(|d| d.get("watchTrips"))
+                        .cloned()
+                });
                 let Some(rt) = rt else {
                     return;
                 };
@@ -2010,9 +2033,7 @@ fn try_start_live_ws(gen: u64, trips: &[TrackedTrip]) -> bool {
                 }
             }
             "error" | "complete" => {
-                web_sys::console::warn_1(&JsValue::from_str(&format!(
-                    "live WS {ty}: {text}"
-                )));
+                web_sys::console::warn_1(&JsValue::from_str(&format!("live WS {ty}: {text}")));
                 APP.with(|app| {
                     app.borrow_mut().live_ws_active = false;
                 });
@@ -2022,9 +2043,7 @@ fn try_start_live_ws(gen: u64, trips: &[TrackedTrip]) -> bool {
     }) as Box<dyn FnMut(_)>);
 
     let on_error = Closure::wrap(Box::new(move |_: web_sys::Event| {
-        web_sys::console::warn_1(&JsValue::from_str(
-            "live WS error — soft fallback to poll",
-        ));
+        web_sys::console::warn_1(&JsValue::from_str("live WS error — soft fallback to poll"));
         APP.with(|app| {
             app.borrow_mut().live_ws_active = false;
         });
@@ -2039,10 +2058,10 @@ fn try_start_live_ws(gen: u64, trips: &[TrackedTrip]) -> bool {
         });
     }) as Box<dyn FnMut(_)>);
 
-    let _ = ws.set_onopen(Some(on_open.as_ref().unchecked_ref()));
-    let _ = ws.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-    let _ = ws.set_onerror(Some(on_error.as_ref().unchecked_ref()));
-    let _ = ws.set_onclose(Some(on_close.as_ref().unchecked_ref()));
+    ws.set_onopen(Some(on_open.as_ref().unchecked_ref()));
+    ws.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+    ws.set_onerror(Some(on_error.as_ref().unchecked_ref()));
+    ws.set_onclose(Some(on_close.as_ref().unchecked_ref()));
     on_open.forget();
     on_message.forget();
     on_error.forget();
@@ -2235,7 +2254,7 @@ fn set_global_live_empty(msg: Option<&str>) {
     if let Some(e) = el("global-live-status") {
         match msg {
             Some(m) if !m.is_empty() => {
-                e.set_inner_html(m);
+                e.set_text_content(Some(m));
                 let _ = e.remove_attribute("hidden");
             }
             _ => {
@@ -2341,7 +2360,9 @@ fn live_vehicle_from_global(v: &Value) -> Option<LiveVehicle> {
         lon,
         bearing: v.get("bearing").and_then(|x| x.as_f64()),
         label: label.clone(),
-        display_label: display_label.or_else(|| label.clone()).or(trip_short.clone()),
+        display_label: display_label
+            .or_else(|| label.clone())
+            .or(trip_short.clone()),
         trip_short_name: trip_short,
         vehicle_id,
         occupancy: v
@@ -2518,9 +2539,7 @@ fn warm_live_viewport_async(bounds: Option<MapBounds>) {
             }
         });
         if let Err(e) = gql(q, vars).await {
-            web_sys::console::warn_1(&JsValue::from_str(&format!(
-                "warmLiveViewport: {e}"
-            )));
+            web_sys::console::warn_1(&JsValue::from_str(&format!("warmLiveViewport: {e}")));
         }
     });
 }
@@ -2593,10 +2612,7 @@ fn render_journeys(app: &App) {
             .get("durationSeconds")
             .and_then(|x| x.as_i64())
             .unwrap_or(0);
-        let transfers = j
-            .get("transfers")
-            .and_then(|x| x.as_i64())
-            .unwrap_or(0);
+        let transfers = j.get("transfers").and_then(|x| x.as_i64()).unwrap_or(0);
         let rt = j
             .get("realtimeStatus")
             .and_then(|x| x.as_str())
@@ -2628,10 +2644,7 @@ fn render_journeys(app: &App) {
         let mut legs_html = String::from(r#"<div class="legs">"#);
         if let Some(legs) = j.get("legs").and_then(|l| l.as_array()) {
             for leg in legs {
-                let ty = leg
-                    .get("__typename")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("");
+                let ty = leg.get("__typename").and_then(|t| t.as_str()).unwrap_or("");
                 if ty == "WalkLeg" {
                     let dist = leg
                         .get("distanceMeters")
@@ -2700,26 +2713,25 @@ fn render_journeys(app: &App) {
                         .get("routeColor")
                         .and_then(|x| x.as_str())
                         .unwrap_or("334155");
-                    let color = color.trim_start_matches('#');
+                    let color = css_hex(color, "334155");
                     let text = leg
                         .get("routeTextColor")
                         .and_then(|x| x.as_str())
                         .unwrap_or("FFFFFF");
-                    let text = text.trim_start_matches('#');
+                    let text = css_hex(text, "FFFFFF");
                     let chip = if route.is_empty() {
                         String::new()
                     } else {
                         format!(
-                            r#"<span class="route-chip" style="background:#{color};color:#{text}">{route}</span>"#
+                            r#"<span class="route-chip" style="background:#{color};color:#{text}">{}</span>"#,
+                            escape_html(route)
                         )
                     };
                     let canceled = leg
                         .get("canceled")
                         .and_then(|x| x.as_bool())
                         .unwrap_or(false);
-                    let delay = leg
-                        .get("delayDepartureSeconds")
-                        .and_then(|x| x.as_i64());
+                    let delay = leg.get("delayDepartureSeconds").and_then(|x| x.as_i64());
                     let same_vehicle = leg
                         .get("sameVehicle")
                         .and_then(|x| x.as_bool())
@@ -2768,9 +2780,7 @@ fn render_journeys(app: &App) {
                         .map(|a| a.len())
                         .unwrap_or(0);
                     if leg_alerts > 0 {
-                        extra.push_str(&format!(
-                            r#" <span class="leg-alert-sign" title="Perturbation sur cette course">⚠</span>"#
-                        ));
+                        extra.push_str(r#" <span class="leg-alert-sign" title="Perturbation sur cette course">⚠</span>"#);
                     }
                     legs_html.push_str(&format!(
                         r#"<div class="leg{leg_cls}"><img class="mode-icon" src="{icon}" alt="{mode_alt}"/><div>{chip}{mode} {trip} · {times} · {from} → {to}{extra}</div></div>"#,
@@ -2901,7 +2911,11 @@ fn render_journeys(app: &App) {
                             let closure = Closure::wrap(Box::new(move |e: web_sys::MouseEvent| {
                                 if let Some(t) = e.target() {
                                     if let Ok(el) = t.dyn_into::<web_sys::Element>() {
-                                        if el.closest("details.disruption-panel").ok().flatten().is_some()
+                                        if el
+                                            .closest("details.disruption-panel")
+                                            .ok()
+                                            .flatten()
+                                            .is_some()
                                             || el.closest("summary").ok().flatten().is_some()
                                         {
                                             e.stop_propagation();
@@ -2961,10 +2975,7 @@ fn render_departures(deps: &Value) {
             .map(format_time);
         let delay = d.get("delaySeconds").and_then(|x| x.as_i64());
         let canceled = d.get("canceled").and_then(|x| x.as_bool()).unwrap_or(false);
-        let platform = d
-            .get("platform")
-            .and_then(|x| x.as_str())
-            .unwrap_or("");
+        let platform = d.get("platform").and_then(|x| x.as_str()).unwrap_or("");
         let source = d.get("source").and_then(|x| x.as_str()).unwrap_or("");
         let status = d.get("status").and_then(|x| x.as_str()).unwrap_or("");
         let live_badge = if source.contains("siri") {
@@ -2987,7 +2998,7 @@ fn render_departures(deps: &Value) {
               <span>{platform} {status} {delay_html}</span>
             </div>"#,
             time_cls = time_cls,
-            show_time = show_time,
+            show_time = escape_html(&show_time),
             live_badge = live_badge,
             icon = mode_icon_path(&mode),
             route = escape_html(route),
@@ -3027,14 +3038,12 @@ fn traffic_line_badge_html(line: &Value) -> Option<String> {
     let bg = line
         .get("color")
         .and_then(|x| x.as_str())
-        .map(|s| s.trim().trim_start_matches('#').to_string())
-        .filter(|s| s.len() == 6)
+        .map(|s| css_hex(s, "475569"))
         .unwrap_or_else(|| "475569".into());
     let fg = line
         .get("textColor")
         .and_then(|x| x.as_str())
-        .map(|s| s.trim().trim_start_matches('#').to_string())
-        .filter(|s| s.len() == 6)
+        .map(|s| css_hex(s, "FFFFFF"))
         .unwrap_or_else(|| "FFFFFF".into());
     let label = escape_html(short);
     let title = escape_html(short);
@@ -3236,7 +3245,7 @@ fn show_trip_detail_card(journey: &Value) {
                 .get("fareCurrency")
                 .and_then(|x| x.as_str())
                 .unwrap_or("EUR");
-            format!(" · {}", format_fare(a, Some(cur)))
+            format!(" · {}", escape_html(&format_fare(a, Some(cur))))
         }
         None => String::new(),
     };
@@ -3286,10 +3295,7 @@ fn show_trip_detail_card(journey: &Value) {
     let mut leg_i = 0usize;
     if let Some(legs) = journey.get("legs").and_then(|l| l.as_array()) {
         for leg in legs {
-            let ty = leg
-                .get("__typename")
-                .and_then(|t| t.as_str())
-                .unwrap_or("");
+            let ty = leg.get("__typename").and_then(|t| t.as_str()).unwrap_or("");
             if ty == "WalkLeg" {
                 let dist = leg
                     .get("distanceMeters")
@@ -3382,13 +3388,13 @@ fn show_trip_detail_card(journey: &Value) {
                 let color = leg
                     .get("routeColor")
                     .and_then(|x| x.as_str())
-                    .unwrap_or("334155")
-                    .trim_start_matches('#');
+                    .map(|s| css_hex(s, "334155"))
+                    .unwrap_or_else(|| "334155".into());
                 let text = leg
                     .get("routeTextColor")
                     .and_then(|x| x.as_str())
-                    .unwrap_or("FFFFFF")
-                    .trim_start_matches('#');
+                    .map(|s| css_hex(s, "FFFFFF"))
+                    .unwrap_or_else(|| "FFFFFF".into());
                 let delay = leg
                     .get("delayDepartureSeconds")
                     .and_then(|x| x.as_i64())
@@ -3403,8 +3409,8 @@ fn show_trip_detail_card(journey: &Value) {
                 } else {
                     format!(
                         r#"<span class="route-chip" style="background:#{color};color:#{text}">{route}</span>"#,
-                        color = escape_html(color),
-                        text = escape_html(text),
+                        color = color,
+                        text = text,
                         route = escape_html(route),
                     )
                 };
@@ -3426,9 +3432,7 @@ fn show_trip_detail_card(journey: &Value) {
                     ));
                 }
                 if same_vehicle {
-                    badges.push_str(
-                        r#" <span class="same-vehicle-badge">même véhicule</span>"#,
-                    );
+                    badges.push_str(r#" <span class="same-vehicle-badge">même véhicule</span>"#);
                 }
                 if pmr {
                     match leg.get("wheelchair").and_then(|x| x.as_i64()) {
@@ -3439,9 +3443,7 @@ fn show_trip_detail_card(journey: &Value) {
                             ));
                         }
                         Some(2) => {
-                            badges.push_str(
-                                r#" <span class="leg-wc-unknown">PMR non</span>"#,
-                            );
+                            badges.push_str(r#" <span class="leg-wc-unknown">PMR non</span>"#);
                         }
                         _ => {
                             badges.push_str(&format!(
@@ -3572,7 +3574,13 @@ fn show_trip_detail_card(journey: &Value) {
     // Journey-level disruptions (full text) at the top of the detail card.
     let journey_msgs = journey_disruption_messages(journey);
     let mut body_prefix = String::new();
-    if !journey_msgs.is_empty() || !journey.get("realtimeStatus").and_then(|x| x.as_str()).unwrap_or("").is_empty() {
+    if !journey_msgs.is_empty()
+        || !journey
+            .get("realtimeStatus")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .is_empty()
+    {
         let impact = journey_impact_html(journey);
         if !impact.is_empty() || !journey_msgs.is_empty() {
             body_prefix.push_str(r#"<div class="trip-detail-impact">"#);
@@ -3637,7 +3645,6 @@ fn show_place_suggest(list_id: &str, places: &[PlacePick], which: &'static str) 
         for i in 0..list.length() {
             if let Some(node) = list.item(i) {
                 if let Ok(elem) = node.dyn_into::<Element>() {
-                    let which = which;
                     let idx = elem
                         .get_attribute("data-idx")
                         .and_then(|s| s.parse::<usize>().ok())
@@ -3652,8 +3659,7 @@ fn show_place_suggest(list_id: &str, places: &[PlacePick], which: &'static str) 
                             ul.set_inner_html("");
                             let _ = ul.set_attribute("hidden", "true");
                         }
-                    })
-                        as Box<dyn FnMut(_)>);
+                    }) as Box<dyn FnMut(_)>);
                     let _ = elem.add_event_listener_with_callback(
                         "click",
                         closure.as_ref().unchecked_ref(),
@@ -3663,54 +3669,6 @@ fn show_place_suggest(list_id: &str, places: &[PlacePick], which: &'static str) 
             }
         }
     }
-}
-
-fn show_suggest(list_id: &str, stops: &[Stop], which: &'static str) {
-    let places: Vec<PlacePick> = stops
-        .iter()
-        .cloned()
-        .map(|stop| PlacePick {
-            kind: "stop".into(),
-            stop,
-        })
-        .collect();
-    show_place_suggest(list_id, &places, which);
-}
-
-fn on_stop_picked(which: &str, stop: Stop) {
-    let input_id = if which == "origin" {
-        "origin-input"
-    } else {
-        "dest-input"
-    };
-    if let Some(inp) = el(input_id).and_then(|e| e.dyn_into::<HtmlInputElement>().ok()) {
-        inp.set_value(&stop.name);
-    }
-    if let (Some(lat), Some(lon)) = (stop.lat, stop.lon) {
-        // focusStop(lat, lon, title) via Reflect
-        if let Some(win) = web_sys::window() {
-            if let Ok(tm) = js_sys::Reflect::get(&win, &JsValue::from_str("TransitMap")) {
-                if let Ok(func) = js_sys::Reflect::get(&tm, &JsValue::from_str("focusStop")) {
-                    if let Ok(func) = func.dyn_into::<Function>() {
-                        let _ = func.call3(
-                            &tm,
-                            &JsValue::from_f64(lat),
-                            &JsValue::from_f64(lon),
-                            &JsValue::from_str(&stop.name),
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    on_place_picked(
-        which,
-        PlacePick {
-            kind: "stop".into(),
-            stop,
-        },
-    );
 }
 
 fn on_place_picked(which: &str, pick: PlacePick) {
@@ -3887,10 +3845,7 @@ fn plan_clicked() {
         );
         return;
     };
-    if from.kind == "stop"
-        && to.kind == "stop"
-        && from.stop.id == to.stop.id
-    {
+    if from.kind == "stop" && to.kind == "stop" && from.stop.id == to.stop.id {
         set_status("Départ et arrivée doivent être différents.", true);
         return;
     }
@@ -3913,13 +3868,7 @@ fn plan_clicked() {
 
     wasm_bindgen_futures::spawn_local(async move {
         let result = plan_itineraries(
-            &from,
-            &to,
-            time_at,
-            arrive_by,
-            wheelchair,
-            bike_from,
-            bike_to,
+            &from, &to, time_at, arrive_by, wheelchair, bike_from, bike_to,
         )
         .await;
         set_plan_loading(false);
@@ -4042,11 +3991,7 @@ fn apply_static_loading_ui(health: &HealthSnapshot) {
         health.feeds.iter().all(|f| f.static_loaded)
     };
     let any_ready = health.trips > 0 || health.feeds.iter().any(|f| f.static_loaded);
-    let pending: Vec<&FeedHealth> = health
-        .feeds
-        .iter()
-        .filter(|f| !f.static_loaded)
-        .collect();
+    let pending: Vec<&FeedHealth> = health.feeds.iter().filter(|f| !f.static_loaded).collect();
 
     // Map overlay + sidebar banner
     if let Some(overlay) = el("static-loading-overlay") {
@@ -4113,10 +4058,7 @@ fn apply_static_loading_ui(health: &HealthSnapshot) {
             let _ = btn.remove_attribute("title");
         } else {
             let _ = btn.set_attribute("disabled", "true");
-            let _ = btn.set_attribute(
-                "title",
-                "En attente du chargement des horaires GTFS",
-            );
+            let _ = btn.set_attribute("title", "En attente du chargement des horaires GTFS");
         }
     }
 
@@ -4157,10 +4099,7 @@ fn apply_health_badge(health: &HealthSnapshot) {
             .collect();
         let ok = health.status == "ok" && health.stops > 0 && pending.is_empty();
         let label = if pending.is_empty() {
-            format!(
-                "Prêt · {} arrêts · {} courses",
-                health.stops, health.trips
-            )
+            format!("Prêt · {} arrêts · {} courses", health.stops, health.trips)
         } else if health.trips > 0 {
             format!(
                 "Partiel · {} arrêts · {} courses · en attente : {}",

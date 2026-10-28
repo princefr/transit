@@ -79,12 +79,12 @@ fn sample_query(from: &str, to: &str) -> ItineraryQuery {
         default_transfer_s: 120,
         timezone: "Europe/Paris".into(),
         osrm_url: None,
-            bike_from: false,
-            bike_to: false,
-            bike_speed_m_s: 4.2,
-            max_bike_meters: 5000,
-            use_tbr: false,
-            excluded_trip_ids: HashSet::new(),
+        bike_from: false,
+        bike_to: false,
+        bike_speed_m_s: 4.2,
+        max_bike_meters: 5000,
+        use_tbr: false,
+        excluded_trip_ids: HashSet::new(),
         rt_adjust: Default::default(),
         wheelchair: false,
     }
@@ -128,7 +128,9 @@ fn load_build_and_plan_a_to_b() {
         let j = &result.journeys[0];
         assert!(j.duration_s > 0, "duration should be positive");
         assert!(
-            j.legs.iter().any(|leg| matches!(leg, transit::routing::Leg::Transit(_))),
+            j.legs
+                .iter()
+                .any(|leg| matches!(leg, transit::routing::Leg::Transit(_))),
             "expected at least one transit leg for {from} → {to}"
         );
     }

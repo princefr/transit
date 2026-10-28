@@ -10,7 +10,7 @@
 //! `[[lat, lon], ...]` or a list of `{lat, lon}` objects and document the order
 //! for map clients.
 
-use crate::gtfs::pack::{PackedStopTime, StopRecord, TripRecord, StaticEpoch};
+use crate::gtfs::pack::{PackedStopTime, StaticEpoch, StopRecord, TripRecord};
 use crate::link::geo::haversine_m;
 use crate::routing::journey::Leg;
 use std::collections::HashMap;
@@ -91,10 +91,166 @@ fn bearing_deg(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     (theta + 360.0) % 360.0
 }
 
+/// A stop counts as "on" the shape at the first vertex within this slack (metres) of
+/// the best forward match — keeps loop / out-and-back shapes on the right pass.
+const PROJECTION_SLACK_M: f64 = 25.0;
+
+/// Index of the shape vertex matching (lat, lon), searching **forward** from `from`.
+///
+/// Picks the earliest vertex whose distance is within [`PROJECTION_SLACK_M`] of the best
+/// forward distance, so a stop served on the outbound leg of an out-and-back shape is not
+/// snapped to the (equally close) return leg.
+pub fn forward_shape_index(shape: &[(f64, f64)], from: usize, lat: f64, lon: f64) -> usize {
+    if shape.is_empty() {
+        return 0;
+    }
+    let from = from.min(shape.len() - 1);
+    let dists: Vec<f64> = shape[from..]
+        .iter()
+        .map(|&(slat, slon)| haversine_m(lat, lon, slat, slon))
+        .collect();
+    let best = dists.iter().cloned().fold(f64::INFINITY, f64::min);
+    let pick = dists
+        .iter()
+        .position(|&d| d <= best + PROJECTION_SLACK_M)
+        .unwrap_or(0);
+    from + pick
+}
+
+/// Monotonic projection of a stop sequence onto a shape: one vertex index per stop
+/// (`None` when the stop has no coordinates). Indices never decrease.
+pub fn project_stops_monotonic(
+    shape: &[(f64, f64)],
+    coords: &[Option<(f64, f64)>],
+) -> Vec<Option<usize>> {
+    let mut cursor = 0usize;
+    coords
+        .iter()
+        .map(|c| {
+            let (lat, lon) = (*c)?;
+            let i = forward_shape_index(shape, cursor, lat, lon);
+            cursor = i;
+            Some(i)
+        })
+        .collect()
+}
+
+/// Snap a measured metres-per-unit ratio to a common GTFS distance unit (m, km, ft, mi)
+/// when within 25 %; otherwise keep the measured ratio.
+fn snap_unit_scale(ratio: f64) -> f64 {
+    const UNITS: [f64; 4] = [1.0, 1000.0, 0.3048, 1609.344];
+    for u in UNITS {
+        if ratio > 0.0 && (ratio / u - 1.0).abs() <= 0.25 {
+            return u;
+        }
+    }
+    ratio
+}
+
+/// Affine map `metres = a + b · d` for a trip's `shape_dist_traveled` values `d`.
+///
+/// GTFS leaves the unit to the producer (metres, km, feet, miles…). The scale is measured
+/// from the trip's first and last stops carrying a value: their projections onto the shape
+/// (metres of arc length) against their `d` span, then snapped to a common unit. Returns
+/// `None` when fewer than two distinct values / projections are available.
+pub fn shape_dist_affine(
+    shape: &[(f64, f64)],
+    cum: &[f64],
+    samples: &[(f64, (f64, f64))],
+) -> Option<(f64, f64)> {
+    if shape.len() < 2 || samples.len() < 2 || cum.len() != shape.len() {
+        return None;
+    }
+    let (d0, (lat0, lon0)) = samples[0];
+    let (d1, (lat1, lon1)) = samples[samples.len() - 1];
+    let i0 = forward_shape_index(shape, 0, lat0, lon0);
+    // Last stop: search forward from the first stop's match.
+    let i1 = forward_last_index(shape, i0, lat1, lon1);
+    let (m0, m1) = (cum[i0], cum[i1]);
+    if (d1 - d0).abs() < 1e-9 || (m1 - m0).abs() < 1.0 {
+        return None;
+    }
+    let b = snap_unit_scale((m1 - m0) / (d1 - d0));
+    if !(b.is_finite() && b > 0.0) {
+        return None;
+    }
+    Some((m0 - b * d0, b))
+}
+
+/// Like [`forward_shape_index`] but prefers the **latest** near vertex (trip terminus on
+/// a loop shape that starts and ends at the same place).
+fn forward_last_index(shape: &[(f64, f64)], from: usize, lat: f64, lon: f64) -> usize {
+    let from = from.min(shape.len().saturating_sub(1));
+    let dists: Vec<f64> = shape[from..]
+        .iter()
+        .map(|&(slat, slon)| haversine_m(lat, lon, slat, slon))
+        .collect();
+    let best = dists.iter().cloned().fold(f64::INFINITY, f64::min);
+    let pick = dists
+        .iter()
+        .rposition(|&d| d <= best + PROJECTION_SLACK_M)
+        .unwrap_or(0);
+    from + pick
+}
+
+/// `metres = a + b · shape_dist_traveled` for one packed trip (see [`shape_dist_affine`]).
+pub fn trip_shape_dist_affine(
+    epoch: &StaticEpoch,
+    trip: &crate::gtfs::pack::GlobalTrip,
+) -> Option<(f64, f64)> {
+    let shape = epoch.shapes.get(trip.shape_id.as_ref()?)?;
+    let cum = shape_cumulative_distances(shape);
+    let mut first: Option<(f64, (f64, f64))> = None;
+    let mut last: Option<(f64, (f64, f64))> = None;
+    for off in 0..trip.stop_time_len {
+        let st = epoch
+            .stop_times
+            .get((trip.stop_time_start + off) as usize)?;
+        let Some(d) = st.shape_dist_traveled else {
+            continue;
+        };
+        let Some(stop) = epoch.stops.get(st.stop_idx as usize) else {
+            continue;
+        };
+        let (Some(lat), Some(lon)) = (stop.lat, stop.lon) else {
+            continue;
+        };
+        let sample = (d as f64, (lat, lon));
+        if first.is_none() {
+            first = Some(sample);
+        }
+        last = Some(sample);
+    }
+    shape_dist_affine(shape, &cum, &[first?, last?])
+}
+
+/// Interpolate along a shape between two `shape_dist_traveled` marks expressed in the
+/// feed's own unit, converting through the trip's affine unit map (`metres = a + b·d`).
+pub fn interpolate_shape_by_feed_dist(
+    shape: &[(f64, f64)],
+    d0: f32,
+    d1: f32,
+    frac: f64,
+    affine: (f64, f64),
+) -> Option<(f64, f64, f64)> {
+    let (a, b) = affine;
+    let m0 = a + b * d0 as f64;
+    let m1 = a + b * d1 as f64;
+    interpolate_shape_by_dist(shape, m0 as f32, m1 as f32, frac)
+}
+
 /// Fill missing `shape_dist_traveled` from packed shapes + stop coordinates.
 ///
 /// IDFM GTFS often omits the column; shape-based vehicle estimation needs these
 /// distances for accurate arc-length interpolation between stops.
+///
+/// - Stops are projected onto the shape **monotonically** (forward search from the
+///   previous stop), so loop and out-and-back shapes keep the right pass.
+/// - Trips with no values get arc-length metres.
+/// - Partially filled trips are completed **in the feed's own unit**: the unit is measured
+///   from the provided values (see [`shape_dist_affine`]); when it cannot be measured the
+///   gaps are left empty rather than mixing metres into km/ft values.
+/// - Fully filled trips are left untouched.
 pub fn backfill_shape_dist_traveled(
     trips: &[TripRecord],
     stop_times: &mut [PackedStopTime],
@@ -113,38 +269,51 @@ pub fn backfill_shape_dist_traveled(
             Some(s) if s.len() >= 2 => s.as_slice(),
             _ => continue,
         };
+        let start = trip.stop_time_start as usize;
+        let end = start + trip.stop_time_len as usize;
+        let Some(sts) = stop_times.get_mut(start..end) else {
+            continue;
+        };
+        let missing = sts
+            .iter()
+            .filter(|st| st.shape_dist_traveled.is_none())
+            .count();
+        if missing == 0 {
+            continue;
+        }
+        let coords: Vec<Option<(f64, f64)>> = sts
+            .iter()
+            .map(|st| {
+                let s = stops.get(st.stop_idx as usize)?;
+                Some((s.lat?, s.lon?))
+            })
+            .collect();
         let cum = shape_cumulative_distances(shape);
-        for off in 0..trip.stop_time_len {
-            let idx = (trip.stop_time_start + off) as usize;
-            let st = &mut stop_times[idx];
+        let proj = project_stops_monotonic(shape, &coords);
+
+        // metres → feed unit for the values we write.
+        let to_feed: Box<dyn Fn(f64) -> f64> = if missing == sts.len() {
+            Box::new(|m| m)
+        } else {
+            let samples: Vec<(f64, (f64, f64))> = sts
+                .iter()
+                .zip(&coords)
+                .filter_map(|(st, c)| Some((st.shape_dist_traveled? as f64, (*c)?)))
+                .collect();
+            match shape_dist_affine(shape, &cum, &samples) {
+                Some((a, b)) => Box::new(move |m| (m - a) / b),
+                None => continue,
+            }
+        };
+        for (st, p) in sts.iter_mut().zip(proj) {
             if st.shape_dist_traveled.is_some() {
                 continue;
             }
-            let stop = match stops.get(st.stop_idx as usize) {
-                Some(s) => s,
-                None => continue,
-            };
-            let (lat, lon) = match (stop.lat, stop.lon) {
-                (Some(la), Some(lo)) => (la, lo),
-                _ => continue,
-            };
-            let ni = nearest_shape_index(shape, lat, lon);
-            st.shape_dist_traveled = Some(cum[ni] as f32);
+            if let Some(i) = p {
+                st.shape_dist_traveled = Some(to_feed(cum[i]) as f32);
+            }
         }
     }
-}
-
-fn nearest_shape_index(shape: &[(f64, f64)], lat: f64, lon: f64) -> usize {
-    let mut best_i = 0usize;
-    let mut best_d = f64::INFINITY;
-    for (i, &(slat, slon)) in shape.iter().enumerate() {
-        let d = haversine_m(lat, lon, slat, slon);
-        if d < best_d {
-            best_d = d;
-            best_i = i;
-        }
-    }
-    best_i
 }
 
 /// Board→alight geometry for a transit leg.
@@ -203,8 +372,23 @@ pub fn leg_geometry(
                     if let (Some(blat), Some(blon), Some(alat), Some(alon)) =
                         (bs.lat, bs.lon, as_.lat, as_.lon)
                     {
-                        let mut i0 = nearest_shape_index(shape, blat, blon);
-                        let mut i1 = nearest_shape_index(shape, alat, alon);
+                        // Monotonic projection of the trip's stops up to the
+                        // alight stop, so loop / out-and-back shapes slice the
+                        // pass actually travelled.
+                        let _ = (blat, blon, alat, alon);
+                        let coords: Vec<Option<(f64, f64)>> = (0..=to_off)
+                            .map(|off| {
+                                let st = &epoch.stop_times[(trip.stop_time_start + off) as usize];
+                                let s = epoch.stops.get(st.stop_idx as usize)?;
+                                Some((s.lat?, s.lon?))
+                            })
+                            .collect();
+                        let proj = project_stops_monotonic(shape, &coords);
+                        let (Some(mut i0), Some(mut i1)) =
+                            (proj[from_off as usize], proj[to_off as usize])
+                        else {
+                            return shape.iter().map(|&(lat, lon)| [lat, lon]).collect();
+                        };
                         if i0 > i1 {
                             std::mem::swap(&mut i0, &mut i1);
                         }
@@ -289,7 +473,9 @@ pub fn journey_geometry(legs: &[Leg]) -> Vec<[f64; 2]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gtfs::pack::{GlobalTrip, PackedStopTime, RouteMode, StaticEpoch, StopRecord, TripRecord};
+    use crate::gtfs::pack::{
+        GlobalTrip, PackedStopTime, RouteMode, StaticEpoch, StopRecord, TripRecord,
+    };
     use std::collections::HashMap;
 
     fn stop(id: &str, lat: f64, lon: f64) -> StopRecord {
@@ -307,9 +493,9 @@ mod tests {
             stop_code: None,
             stop_desc: None,
             level_id: None,
-        zone_id: None,
-        stop_url: None,
-        stop_timezone: None,
+            zone_id: None,
+            stop_url: None,
+            stop_timezone: None,
         }
     }
 
@@ -354,8 +540,8 @@ mod tests {
                 pickup_type: 0,
                 drop_off_type: 0,
                 stop_headsign_idx: 0,
-            timepoint: 1,
-            shape_dist_traveled: None,
+                timepoint: 1,
+                shape_dist_traveled: None,
             },
             PackedStopTime {
                 stop_idx: 1,
@@ -365,8 +551,8 @@ mod tests {
                 pickup_type: 0,
                 drop_off_type: 0,
                 stop_headsign_idx: 0,
-            timepoint: 1,
-            shape_dist_traveled: None,
+                timepoint: 1,
+                shape_dist_traveled: None,
             },
         ];
         epoch.trips = vec![base_trip(None, 2)];
@@ -391,10 +577,8 @@ mod tests {
 
     #[test]
     fn backfill_shape_dist_from_geometry() {
-        let shapes = HashMap::from([(
-            "t:sh".into(),
-            vec![(48.0, 2.0), (48.01, 2.0), (48.02, 2.0)],
-        )]);
+        let shapes =
+            HashMap::from([("t:sh".into(), vec![(48.0, 2.0), (48.01, 2.0), (48.02, 2.0)])]);
         let stops = vec![stop("t:a", 48.0, 2.0), stop("t:b", 48.02, 2.0)];
         let trips = vec![TripRecord {
             id: "t:trip".into(),
@@ -439,26 +623,139 @@ mod tests {
         assert!(stop_times[0].shape_dist_traveled.is_some());
         assert!(stop_times[1].shape_dist_traveled.is_some());
         assert!(
-            stop_times[1].shape_dist_traveled.unwrap()
-                > stop_times[0].shape_dist_traveled.unwrap()
+            stop_times[1].shape_dist_traveled.unwrap() > stop_times[0].shape_dist_traveled.unwrap()
         );
+    }
+
+    fn st(stop_idx: u32, seq: u16, dist: Option<f32>) -> PackedStopTime {
+        PackedStopTime {
+            stop_idx,
+            arrival_s: seq as u32 * 60,
+            departure_s: seq as u32 * 60,
+            stop_sequence: seq.into(),
+            pickup_type: 0,
+            drop_off_type: 0,
+            stop_headsign_idx: 0,
+            timepoint: 1,
+            shape_dist_traveled: dist,
+        }
+    }
+
+    fn trip_rec(len: u32) -> TripRecord {
+        TripRecord {
+            id: "t:trip".into(),
+            feed_id: "t".into(),
+            route_id: "t:r".into(),
+            service_id: "svc".into(),
+            headsign: None,
+            short_name: None,
+            direction_id: None,
+            wheelchair: 0,
+            bikes_allowed: 0,
+            block_id: None,
+            shape_id: Some("t:sh".into()),
+            stop_time_start: 0,
+            stop_time_len: len,
+        }
+    }
+
+    /// Straight north-south shape, 0.01° lat ≈ 1112 m per step.
+    fn line_shape() -> Vec<(f64, f64)> {
+        (0..=4).map(|i| (48.0 + 0.01 * i as f64, 2.0)).collect()
+    }
+
+    #[test]
+    fn backfill_partial_trip_keeps_feed_unit_km() {
+        let shapes = HashMap::from([("t:sh".to_string(), line_shape())]);
+        let stops = vec![
+            stop("t:a", 48.00, 2.0),
+            stop("t:b", 48.02, 2.0),
+            stop("t:c", 48.04, 2.0),
+        ];
+        let len_km = haversine_m(48.0, 2.0, 48.04, 2.0) as f32 / 1000.0;
+        // Provided in km at both ends, missing in the middle.
+        let mut sts = vec![st(0, 1, Some(0.0)), st(1, 2, None), st(2, 3, Some(len_km))];
+        backfill_shape_dist_traveled(&[trip_rec(3)], &mut sts, &stops, &shapes);
+        let mid = sts[1].shape_dist_traveled.expect("filled");
+        // Half-way, in km (≈ 2.22), not metres (≈ 2224).
+        assert!(
+            (mid - len_km / 2.0).abs() < 0.05,
+            "mid={mid} len_km={len_km}"
+        );
+    }
+
+    #[test]
+    fn backfill_out_and_back_is_monotonic() {
+        // Out to the north and back: stops A (start), B (far end), A' (back at start).
+        let mut shape = line_shape();
+        let mut back = line_shape();
+        back.reverse();
+        shape.extend(back.into_iter().skip(1));
+        let shapes = HashMap::from([("t:sh".to_string(), shape)]);
+        let stops = vec![
+            stop("t:a", 48.00, 2.0),
+            stop("t:m", 48.02, 2.0),
+            stop("t:b", 48.04, 2.0),
+            stop("t:m2", 48.02, 2.0),
+            stop("t:a2", 48.00, 2.0),
+        ];
+        let mut sts: Vec<PackedStopTime> = (0..5).map(|i| st(i, i as u16 + 1, None)).collect();
+        backfill_shape_dist_traveled(&[trip_rec(5)], &mut sts, &stops, &shapes);
+        let d: Vec<f32> = sts.iter().map(|s| s.shape_dist_traveled.unwrap()).collect();
+        for w in d.windows(2) {
+            assert!(w[1] > w[0], "not monotonic: {d:?}");
+        }
+        // Return-leg midpoint is 3/4 of the way, not snapped to the outbound pass.
+        assert!((d[3] / d[4] - 0.75).abs() < 0.01, "{d:?}");
+    }
+
+    #[test]
+    fn affine_detects_km_and_converts() {
+        let shape = line_shape();
+        let cum = shape_cumulative_distances(&shape);
+        let total = *cum.last().unwrap();
+        let samples = [(0.0, (48.0, 2.0)), (total / 1000.0, (48.04, 2.0))];
+        let (a, b) = shape_dist_affine(&shape, &cum, &samples).unwrap();
+        assert_eq!(b, 1000.0);
+        assert!(a.abs() < 1e-6);
+        // Interpolating at half-way with km marks lands on the middle vertex.
+        let (lat, _, _) =
+            interpolate_shape_by_feed_dist(&shape, 0.0, (total / 1000.0) as f32, 0.5, (a, b))
+                .unwrap();
+        assert!((lat - 48.02).abs() < 1e-3, "lat={lat}");
+    }
+
+    #[test]
+    fn leg_geometry_on_loop_slices_travelled_pass() {
+        let mut epoch = StaticEpoch::empty();
+        let mut shape = line_shape();
+        let mut back = line_shape();
+        back.reverse();
+        shape.extend(back.into_iter().skip(1));
+        epoch.shapes.insert("t:sh".into(), shape);
+        epoch.stops = vec![
+            stop("t:a", 48.00, 2.0),
+            stop("t:b", 48.04, 2.0),
+            stop("t:m", 48.02, 2.0),
+        ];
+        epoch.stop_times = vec![st(0, 1, None), st(1, 2, None), st(2, 3, None)];
+        epoch.trips = vec![base_trip(Some("t:sh".into()), 3)];
+        epoch.trip_id_to_idx.insert("t:trip".into(), 0);
+        // Board at the far end B, alight at M on the way back: the slice must be the
+        // return pass (B → M), i.e. 3 vertices going south.
+        let geo = leg_geometry(&epoch, "t:trip", 1, 2);
+        assert_eq!(geo.len(), 3, "{geo:?}");
+        assert!((geo[0][0] - 48.04).abs() < 1e-9);
+        assert!((geo[2][0] - 48.02).abs() < 1e-9);
     }
 
     #[test]
     fn slices_shape_between_stops() {
         let mut epoch = StaticEpoch::empty();
-        epoch.stops = vec![
-            stop("t:a", 48.86, 2.35),
-            stop("t:b", 45.76, 4.86),
-        ];
+        epoch.stops = vec![stop("t:a", 48.86, 2.35), stop("t:b", 45.76, 4.86)];
         epoch.shapes.insert(
             "t:sh".into(),
-            vec![
-                (48.86, 2.35),
-                (47.5, 3.0),
-                (46.5, 4.0),
-                (45.76, 4.86),
-            ],
+            vec![(48.86, 2.35), (47.5, 3.0), (46.5, 4.0), (45.76, 4.86)],
         );
         epoch.stop_times = vec![
             PackedStopTime {
@@ -469,8 +766,8 @@ mod tests {
                 pickup_type: 0,
                 drop_off_type: 0,
                 stop_headsign_idx: 0,
-            timepoint: 1,
-            shape_dist_traveled: None,
+                timepoint: 1,
+                shape_dist_traveled: None,
             },
             PackedStopTime {
                 stop_idx: 1,
@@ -480,8 +777,8 @@ mod tests {
                 pickup_type: 0,
                 drop_off_type: 0,
                 stop_headsign_idx: 0,
-            timepoint: 1,
-            shape_dist_traveled: None,
+                timepoint: 1,
+                shape_dist_traveled: None,
             },
         ];
         epoch.trips = vec![base_trip(Some("t:sh".into()), 2)];

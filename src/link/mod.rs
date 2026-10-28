@@ -5,7 +5,11 @@ use geo::hub_links;
 use std::sync::Arc;
 
 /// Build cross-feed (and same-feed nearby) walk edges between stops.
-pub fn link_feeds(bundles: &[Arc<FeedStaticBundle>], radius_m: f64, walk_speed_m_s: f64) -> Vec<WalkEdge> {
+pub fn link_feeds(
+    bundles: &[Arc<FeedStaticBundle>],
+    radius_m: f64,
+    walk_speed_m_s: f64,
+) -> Vec<WalkEdge> {
     // Prefer link_epoch_stops after merge (global indices).
     let _ = (bundles, radius_m, walk_speed_m_s);
     Vec::new()

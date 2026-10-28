@@ -1,5 +1,5 @@
 use crate::config::FeedConfig;
-use crate::feeds::download::download_bytes_with_headers;
+use crate::feeds::download::{download_bytes_with_headers, MAX_RT_BYTES};
 use crate::feeds::FeedEvent;
 use crate::rt::adapter::{ingest_realtime, RealtimeFormat, RealtimeKind};
 use crate::rt::decode::{apply_service_alerts, apply_trip_updates, apply_vehicle_positions};
@@ -46,14 +46,13 @@ fn decode_rt(feed_id: &str, kind: RtKind, bytes: &[u8]) -> FeedRtState {
                 RtKind::VehiclePositions => delta.state.vehicles.is_empty(),
                 RtKind::ServiceAlerts => delta.state.alerts.is_empty(),
             };
-            if empty_for_kind && matches!(delta.format, RealtimeFormat::GtfsRt | RealtimeFormat::Auto)
+            if empty_for_kind
+                && matches!(delta.format, RealtimeFormat::GtfsRt | RealtimeFormat::Auto)
             {
                 let mut state = FeedRtState::new(feed_id);
                 match kind {
                     RtKind::TripUpdates => apply_trip_updates(feed_id, bytes, &mut state),
-                    RtKind::VehiclePositions => {
-                        apply_vehicle_positions(feed_id, bytes, &mut state)
-                    }
+                    RtKind::VehiclePositions => apply_vehicle_positions(feed_id, bytes, &mut state),
                     RtKind::ServiceAlerts => apply_service_alerts(feed_id, bytes, &mut state),
                 }
                 return state;
@@ -127,8 +126,7 @@ pub async fn run_rt_poller(
         // Interval with ±10% jitter each cycle
         let j = jitter_ms((base.as_millis() as u64) / 5);
         let half = (base.as_millis() as u64) / 10;
-        let wait = base
-            .saturating_sub(Duration::from_millis(half))
+        let wait = base.saturating_sub(Duration::from_millis(half))
             + Duration::from_millis(j.min(half * 2));
 
         tokio::select! {
@@ -152,6 +150,7 @@ pub async fn run_rt_poller(
                     &feed.user_agent,
                     timeout,
                     &headers,
+                    MAX_RT_BYTES,
                 )
                 .await;
                 drop(permit);

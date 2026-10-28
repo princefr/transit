@@ -2,8 +2,8 @@ use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::cell_bitset::CellBitSet;
 use super::calendar::ServiceCalendar;
+use super::cell_bitset::CellBitSet;
 use super::siri_trip_map::SiriTripAliases;
 
 /// Namespaced id: `{feed_id}:{raw_id}`
@@ -143,7 +143,9 @@ impl PathwayRecord {
     }
 
     pub fn distance_m(&self) -> f64 {
-        self.length_m.filter(|l| l.is_finite() && *l >= 0.0).unwrap_or(0.0)
+        self.length_m
+            .filter(|l| l.is_finite() && *l >= 0.0)
+            .unwrap_or(0.0)
     }
 
     pub fn mode_name(&self) -> &'static str {
@@ -153,8 +155,7 @@ impl PathwayRecord {
 
 impl StopRecord {
     pub fn is_station(&self) -> bool {
-        self.location_type == 1
-            || (self.location_type == 0 && self.parent_id.is_none())
+        self.location_type == 1 || (self.location_type == 0 && self.parent_id.is_none())
     }
 }
 
@@ -215,7 +216,7 @@ pub struct PackedStopTime {
     pub stop_idx: u32,
     pub arrival_s: u32,
     pub departure_s: u32,
-    pub stop_sequence: u16,
+    pub stop_sequence: u32,
     pub pickup_type: u8,
     pub drop_off_type: u8,
     /// Index into feed/epoch `headsign_pool` (0 = none / empty).
@@ -669,11 +670,7 @@ pub fn build_epoch_with_flash(
                     }
                 });
 
-            let frequency_windows = bundle
-                .frequencies
-                .get(&t.id)
-                .cloned()
-                .unwrap_or_default();
+            let frequency_windows = bundle.frequencies.get(&t.id).cloned().unwrap_or_default();
 
             let g = GlobalTrip {
                 id: t.id.clone(),
@@ -702,7 +699,9 @@ pub fn build_epoch_with_flash(
             epoch.trip_id_to_idx.insert(g.id.clone(), trip_idx);
             epoch.trips.push(g);
 
-            if let Some(token) = super::siri_trip_map::line_product_code(&epoch.trips[trip_idx as usize].route_id) {
+            if let Some(token) =
+                super::siri_trip_map::line_product_code(&epoch.trips[trip_idx as usize].route_id)
+            {
                 epoch
                     .route_line_to_trip_idxs
                     .entry(token)
@@ -785,7 +784,10 @@ pub fn build_epoch_with_flash(
     let t_pack = std::time::Instant::now();
     crate::gtfs::load_progress::set_phase(crate::gtfs::load_progress::PHASE_PACK);
     compute_line_groups(&mut epoch);
-    eprintln!("[pack] line groups in {:.1}s", t_pack.elapsed().as_secs_f32());
+    eprintln!(
+        "[pack] line groups in {:.1}s",
+        t_pack.elapsed().as_secs_f32()
+    );
     compute_partition(&mut epoch);
     eprintln!(
         "[pack] layout-graph partition ({} cells) in {:.1}s",
@@ -793,60 +795,37 @@ pub fn build_epoch_with_flash(
         t_pack.elapsed().as_secs_f32()
     );
     compute_trip_transfers(&mut epoch);
-    eprintln!("[pack] trip transfers in {:.1}s", t_pack.elapsed().as_secs_f32());
+    eprintln!(
+        "[pack] trip transfers in {:.1}s",
+        t_pack.elapsed().as_secs_f32()
+    );
     match mode {
         FlashMode::Skip => {}
         FlashMode::Persist(dir) => {
             use super::flash_store;
-            use sha2::{Digest, Sha256};
-            // Fingerprint the walk graph layout: flag arrays are indexed by
-            // edge position, so any reordering must invalidate the cache.
-            let mut gh = Sha256::new();
-            gh.update((epoch.walk_edges.len() as u64).to_le_bytes());
-            for e in &epoch.walk_edges {
-                gh.update(e.from_stop_idx.to_le_bytes());
-                gh.update(e.to_stop_idx.to_le_bytes());
-                gh.update(e.duration_s.to_le_bytes());
-            }
-            let graph_fp = format!("{:x}", gh.finalize());
+            // The zip SHA alone is not enough: with a static horizon the
+            // retained trip set shifts daily under the same SHA, and flag
+            // arrays are indexed by walk-edge / trip / stop-time position.
+            let pack_fp = flash_pack_fingerprint(&epoch);
             let hash = format!(
                 "{}-{}",
                 flash_store::feed_content_hash(&bundles),
-                &graph_fp[..12]
+                &pack_fp[..16]
             );
             let path = flash_store::flash_path(dir, &hash);
-            let cached = flash_store::load_flash(&path).ok().flatten().and_then(
-                |(num_cells, arc_flag_pattern, flag_patterns, trip_transfers)| {
-                    // Validate shape against the freshly built epoch.
-                    let shape_ok = num_cells == epoch.num_cells
-                        && arc_flag_pattern.len() == epoch.walk_edges.len()
-                        && trip_transfers.len() == epoch.trip_transfers.len()
-                        && trip_transfers
-                            .iter()
-                            .zip(epoch.trip_transfers.iter())
-                            .all(|(a, b)| a.len() == b.len());
-                    if !shape_ok {
-                        let first_bad = trip_transfers
-                            .iter()
-                            .zip(epoch.trip_transfers.iter())
-                            .position(|(a, b)| a.len() != b.len());
-                        eprintln!(
-                            "[pack] flash cache shape mismatch: cells({} vs {}) walk({}, {}) trips({}, {}) first_bad_trip={:?} bad_lens=({:?}, {:?})",
-                            num_cells, epoch.num_cells,
-                            arc_flag_pattern.len(), epoch.walk_edges.len(),
-                            trip_transfers.len(), epoch.trip_transfers.len(),
-                            first_bad,
-                            first_bad.map(|i| trip_transfers[i].len()),
-                            first_bad.map(|i| epoch.trip_transfers[i].len())
-                        );
+            let cached = flash_store::load_flash(&path, &pack_fp)
+                .ok()
+                .flatten()
+                .and_then(|data| match flash_store::validate_flash(&epoch, &data) {
+                    Ok(()) => {
+                        let (_, ap, fp, tt) = data;
+                        Some((ap, fp, tt))
                     }
-                    if shape_ok {
-                        Some((arc_flag_pattern, flag_patterns, trip_transfers))
-                    } else {
+                    Err(why) => {
+                        eprintln!("[pack] flash cache rejected: {why}");
                         None
                     }
-                },
-            );
+                });
             if std::env::var("TRANSIT_PROFILE").ok().as_deref() == Some("1") {
                 eprintln!("[pack] flash cache key {} -> {}", hash, path.display());
             }
@@ -867,7 +846,7 @@ pub fn build_epoch_with_flash(
                 None => {
                     compute_arc_flags(&mut epoch);
                     if !epoch.flag_patterns.is_empty() {
-                        match flash_store::save_flash(&path, &epoch) {
+                        match flash_store::save_flash(&path, &epoch, &pack_fp) {
                             Ok(()) => {
                                 flash_store::prune_flash_dir(dir, &hash);
                                 eprintln!(
@@ -881,10 +860,7 @@ pub fn build_epoch_with_flash(
                             }
                         }
                     }
-                    eprintln!(
-                        "[pack] arc-flags in {:.1}s",
-                        t_pack.elapsed().as_secs_f32()
-                    );
+                    eprintln!("[pack] arc-flags in {:.1}s", t_pack.elapsed().as_secs_f32());
                 }
             }
         }
@@ -901,6 +877,52 @@ pub fn build_epoch_with_flash(
 /// Sort each stop's departure list by scheduled departure time so RAPTOR can
 /// binary-search the first boardable entry, and flag stops served by
 /// frequency-based trips (template times break the ordering invariant).
+/// Fingerprint of everything the FLASH-TB flag cache depends on: the walk
+/// graph layout, the packed trip set in order (ids, stop events, times,
+/// pickup/drop-off) and the pack parameters. Hex SHA-256.
+fn flash_pack_fingerprint(epoch: &StaticEpoch) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"flash-pack-v1\n");
+    // Pack parameters.
+    h.update(FLASH_HORIZON_S.to_le_bytes());
+    h.update(FLASH_MIN_TRANSFER_S.to_le_bytes());
+    h.update((FLASH_MAX_ROUNDS as u64).to_le_bytes());
+    for key in ["TRANSIT_FLASH_SOURCES", "TRANSIT_FLASH_SAMPLES"] {
+        let v = std::env::var(key).unwrap_or_default();
+        h.update(key.as_bytes());
+        h.update(b"=");
+        h.update(v.trim().as_bytes());
+        h.update(b"\n");
+    }
+    h.update((epoch.stops.len() as u64).to_le_bytes());
+    h.update(epoch.num_cells.to_le_bytes());
+    // Walk graph layout (flags are indexed by edge position).
+    h.update((epoch.walk_edges.len() as u64).to_le_bytes());
+    for e in &epoch.walk_edges {
+        h.update(e.from_stop_idx.to_le_bytes());
+        h.update(e.to_stop_idx.to_le_bytes());
+        h.update(e.duration_s.to_le_bytes());
+    }
+    // Trip set, in packed order.
+    h.update((epoch.trips.len() as u64).to_le_bytes());
+    for t in &epoch.trips {
+        h.update((t.id.len() as u64).to_le_bytes());
+        h.update(t.id.as_bytes());
+        h.update(t.stop_time_len.to_le_bytes());
+        h.update((t.frequency_windows.len() as u32).to_le_bytes());
+        let start = t.stop_time_start as usize;
+        let end = start + t.stop_time_len as usize;
+        for st in epoch.stop_times.get(start..end).unwrap_or(&[]) {
+            h.update(st.stop_idx.to_le_bytes());
+            h.update(st.arrival_s.to_le_bytes());
+            h.update(st.departure_s.to_le_bytes());
+            h.update([st.pickup_type, st.drop_off_type]);
+        }
+    }
+    format!("{:x}", h.finalize())
+}
+
 fn sort_stop_departures(epoch: &mut StaticEpoch) {
     epoch.stop_has_freq = vec![false; epoch.stops.len()];
     let trips = &epoch.trips;
@@ -1102,8 +1124,7 @@ fn compute_partition(epoch: &mut StaticEpoch) {
                 // stalls early (disconnected remainder), the visited component
                 // becomes side A and the rest is re-split recursively.
                 let cut = half.saturating_add(1).min(grow.len());
-                let a_set: std::collections::HashSet<u32> =
-                    grow[..cut].iter().copied().collect();
+                let a_set: std::collections::HashSet<u32> = grow[..cut].iter().copied().collect();
                 side_a = grow[..cut].to_vec();
                 side_b = members
                     .iter()
@@ -1157,7 +1178,15 @@ fn compute_partition(epoch: &mut StaticEpoch) {
         }
 
         let cells_per_half = 1u32 << (target_depth - depth - 1);
-        split(adj, coords, &mut side_a, depth + 1, target_depth, base_cell, out);
+        split(
+            adj,
+            coords,
+            &mut side_a,
+            depth + 1,
+            target_depth,
+            base_cell,
+            out,
+        );
         split(
             adj,
             coords,
@@ -1195,14 +1224,16 @@ fn compute_trip_transfers(epoch: &mut StaticEpoch) {
     // Per stop: (line, ascending [(dep_s, trip_idx, off)]) for every departure.
     // Lets each transfer lookup binary-search the earliest boardable trip of a
     // specific line instead of scanning the stop's whole departure tail.
-    let mut lines_at_stop: Vec<Vec<(u32, Vec<(u32, u32, u32)>)>> = vec![Vec::new(); epoch.stops.len()];
+    let mut lines_at_stop: Vec<Vec<(u32, Vec<(u32, u32, u32)>)>> =
+        vec![Vec::new(); epoch.stops.len()];
     {
         let mut by_line: Vec<HashMap<u32, Vec<(u32, u32, u32)>>> =
             (0..epoch.stops.len()).map(|_| HashMap::new()).collect();
         for (si, deps) in epoch.stop_departures.iter().enumerate() {
             let m = &mut by_line[si];
             for &(t, o) in deps {
-                let dep_s = epoch.stop_times[(epoch.trips[t as usize].stop_time_start + o) as usize]
+                let dep_s = epoch.stop_times
+                    [(epoch.trips[t as usize].stop_time_start + o) as usize]
                     .departure_s;
                 m.entry(epoch.line_of_trip[t as usize])
                     .or_default()
@@ -1223,7 +1254,7 @@ fn compute_trip_transfers(epoch: &mut StaticEpoch) {
         let start = trip.stop_time_start as usize;
         let len = trip.stop_time_len as usize;
         let mut per_alight: Vec<Vec<TripTransferEntry>> = Vec::with_capacity(len);
-        
+
         for off in 0..len {
             let st = &epoch.stop_times[start + off];
             if st.drop_off_type == 1 {
@@ -1233,7 +1264,7 @@ fn compute_trip_transfers(epoch: &mut StaticEpoch) {
             let alight_stop = st.stop_idx as usize;
             let alight_arr = st.arrival_s;
             let board_after = alight_arr.saturating_add(DEFAULT_TRANSFER_S);
-            
+
             let mut entries: Vec<TripTransferEntry> = Vec::new();
             let mut seen_lines: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
@@ -1270,7 +1301,7 @@ fn compute_trip_transfers(epoch: &mut StaticEpoch) {
         }
         all_transfers.push(per_alight);
     }
-    
+
     epoch.trip_transfers = all_transfers;
 }
 
@@ -1359,12 +1390,13 @@ fn compute_arc_flags(epoch: &mut StaticEpoch) {
         let mut hi = 0u32;
         for deps in &epoch.stop_departures {
             if let Some(&(t, _)) = deps.first() {
-                lo = lo.min(epoch.stop_times[epoch.trips[t as usize].stop_time_start as usize].departure_s);
+                lo = lo.min(
+                    epoch.stop_times[epoch.trips[t as usize].stop_time_start as usize].departure_s,
+                );
             }
             if let Some(&(t, _)) = deps.last() {
                 hi = hi.max(
-                    epoch.stop_times
-                        [(epoch.trips[t as usize].stop_time_start) as usize]
+                    epoch.stop_times[(epoch.trips[t as usize].stop_time_start) as usize]
                         .departure_s,
                 );
             }
@@ -1391,9 +1423,7 @@ fn compute_arc_flags(epoch: &mut StaticEpoch) {
     let results: Mutex<Vec<HashMap<u64, CellBitSet>>> = Mutex::new(Vec::new());
     let horizon_s = dep_times[dep_times.len() - 1].saturating_add(FLASH_HORIZON_S);
     crate::gtfs::load_progress::set_phase(crate::gtfs::load_progress::PHASE_FLAGS_COMPUTE);
-    crate::gtfs::load_progress::flags_set_total(
-        (sources.len() * dep_times.len()) as u64,
-    );
+    crate::gtfs::load_progress::flags_set_total((sources.len() * dep_times.len()) as u64);
     // Batched progress ticks: one atomic add per worker loop keeps overhead
     // negligible while giving /health a smooth percentage.
     std::thread::scope(|scope| {
@@ -1409,12 +1439,10 @@ fn compute_arc_flags(epoch: &mut StaticEpoch) {
                     }
                     let ps = sources[i];
                     for &dep in &dep_times {
-                        flash_search(
-                            epoch, &entry_prefix, walk_base, ps, dep, horizon_s, &mut st,
-                        );
+                        flash_search(epoch, &entry_prefix, walk_base, ps, dep, horizon_s, &mut st);
                         flash_set_flags(epoch, &st, num_cells, &mut local);
                         ticks += 1;
-                        if ticks % 16 == 0 {
+                        if ticks.is_multiple_of(16) {
                             crate::gtfs::load_progress::flags_tick(16);
                         }
                     }
@@ -1448,8 +1476,9 @@ fn compute_arc_flags(epoch: &mut StaticEpoch) {
         for (off, entries) in per_alight.iter().enumerate() {
             let base = entry_prefix[ti][off];
             for (k, entry) in entries.iter().enumerate() {
-                let target_is_freq =
-                    !epoch.trips[entry.target_trip as usize].frequency_windows.is_empty();
+                let target_is_freq = !epoch.trips[entry.target_trip as usize]
+                    .frequency_windows
+                    .is_empty();
                 if !source_is_freq && !target_is_freq {
                     continue;
                 }
@@ -1481,7 +1510,7 @@ fn compute_arc_flags(epoch: &mut StaticEpoch) {
     *counts.entry(&zero).or_default() += (num_refs - flagged_refs as u64) as usize;
 
     let mut ranked: Vec<(&CellBitSet, usize)> = counts.into_iter().collect();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    ranked.sort_by_key(|r| std::cmp::Reverse(r.1));
     epoch.flag_patterns = ranked.iter().map(|(bs, _)| (*bs).clone()).collect();
 
     // Content-keyed lookup: distinct delta values may share one pattern.
@@ -1551,11 +1580,19 @@ const FLASH_MAX_ROUNDS: usize = 8;
 enum FlashLab {
     Source,
     /// Rode a trip boarded directly from `board_stop` (no precomputed transfer).
-    Board { board_stop: u32 },
+    Board {
+        board_stop: u32,
+    },
     /// Arrival at a boarding stop improved via a precomputed trip-transfer.
-    EntryUse { entry_ref: u64, prev_stop: u32 },
+    EntryUse {
+        entry_ref: u64,
+        prev_stop: u32,
+    },
     /// Moved via a footpath / transfer walk edge.
-    WalkMove { edge_idx: u64, prev_stop: u32 },
+    WalkMove {
+        edge_idx: u64,
+        prev_stop: u32,
+    },
 }
 
 struct FlashState {
@@ -1681,8 +1718,7 @@ fn flash_search(
 
             for &(ti, off) in &deps[start..] {
                 let trip = &epoch.trips[ti as usize];
-                let st_board =
-                    &epoch.stop_times[(trip.stop_time_start + off) as usize];
+                let st_board = &epoch.stop_times[(trip.stop_time_start + off) as usize];
                 if trip.frequency_windows.is_empty() && st_board.departure_s < board_after {
                     continue;
                 }
@@ -1692,7 +1728,11 @@ fn flash_search(
                 if !trip.frequency_windows.is_empty() {
                     continue; // template times — covered by conservative flags
                 }
-                let line_id = epoch.line_of_trip.get(ti as usize).copied().unwrap_or(u32::MAX);
+                let line_id = epoch
+                    .line_of_trip
+                    .get(ti as usize)
+                    .copied()
+                    .unwrap_or(u32::MAX);
                 if line_id != u32::MAX
                     && st.line_stamp.get(line_id as usize).copied().unwrap_or(0) == round_stamp
                 {
@@ -1737,8 +1777,7 @@ fn flash_search(
                             let board_st = &epoch.stop_times
                                 [(t2.stop_time_start + entry.target_board_off) as usize];
                             let effective = st_r.arrival_s.saturating_add(entry.min_transfer_s);
-                            if board_st.departure_s < effective
-                                || board_st.departure_s >= horizon_s
+                            if board_st.departure_s < effective || board_st.departure_s >= horizon_s
                             {
                                 continue;
                             }
@@ -1826,18 +1865,282 @@ fn flash_set_flags(
             match st.lab[cur] {
                 None | Some(FlashLab::Source) => break,
                 Some(FlashLab::Board { board_stop }) => cur = board_stop as usize,
-                Some(FlashLab::EntryUse { entry_ref, prev_stop }) => {
-                    delta.entry(entry_ref)
+                Some(FlashLab::EntryUse {
+                    entry_ref,
+                    prev_stop,
+                }) => {
+                    delta
+                        .entry(entry_ref)
                         .or_insert_with(|| CellBitSet::new(num_cells))
                         .set_bit(cell);
                     cur = prev_stop as usize;
                 }
-                Some(FlashLab::WalkMove { edge_idx, prev_stop }) => {
-                    delta.entry(edge_idx)
+                Some(FlashLab::WalkMove {
+                    edge_idx,
+                    prev_stop,
+                }) => {
+                    delta
+                        .entry(edge_idx)
                         .or_insert_with(|| CellBitSet::new(num_cells))
                         .set_bit(cell);
                     cur = prev_stop as usize;
                 }
+            }
+        }
+    }
+}
+
+/// Precompute geo point lists and place/parent indexes used on every itinerary request.
+fn build_geo_and_place_indexes(epoch: &mut StaticEpoch) {
+    use crate::search::stops::{is_idfm_place_stop, place_name_key};
+
+    epoch.geo_stop_points.clear();
+    epoch.geo_boardable_points.clear();
+    epoch.place_name_index.clear();
+    epoch.children_by_parent.clear();
+
+    for (i, s) in epoch.stops.iter().enumerate() {
+        let (Some(lat), Some(lon)) = (s.lat, s.lon) else {
+            continue;
+        };
+        epoch.geo_stop_points.push((i, lat, lon));
+
+        let boardable = epoch
+            .stop_departures
+            .get(i)
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        let place = is_idfm_place_stop(s);
+        if boardable || place {
+            epoch.geo_boardable_points.push((i, lat, lon));
+            let key = place_name_key(&s.name);
+            if key.len() >= 3 {
+                epoch
+                    .place_name_index
+                    .entry(key)
+                    .or_default()
+                    .push(i as u32);
+            }
+        }
+
+        if let Some(ref p) = s.parent_id {
+            epoch
+                .children_by_parent
+                .entry(p.clone())
+                .or_default()
+                .push(i as u32);
+        }
+        if s.location_type == 1 {
+            epoch
+                .children_by_parent
+                .entry(s.id.clone())
+                .or_default()
+                .push(i as u32);
+        }
+    }
+}
+
+fn undirected_pair(a: u32, b: u32) -> (u32, u32) {
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// Global stop pairs that have at least one pathway-derived walk edge.
+fn pathway_pair_set(
+    bundles: &[Arc<FeedStaticBundle>],
+    stop_offset: &HashMap<String, u32>,
+) -> std::collections::HashSet<(u32, u32)> {
+    use std::collections::HashSet;
+    let mut set = HashSet::new();
+    for bundle in bundles {
+        let base = *stop_offset.get(&bundle.feed_id).unwrap_or(&0);
+        for pw in &bundle.pathways {
+            set.insert(undirected_pair(
+                pw.from_stop_idx + base,
+                pw.to_stop_idx + base,
+            ));
+        }
+    }
+    set
+}
+
+/// Build a **complete transfer subgraph** among boardable stops (have departures).
+///
+/// Uses a geographic grid so monomodal RER shells connect to nearby Métro/tram/bus
+/// board points **without naming any gare**. Completeness > hard skip.
+fn add_boardable_transfer_graph(
+    epoch: &mut StaticEpoch,
+    pathway_pairs: &std::collections::HashSet<(u32, u32)>,
+) {
+    use crate::feeds::hub_link::hub_links_grid;
+    use crate::link::geo::GeoGrid;
+    use tracing::info;
+
+    /// Transfer radius (m) for general boardable↔boardable links.
+    const TRANSFER_RADIUS_M: f64 = 600.0;
+    /// Extra radius from monomodal/multimodal places (large stations).
+    const PLACE_RADIUS_M: f64 = 900.0;
+    const PLACE_NEIGHBORS: usize = 32;
+    const WALK_SPEED: f64 = 1.2;
+    const MIN_TRANSFER_S: u32 = 75;
+    const MAX_UNDIRECTED_PAIRS: usize = 300_000;
+
+    let points: Vec<(usize, f64, f64)> = epoch
+        .stops
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| {
+            let boardable = epoch
+                .stop_departures
+                .get(i)
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+            let id = s.raw_id.to_ascii_lowercase();
+            let place = id.contains("monomodalstopplace") || id.contains("multimodalstopplace");
+            if !boardable && !place {
+                return None;
+            }
+            if s.location_type == 1 && !place {
+                return None;
+            }
+            Some((i, s.lat?, s.lon?))
+        })
+        .collect();
+
+    if points.len() < 2 {
+        return;
+    }
+
+    info!(
+        boardable_points = points.len(),
+        radius_m = TRANSFER_RADIUS_M,
+        "building complete boardable transfer graph (grid)"
+    );
+
+    let mut pairs = hub_links_grid(&points, TRANSFER_RADIUS_M);
+    if pairs.len() > MAX_UNDIRECTED_PAIRS {
+        pairs.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+        pairs.truncate(MAX_UNDIRECTED_PAIRS);
+    }
+
+    let mut seen: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+    let mut extra = Vec::with_capacity(pairs.len().saturating_mul(2) + 64_000);
+
+    let push_pair = |extra: &mut Vec<WalkEdge>,
+                     seen: &mut std::collections::HashSet<(u32, u32)>,
+                     a: u32,
+                     b: u32,
+                     dist: f64| {
+        if a == b {
+            return;
+        }
+        let key = undirected_pair(a, b);
+        if pathway_pairs.contains(&key) || !seen.insert(key) {
+            return;
+        }
+        let dur = ((dist / WALK_SPEED).ceil() as u32).max(MIN_TRANSFER_S);
+        extra.push(WalkEdge {
+            from_stop_idx: a,
+            to_stop_idx: b,
+            duration_s: dur,
+            distance_m: dist,
+            pathway_mode: None,
+        });
+        extra.push(WalkEdge {
+            from_stop_idx: b,
+            to_stop_idx: a,
+            duration_s: dur,
+            distance_m: dist,
+            pathway_mode: None,
+        });
+    };
+
+    for (a, b, dist) in pairs {
+        push_pair(&mut extra, &mut seen, a as u32, b as u32, dist);
+    }
+
+    // Dense star from every monomodal/multimodal place → nearest boardable (uncapped
+    // by the global pair budget). This is what makes RER shell → Métro work.
+    let boardable_pts: Vec<(usize, f64, f64)> = points.clone();
+    let boardable_grid = GeoGrid::build(&boardable_pts, PLACE_RADIUS_M);
+    let mut place_links = 0usize;
+    for (i, s) in epoch.stops.iter().enumerate() {
+        let id = s.raw_id.to_ascii_lowercase();
+        if !id.contains("monomodalstopplace") && !id.contains("multimodalstopplace") {
+            continue;
+        }
+        let (Some(lat), Some(lon)) = (s.lat, s.lon) else {
+            continue;
+        };
+        let near = boardable_grid.nearby(
+            &boardable_pts,
+            lat,
+            lon,
+            PLACE_RADIUS_M,
+            PLACE_NEIGHBORS + 1,
+        );
+        for (j, dist) in near {
+            if j == i {
+                continue;
+            }
+            let before = seen.len();
+            push_pair(&mut extra, &mut seen, i as u32, j as u32, dist);
+            if seen.len() > before {
+                place_links += 1;
+            }
+        }
+    }
+
+    info!(
+        transfer_walk_edges = extra.len(),
+        monomodal_star_links = place_links,
+        "boardable transfer graph ready"
+    );
+    epoch.walk_edges.extend(extra);
+}
+
+fn add_parent_station_walks(
+    epoch: &mut StaticEpoch,
+    pathway_pairs: &std::collections::HashSet<(u32, u32)>,
+) {
+    let mut by_parent: HashMap<String, Vec<u32>> = HashMap::new();
+    for (idx, s) in epoch.stops.iter().enumerate() {
+        if let Some(ref p) = s.parent_id {
+            by_parent.entry(p.clone()).or_default().push(idx as u32);
+        }
+        if s.location_type == 1 {
+            by_parent.entry(s.id.clone()).or_default().push(idx as u32);
+        }
+    }
+    const DEFAULT_TRANSFER: u32 = 120;
+    // Deterministic edge order — walk_edges indices are referenced by the
+    // persisted FLASH-TB flag table, so iteration must not depend on HashMap
+    // seeding.
+    let mut parents: Vec<&String> = by_parent.keys().collect();
+    parents.sort();
+    for parent in parents {
+        let members = &by_parent[parent];
+        if members.len() < 2 {
+            continue;
+        }
+        for &a in members {
+            for &b in members {
+                if a == b {
+                    continue;
+                }
+                if pathway_pairs.contains(&undirected_pair(a, b)) {
+                    continue;
+                }
+                epoch.walk_edges.push(WalkEdge {
+                    from_stop_idx: a,
+                    to_stop_idx: b,
+                    duration_s: DEFAULT_TRANSFER,
+                    distance_m: 50.0,
+                    pathway_mode: None,
+                });
             }
         }
     }
@@ -1948,7 +2251,10 @@ mod tests {
         compute_partition(&mut epoch);
         compute_arc_flags(&mut epoch);
 
-        assert!(!epoch.flag_patterns.is_empty(), "forward search should produce flags");
+        assert!(
+            !epoch.flag_patterns.is_empty(),
+            "forward search should produce flags"
+        );
         let cell_a = epoch.stop_partition[0] as usize;
         let cell_b = epoch.stop_partition[1] as usize;
         let cell_c = epoch.stop_partition[2] as usize;
@@ -1971,7 +2277,10 @@ mod tests {
             assert!(pat3.get_bit(cell_b), "C→B should flag cell of B");
         }
         if cell_a != cell_c && cell_a != cell_b {
-            assert!(pat3.get_bit(cell_a), "C→B should flag cell of A (reachable via B→A)");
+            assert!(
+                pat3.get_bit(cell_a),
+                "C→B should flag cell of A (reachable via B→A)"
+            );
         }
     }
 
@@ -2029,258 +2338,6 @@ mod tests {
         // direction after full recursion. Weak but meaningful sanity check:
         for i in 0..6 {
             assert!(epoch.stop_partition[i] < 256);
-        }
-    }
-}
-
-/// Precompute geo point lists and place/parent indexes used on every itinerary request.
-fn build_geo_and_place_indexes(epoch: &mut StaticEpoch) {
-    use crate::search::stops::{is_idfm_place_stop, place_name_key};
-
-    epoch.geo_stop_points.clear();
-    epoch.geo_boardable_points.clear();
-    epoch.place_name_index.clear();
-    epoch.children_by_parent.clear();
-
-    for (i, s) in epoch.stops.iter().enumerate() {
-        let (Some(lat), Some(lon)) = (s.lat, s.lon) else {
-            continue;
-        };
-        epoch.geo_stop_points.push((i, lat, lon));
-
-        let boardable = epoch
-            .stop_departures
-            .get(i)
-            .map(|v| !v.is_empty())
-            .unwrap_or(false);
-        let place = is_idfm_place_stop(s);
-        if boardable || place {
-            epoch.geo_boardable_points.push((i, lat, lon));
-            let key = place_name_key(&s.name);
-            if key.len() >= 3 {
-                epoch
-                    .place_name_index
-                    .entry(key)
-                    .or_default()
-                    .push(i as u32);
-            }
-        }
-
-        if let Some(ref p) = s.parent_id {
-            epoch
-                .children_by_parent
-                .entry(p.clone())
-                .or_default()
-                .push(i as u32);
-        }
-        if s.location_type == 1 {
-            epoch
-                .children_by_parent
-                .entry(s.id.clone())
-                .or_default()
-                .push(i as u32);
-        }
-    }
-}
-
-fn undirected_pair(a: u32, b: u32) -> (u32, u32) {
-    if a <= b {
-        (a, b)
-    } else {
-        (b, a)
-    }
-}
-
-/// Global stop pairs that have at least one pathway-derived walk edge.
-fn pathway_pair_set(
-    bundles: &[Arc<FeedStaticBundle>],
-    stop_offset: &HashMap<String, u32>,
-) -> std::collections::HashSet<(u32, u32)> {
-    use std::collections::HashSet;
-    let mut set = HashSet::new();
-    for bundle in bundles {
-        let base = *stop_offset.get(&bundle.feed_id).unwrap_or(&0);
-        for pw in &bundle.pathways {
-            set.insert(undirected_pair(
-                pw.from_stop_idx + base,
-                pw.to_stop_idx + base,
-            ));
-        }
-    }
-    set
-}
-
-/// Build a **complete transfer subgraph** among boardable stops (have departures).
-///
-/// Uses a geographic grid so monomodal RER shells connect to nearby Métro/tram/bus
-/// board points **without naming any gare**. Completeness > hard skip.
-fn add_boardable_transfer_graph(
-    epoch: &mut StaticEpoch,
-    pathway_pairs: &std::collections::HashSet<(u32, u32)>,
-) {
-    use crate::feeds::hub_link::hub_links_grid;
-    use crate::link::geo::nearby;
-    use tracing::info;
-
-    /// Transfer radius (m) for general boardable↔boardable links.
-    const TRANSFER_RADIUS_M: f64 = 600.0;
-    /// Extra radius from monomodal/multimodal places (large stations).
-    const PLACE_RADIUS_M: f64 = 900.0;
-    const PLACE_NEIGHBORS: usize = 32;
-    const WALK_SPEED: f64 = 1.2;
-    const MIN_TRANSFER_S: u32 = 75;
-    const MAX_UNDIRECTED_PAIRS: usize = 300_000;
-
-    let points: Vec<(usize, f64, f64)> = epoch
-        .stops
-        .iter()
-        .enumerate()
-        .filter_map(|(i, s)| {
-            let boardable = epoch
-                .stop_departures
-                .get(i)
-                .map(|v| !v.is_empty())
-                .unwrap_or(false);
-            let id = s.raw_id.to_ascii_lowercase();
-            let place = id.contains("monomodalstopplace") || id.contains("multimodalstopplace");
-            if !boardable && !place {
-                return None;
-            }
-            if s.location_type == 1 && !place {
-                return None;
-            }
-            Some((i, s.lat?, s.lon?))
-        })
-        .collect();
-
-    if points.len() < 2 {
-        return;
-    }
-
-    info!(
-        boardable_points = points.len(),
-        radius_m = TRANSFER_RADIUS_M,
-        "building complete boardable transfer graph (grid)"
-    );
-
-    let mut pairs = hub_links_grid(&points, TRANSFER_RADIUS_M);
-    if pairs.len() > MAX_UNDIRECTED_PAIRS {
-        pairs.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
-        pairs.truncate(MAX_UNDIRECTED_PAIRS);
-    }
-
-    let mut seen: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
-    let mut extra = Vec::with_capacity(pairs.len().saturating_mul(2) + 64_000);
-
-    let push_pair = |extra: &mut Vec<WalkEdge>,
-                     seen: &mut std::collections::HashSet<(u32, u32)>,
-                     a: u32,
-                     b: u32,
-                     dist: f64| {
-        if a == b {
-            return;
-        }
-        let key = undirected_pair(a, b);
-        if pathway_pairs.contains(&key) || !seen.insert(key) {
-            return;
-        }
-        let dur = ((dist / WALK_SPEED).ceil() as u32).max(MIN_TRANSFER_S);
-        extra.push(WalkEdge {
-            from_stop_idx: a,
-            to_stop_idx: b,
-            duration_s: dur,
-            distance_m: dist,
-            pathway_mode: None,
-        });
-        extra.push(WalkEdge {
-            from_stop_idx: b,
-            to_stop_idx: a,
-            duration_s: dur,
-            distance_m: dist,
-            pathway_mode: None,
-        });
-    };
-
-    for (a, b, dist) in pairs {
-        push_pair(&mut extra, &mut seen, a as u32, b as u32, dist);
-    }
-
-    // Dense star from every monomodal/multimodal place → nearest boardable (uncapped
-    // by the global pair budget). This is what makes RER shell → Métro work.
-    let boardable_pts: Vec<(usize, f64, f64)> = points.clone();
-    let mut place_links = 0usize;
-    for (i, s) in epoch.stops.iter().enumerate() {
-        let id = s.raw_id.to_ascii_lowercase();
-        if !id.contains("monomodalstopplace") && !id.contains("multimodalstopplace") {
-            continue;
-        }
-        let (Some(lat), Some(lon)) = (s.lat, s.lon) else {
-            continue;
-        };
-        let near = nearby(&boardable_pts, lat, lon, PLACE_RADIUS_M, PLACE_NEIGHBORS + 1);
-        for (j, dist) in near {
-            if j == i {
-                continue;
-            }
-            let before = seen.len();
-            push_pair(&mut extra, &mut seen, i as u32, j as u32, dist);
-            if seen.len() > before {
-                place_links += 1;
-            }
-        }
-    }
-
-    info!(
-        transfer_walk_edges = extra.len(),
-        monomodal_star_links = place_links,
-        "boardable transfer graph ready"
-    );
-    epoch.walk_edges.extend(extra);
-}
-
-fn add_parent_station_walks(
-    epoch: &mut StaticEpoch,
-    pathway_pairs: &std::collections::HashSet<(u32, u32)>,
-) {
-    let mut by_parent: HashMap<String, Vec<u32>> = HashMap::new();
-    for (idx, s) in epoch.stops.iter().enumerate() {
-        if let Some(ref p) = s.parent_id {
-            by_parent.entry(p.clone()).or_default().push(idx as u32);
-        }
-        if s.location_type == 1 {
-            by_parent
-                .entry(s.id.clone())
-                .or_default()
-                .push(idx as u32);
-        }
-    }
-    const DEFAULT_TRANSFER: u32 = 120;
-    // Deterministic edge order — walk_edges indices are referenced by the
-    // persisted FLASH-TB flag table, so iteration must not depend on HashMap
-    // seeding.
-    let mut parents: Vec<&String> = by_parent.keys().collect();
-    parents.sort();
-    for parent in parents {
-        let members = &by_parent[parent];
-        if members.len() < 2 {
-            continue;
-        }
-        for &a in members {
-            for &b in members {
-                if a == b {
-                    continue;
-                }
-                if pathway_pairs.contains(&undirected_pair(a, b)) {
-                    continue;
-                }
-                epoch.walk_edges.push(WalkEdge {
-                    from_stop_idx: a,
-                    to_stop_idx: b,
-                    duration_s: DEFAULT_TRANSFER,
-                    distance_m: 50.0,
-                    pathway_mode: None,
-                });
-            }
         }
     }
 }

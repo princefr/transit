@@ -38,7 +38,9 @@ pub fn detect_format(bytes: &[u8]) -> RealtimeFormat {
         return RealtimeFormat::GtfsRt;
     }
     // XML SIRI (rare on PRIM; usually JSON)
-    if trimmed.starts_with(b"<?xml") || trimmed.starts_with(b"<Siri") || trimmed.starts_with(b"<siri")
+    if trimmed.starts_with(b"<?xml")
+        || trimmed.starts_with(b"<Siri")
+        || trimmed.starts_with(b"<siri")
     {
         let s = String::from_utf8_lossy(trimmed);
         if s.contains("EstimatedTimetable") {
@@ -63,10 +65,7 @@ fn trim_start(b: &[u8]) -> &[u8] {
 }
 
 fn detect_siri_json(v: &serde_json::Value) -> RealtimeFormat {
-    let siri = v
-        .get("Siri")
-        .or_else(|| v.get("siri"))
-        .unwrap_or(v);
+    let siri = v.get("Siri").or_else(|| v.get("siri")).unwrap_or(v);
     let sd = siri
         .get("ServiceDelivery")
         .or_else(|| siri.get("serviceDelivery"))

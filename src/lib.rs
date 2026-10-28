@@ -1,3 +1,9 @@
+// Long planner signatures and nested result types are deliberate in the routing core.
+#![allow(
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::large_enum_variant
+)]
 //! Library surface for the transit itinerary server.
 //! Enables integration tests and optional embedding without the HTTP binary.
 

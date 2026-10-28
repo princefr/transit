@@ -48,19 +48,16 @@
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
 
-use super::journey::{
-    local_midnight_utc, local_seconds_since_midnight, service_date_in_tz,
-    ItineraryQuery, ItineraryResult, Journey, Leg, Place, RtTripAdjust,
-};
+use super::journey::{ItineraryQuery, ItineraryResult, Journey, Leg, Place, RtTripAdjust};
 use super::walk::AccessStop;
 use crate::gtfs::pack::{RouteMode, StaticEpoch};
 
 // Re-export the RAPTOR reconstruction helpers so TBR produces identical leg
 // output (same geometry, same intermediate stops, same stay-seated logic).
 use super::raptor::{
-    earliest_freq_board, journey_arrival_s, journey_first_departure, next_departure_s,
-    pareto_front, pure_walk_journey, rt_effective_arr_s, rt_effective_dep_s, trip_template_base,
-    CANDIDATE_POOL_FACTOR,
+    dedup_journeys, earliest_freq_board, journey_arrival_s, journey_first_departure,
+    next_departure_s, pareto_front, pure_walk_journey, rt_effective_arr_s, rt_effective_dep_s,
+    service_day_passes, trip_activity, trip_template_base, CANDIDATE_POOL_FACTOR,
 };
 
 /// How a stop was reached in a given round — mirrors RAPTOR's `Reach`.
@@ -165,7 +162,11 @@ impl<'a> super::raptor::LabelSource for TbrLabelSource<'a> {
     }
     #[inline]
     fn get(&self, round: usize, stop: usize) -> Option<super::raptor::Reach> {
-        self.rows.get(round)?.get(stop)?.as_ref().map(|l| l.to_reach())
+        self.rows
+            .get(round)?
+            .get(stop)?
+            .as_ref()
+            .map(|l| l.to_reach())
     }
 }
 
@@ -189,20 +190,35 @@ struct TbrScratch {
     reached: Vec<u32>,
     /// Stamp for "stop already reached in this round".
     stop_stamp: Vec<u32>,
-    /// Stamp for "line already boarded in this round".
+    /// Stamp: `line_boards[line]` holds entries of the current round.
     line_stamp: Vec<u32>,
+    /// Trip-based line pruning (Witt / Geisberger TB): per line, the
+    /// `(position in line, board offset)` of trips boarded this round. A later
+    /// trip of a FIFO line boarded at the same or a later stop position is
+    /// dominated by an earlier boarded trip and is skipped.
+    line_boards: Vec<Vec<(u32, u32)>>,
+    /// Position of each trip inside `epoch.line_trips[line_of_trip[trip]]`.
+    trip_line_pos: Vec<u32>,
+    /// Per line: trips never overtake each other and share pickup/drop-off
+    /// patterns (precondition for line pruning).
+    line_fifo: Vec<bool>,
     /// Trip-centric segment queue for the NEXT round (flagged FLASH-TB mode):
-    /// (trip_idx, board_off, board_stop). Segments are ridden directly via
-    /// their precomputed transfer lists instead of re-scanning departures.
-    seg_queue: Vec<(u32, u32, u32)>,
+    /// (trip_idx, board_off, board_stop, time_shift_s). Segments are ridden
+    /// directly via their precomputed transfer lists instead of re-scanning
+    /// departures. `time_shift_s` is the realtime / frequency offset applied to
+    /// the template times of that ride.
+    seg_queue: Vec<(u32, u32, u32, i32)>,
     /// Per-trip reached index for segment enqueues (earliest board offset).
     /// Lazily reset via `touched_segs`.
     seg_reach: Vec<u32>,
     touched_segs: Vec<u32>,
-    /// Per-trip calendar activity for the query service date.
+    /// Per-trip calendar activity for `date` (the service day being searched).
     active: Vec<bool>,
-    /// Pooling identity: epoch + service date the scratch was built for.
+    /// Activity vectors of other recently searched service dates.
+    active_cache: Vec<(chrono::NaiveDate, Vec<bool>)>,
+    /// Pooling identity: epoch (+ sizes) and round count the scratch was built for.
     epoch_id: String,
+    epoch_sizes: (usize, usize, usize),
     date: chrono::NaiveDate,
     /// Trip indices written into `rt` (for cheap per-query refresh).
     rt_touched: Vec<u32>,
@@ -222,19 +238,8 @@ impl TbrScratch {
         let n = epoch.stops.len();
         let trip_n = epoch.trips.len();
 
-        let mut cal_memo: HashMap<(&str, &str), bool> = HashMap::new();
-        let mut active = Vec::with_capacity(trip_n);
-        for trip in &epoch.trips {
-            let key = (trip.feed_id.as_str(), trip.service_id.as_str());
-            let a = *cal_memo.entry(key).or_insert_with(|| {
-                epoch
-                    .calendars
-                    .get(&trip.feed_id)
-                    .map(|cal| cal.is_active(&trip.service_id, date))
-                    .unwrap_or(true)
-            });
-            active.push(a);
-        }
+        let active = trip_activity(epoch, date);
+        let (trip_line_pos, line_fifo) = line_layout(epoch);
 
         let mut rt: Vec<Option<RtTripAdjust>> = vec![None; trip_n];
         let mut margin = 0u32;
@@ -263,11 +268,16 @@ impl TbrScratch {
             reached: Vec::new(),
             stop_stamp: vec![0; n],
             line_stamp: vec![0; epoch.line_trips.len().max(1)],
+            line_boards: vec![Vec::new(); epoch.line_trips.len().max(1)],
+            trip_line_pos,
+            line_fifo,
             seg_queue: Vec::new(),
             seg_reach: vec![u32::MAX; trip_n],
             touched_segs: Vec::new(),
             active,
+            active_cache: Vec::new(),
             epoch_id: epoch.id.clone(),
+            epoch_sizes: epoch_sizes(epoch),
             date,
             rt_touched,
             rt,
@@ -294,6 +304,24 @@ impl TbrScratch {
         self.seg_queue.clear();
     }
 
+    /// Switch calendar activity to `date` (keeps a few recent dates warm so the
+    /// previous-service-day pass does not rebuild activity every query).
+    fn set_date(&mut self, epoch: &StaticEpoch, date: chrono::NaiveDate) {
+        if self.date == date {
+            return;
+        }
+        let new_active = match self.active_cache.iter().position(|(d, _)| *d == date) {
+            Some(i) => self.active_cache.swap_remove(i).1,
+            None => trip_activity(epoch, date),
+        };
+        let old = std::mem::replace(&mut self.active, new_active);
+        self.active_cache.push((self.date, old));
+        if self.active_cache.len() > 3 {
+            self.active_cache.remove(0);
+        }
+        self.date = date;
+    }
+
     /// Re-point the realtime table at a new query (pool reuse path).
     /// Only the touched entries are cleared, so this costs O(|q.rt_adjust|).
     fn retarget_rt(&mut self, epoch: &StaticEpoch, q: &ItineraryQuery) {
@@ -314,6 +342,20 @@ impl TbrScratch {
         }
         self.rt_margin_s = margin.min(6 * 3600);
         self.flash_disabled = false;
+    }
+
+    /// Remember that trip `ti` (of FIFO line `line_id`) was boarded at `off`.
+    fn record_line_board(&mut self, line_id: u32, ti: usize, off: u32, round_stamp: u32) {
+        let li = line_id as usize;
+        if li >= self.line_boards.len() {
+            return;
+        }
+        if self.line_stamp[li] != round_stamp {
+            self.line_stamp[li] = round_stamp;
+            self.line_boards[li].clear();
+        }
+        let pos = self.trip_line_pos[ti];
+        self.line_boards[li].push((pos, off));
     }
 
     #[inline]
@@ -342,8 +384,55 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Take this thread's pooled scratch when it matches `epoch` + `date`,
-/// retargeting its realtime table to `q`. Otherwise builds a fresh one.
+fn epoch_sizes(epoch: &StaticEpoch) -> (usize, usize, usize) {
+    (epoch.stops.len(), epoch.trips.len(), epoch.line_trips.len())
+}
+
+/// Per-trip position inside its line, and per-line FIFO flag (no overtaking,
+/// identical pickup/drop-off pattern, no frequency trips).
+fn line_layout(epoch: &StaticEpoch) -> (Vec<u32>, Vec<bool>) {
+    let mut pos = vec![u32::MAX; epoch.trips.len()];
+    let mut fifo = vec![false; epoch.line_trips.len()];
+    for (li, trips) in epoch.line_trips.iter().enumerate() {
+        for (p, &t) in trips.iter().enumerate() {
+            if let Some(slot) = pos.get_mut(t as usize) {
+                *slot = p as u32;
+            }
+        }
+        let mut ok = true;
+        'pairs: for w in trips.windows(2) {
+            let (a, b) = (&epoch.trips[w[0] as usize], &epoch.trips[w[1] as usize]);
+            if !a.frequency_windows.is_empty()
+                || !b.frequency_windows.is_empty()
+                || a.stop_time_len != b.stop_time_len
+            {
+                ok = false;
+                break;
+            }
+            for off in 0..a.stop_time_len {
+                let sa = &epoch.stop_times[(a.stop_time_start + off) as usize];
+                let sb = &epoch.stop_times[(b.stop_time_start + off) as usize];
+                if sa.arrival_s > sb.arrival_s
+                    || sa.departure_s > sb.departure_s
+                    || sa.pickup_type != sb.pickup_type
+                    || sa.drop_off_type != sb.drop_off_type
+                {
+                    ok = false;
+                    break 'pairs;
+                }
+            }
+        }
+        if trips.len() == 1 {
+            ok = epoch.trips[trips[0] as usize].frequency_windows.is_empty();
+        }
+        fifo[li] = ok;
+    }
+    (pos, fifo)
+}
+
+/// Take this thread's pooled scratch when it matches `epoch` and the query's
+/// round count (label rows are sized by rounds), retargeting its realtime
+/// table to `q` and its calendar to `date`. Otherwise builds a fresh one.
 fn take_pooled_scratch(
     epoch: &StaticEpoch,
     q: &ItineraryQuery,
@@ -352,11 +441,15 @@ fn take_pooled_scratch(
     SCRATCH_POOL.with(|cell| {
         let mut slot = cell.borrow_mut();
         if let Some(mut s) = slot.take() {
-            if s.epoch_id == epoch.id && s.date == date {
+            if s.epoch_id == epoch.id
+                && s.epoch_sizes == epoch_sizes(epoch)
+                && s.rounds == tbr_max_rounds(q)
+            {
                 s.retarget_rt(epoch, q);
+                s.set_date(epoch, date);
                 return s;
             }
-            // Epoch or date changed — drop the stale scratch entirely.
+            // Epoch or sizing changed — drop the stale scratch entirely.
         }
         TbrScratch::new(epoch, q, date)
     })
@@ -374,7 +467,6 @@ fn tbr_max_rounds(q: &ItineraryQuery) -> usize {
         .max(q.max_transfers.saturating_add(2))
         .max(4) as usize)
         .min(12)
-        .max(1)
 }
 
 /// Phase timings for one planning call. Printed when `TRANSIT_PROFILE=1`.
@@ -417,11 +509,10 @@ impl TbrProfile {
 pub fn plan_journeys_tbr(epoch: &StaticEpoch, q: &ItineraryQuery) -> ItineraryResult {
     let t_total = std::time::Instant::now();
     let mut prof = TbrProfile::new();
-    let date = service_date_in_tz(q.departure_at, &q.timezone);
-    let dep_s0 = local_seconds_since_midnight(q.departure_at, &q.timezone);
-    let midnight = local_midnight_utc(date, &q.timezone);
 
-    let osrm = q.osrm_url.as_deref().filter(|u| !u.trim().is_empty());
+    let osrm = super::walk::osrm_base(q.osrm_url.as_deref());
+    // One wall-clock OSRM budget for the whole plan (access, egress, leg paths).
+    let osrm_budget = super::walk::OsrmBudget::per_plan();
     let access_n = if epoch.trip_count() > 80_000 { 40 } else { 16 };
     let from_profile = if q.bike_from {
         super::walk::OsrmProfile::Bike
@@ -434,7 +525,7 @@ pub fn plan_journeys_tbr(epoch: &StaticEpoch, q: &ItineraryQuery) -> ItineraryRe
         super::walk::OsrmProfile::Foot
     };
     let t_phase = std::time::Instant::now();
-    let origins = super::walk::resolve_access_stops_profile(
+    let origins = super::walk::resolve_access_stops_budget(
         epoch,
         q.from_stop_id.as_deref(),
         q.from_lat,
@@ -444,8 +535,9 @@ pub fn plan_journeys_tbr(epoch: &StaticEpoch, q: &ItineraryQuery) -> ItineraryRe
         access_n,
         osrm,
         from_profile,
+        &osrm_budget,
     );
-    let targets = super::walk::resolve_access_stops_profile(
+    let targets = super::walk::resolve_access_stops_budget(
         epoch,
         q.to_stop_id.as_deref(),
         q.to_lat,
@@ -455,6 +547,7 @@ pub fn plan_journeys_tbr(epoch: &StaticEpoch, q: &ItineraryQuery) -> ItineraryRe
         access_n,
         osrm,
         to_profile,
+        &osrm_budget,
     );
     prof.access_us = t_phase.elapsed().as_micros();
 
@@ -462,14 +555,10 @@ pub fn plan_journeys_tbr(epoch: &StaticEpoch, q: &ItineraryQuery) -> ItineraryRe
         return empty_result(epoch, q);
     }
 
-    let egress: HashMap<u32, AccessStop> = targets
-        .iter()
-        .map(|a| (a.stop_idx, a.clone()))
-        .collect();
-    let origin_map: HashMap<u32, AccessStop> = origins
-        .iter()
-        .map(|a| (a.stop_idx, a.clone()))
-        .collect();
+    let egress: HashMap<u32, AccessStop> =
+        targets.iter().map(|a| (a.stop_idx, a.clone())).collect();
+    let origin_map: HashMap<u32, AccessStop> =
+        origins.iter().map(|a| (a.stop_idx, a.clone())).collect();
 
     let max_k = if epoch.trip_count() > 80_000 {
         (q.max_results.max(1) as usize).min(4)
@@ -482,41 +571,71 @@ pub fn plan_journeys_tbr(epoch: &StaticEpoch, q: &ItineraryQuery) -> ItineraryRe
         (max_k * CANDIDATE_POOL_FACTOR).max(max_k)
     };
 
+    let passes = service_day_passes(epoch, q);
+    if passes.is_empty() {
+        return empty_result(epoch, q);
+    }
+
     let t_phase = std::time::Instant::now();
-    let mut scratch = take_pooled_scratch(epoch, q, date);
+    let mut scratch = take_pooled_scratch(epoch, q, passes[0].date);
     prof.scratch_us = t_phase.elapsed().as_micros();
 
     let t_phase = std::time::Instant::now();
-    let mut journeys = if q.arrive_by {
-        plan_arrive_by_tbr(
-            epoch, q, dep_s0, midnight, &origins, &targets, &egress, &origin_map, pool_cap,
-            &mut scratch, &mut prof,
-        )
-    } else {
-        plan_depart_after_tbr(
-            epoch, q, dep_s0, midnight, &origins, &targets, &egress, &origin_map, pool_cap,
-            None, &mut scratch, &mut prof,
-        )
-    };
-
-    // FLASH-TB safety valve: flag preprocessing samples source stops and
-    // departure times, so a legitimate transfer can occasionally end up
-    // unflagged and prune away the only journey. When a flagged search finds
-    // nothing, retry once with pruning disabled.
-    if journeys.is_empty() && !epoch.flag_patterns.is_empty() && !scratch.flash_disabled {
-        scratch.flash_disabled = true;
-        journeys = if q.arrive_by {
-            plan_arrive_by_tbr(
-                epoch, q, dep_s0, midnight, &origins, &targets, &egress, &origin_map, pool_cap,
-                &mut scratch, &mut prof,
-            )
-        } else {
-            plan_depart_after_tbr(
-                epoch, q, dep_s0, midnight, &origins, &targets, &egress, &origin_map, pool_cap,
-                None, &mut scratch, &mut prof,
-            )
+    let mut journeys: Vec<Journey> = Vec::new();
+    for pass in &passes {
+        scratch.set_date(epoch, pass.date);
+        let dep_s0 = pass.query_s;
+        let midnight = pass.anchor;
+        // Arc-flags are computed from same-day departures; the previous-day
+        // pass (query time ≈ +24h, only after-midnight trips matter) runs as
+        // plain TBR so a sampling gap in the flags cannot hide those trips.
+        scratch.flash_disabled = !pass.primary;
+        let run = |scratch: &mut TbrScratch, prof: &mut TbrProfile| {
+            if q.arrive_by {
+                plan_arrive_by_tbr(
+                    epoch,
+                    q,
+                    dep_s0,
+                    midnight,
+                    &origins,
+                    &targets,
+                    &egress,
+                    &origin_map,
+                    pool_cap,
+                    scratch,
+                    prof,
+                )
+            } else {
+                plan_depart_after_tbr(
+                    epoch,
+                    q,
+                    dep_s0,
+                    midnight,
+                    &origins,
+                    &targets,
+                    &egress,
+                    &origin_map,
+                    pool_cap,
+                    None,
+                    scratch,
+                    prof,
+                )
+            }
         };
+        let mut found = run(&mut scratch, &mut prof);
+
+        // FLASH-TB safety valve: flag preprocessing samples source stops and
+        // departure times, so a legitimate transfer can occasionally end up
+        // unflagged and prune away the only journey. When a flagged search
+        // finds nothing, retry once with pruning disabled.
+        if found.is_empty() && !epoch.flag_patterns.is_empty() && !scratch.flash_disabled {
+            scratch.flash_disabled = true;
+            found = run(&mut scratch, &mut prof);
+        }
+        journeys.extend(found);
     }
+    scratch.flash_disabled = false;
+    dedup_journeys(&mut journeys);
     prof.search_us += t_phase.elapsed().as_micros();
 
     journeys = pareto_front(journeys);
@@ -555,16 +674,20 @@ pub fn plan_journeys_tbr(epoch: &StaticEpoch, q: &ItineraryQuery) -> ItineraryRe
         let n = j.legs.len();
         for (i, leg) in j.legs.iter_mut().enumerate() {
             if let Leg::Walk(w) = leg {
-                if i == 0 && q.bike_from {
-                    w.mode = "BIKE".into();
-                } else if i + 1 == n && q.bike_to {
+                if (i == 0 && q.bike_from) || (i + 1 == n && q.bike_to) {
                     w.mode = "BIKE".into();
                 } else if w.mode.is_empty() {
                     w.mode = "WALK".into();
                 }
             }
         }
-        super::walk::enrich_non_transit_paths(j, osrm, from_profile, to_profile);
+        super::walk::enrich_non_transit_paths_budget(
+            j,
+            osrm,
+            from_profile,
+            to_profile,
+            &osrm_budget,
+        );
     }
     prof.post_us = t_phase.elapsed().as_micros();
 
@@ -608,7 +731,10 @@ fn plan_depart_after_tbr(
     let mut journeys = Vec::new();
 
     if let Some(mut j) = pure_walk_journey(epoch, q, origins, targets, dep_s0, midnight) {
-        if arrive_deadline_s.map(|d| journey_arrival_s(&j, midnight) <= d).unwrap_or(true) {
+        if arrive_deadline_s
+            .map(|d| journey_arrival_s(&j, midnight) <= d)
+            .unwrap_or(true)
+        {
             super::fare::apply_fare_estimate(epoch, &mut j);
             journeys.push(j);
         }
@@ -627,6 +753,9 @@ fn plan_depart_after_tbr(
     };
 
     while journeys.len() < pool_cap && stagnant < 8 && iterations < max_iterations {
+        if crate::routing::cancel::expired() {
+            break;
+        }
         iterations += 1;
         if let Some(deadline) = arrive_deadline_s {
             if dep_s >= deadline {
@@ -672,7 +801,11 @@ fn plan_depart_after_tbr(
                 continue;
             };
             let j_dep = journey_first_departure(&journey).unwrap_or(journey.departure);
-            let key = (j_dep.timestamp(), journey.arrival.timestamp(), journey.transfers);
+            let key = (
+                j_dep.timestamp(),
+                journey.arrival.timestamp(),
+                journey.transfers,
+            );
             if !seen_keys.insert(key) {
                 continue;
             }
@@ -801,11 +934,7 @@ fn plan_arrive_by_tbr(
             j.arrival = arr;
             j.duration_s = (arr - dep).num_seconds();
             super::fare::apply_fare_estimate(epoch, &mut j);
-            let key = (
-                j.departure.timestamp(),
-                j.arrival.timestamp(),
-                j.transfers,
-            );
+            let key = (j.departure.timestamp(), j.arrival.timestamp(), j.transfers);
             seen_keys.insert(key);
             journeys.push(j);
         }
@@ -827,6 +956,9 @@ fn plan_arrive_by_tbr(
     let per_sample = ((pool_cap / samples.len().max(1)) + 2).max(2);
 
     for seed in samples {
+        if crate::routing::cancel::expired() {
+            break;
+        }
         let batch = plan_depart_after_tbr(
             epoch,
             q,
@@ -887,7 +1019,7 @@ fn run_tbr(
     // Only transfer edges whose flag pattern intersects the target cells are
     // explored during the walk transfer phase.
     let mut target_cells = crate::gtfs::cell_bitset::CellBitSet::new(epoch.num_cells);
-    for (t_idx, _) in egress {
+    for t_idx in egress.keys() {
         if let Some(&cell) = epoch.stop_partition.get(*t_idx as usize) {
             target_cells.set_bit(cell as usize);
         }
@@ -944,6 +1076,9 @@ fn run_tbr(
     };
 
     for round in 0..s.rounds {
+        if crate::routing::cancel::expired() {
+            break;
+        }
         if s.reached.is_empty() && (!use_arc_flags || s.seg_queue.is_empty()) {
             break;
         }
@@ -957,28 +1092,30 @@ fn run_tbr(
         // their precomputed transfer lists — no departure-list scanning. This
         // is where arc-flag pruning bites: unflagged transfers were already
         // dropped at pack time.
-        let segs: Vec<(u32, u32, u32)> = std::mem::take(&mut s.seg_queue);
-        for (seg_ti, seg_off, seg_stop) in segs {
+        let segs: Vec<(u32, u32, u32, i32)> = std::mem::take(&mut s.seg_queue);
+        for (seg_ti, seg_off, seg_stop, seg_shift) in segs {
             let seg_tiu = seg_ti as usize;
             if !s.active[seg_tiu] {
                 continue;
             }
             let trip = &epoch.trips[seg_tiu];
-            if q.excluded_trip_ids.contains(&trip.id) || (q.wheelchair && trip.wheelchair == 2)
-            {
+            if q.excluded_trip_ids.contains(&trip.id) || (q.wheelchair && trip.wheelchair == 2) {
                 continue;
             }
             if !mode_ok(trip.mode) {
                 continue;
             }
+            // Realtime: ride the segment on its RT-adjusted times (the shift was
+            // resolved when the transfer was checked for feasibility).
+            let seg_adj = s.rt[seg_tiu].clone();
             scan_trip_forward(
                 epoch,
                 q,
                 seg_tiu,
                 trip,
                 seg_off,
-                0,
-                None,
+                seg_shift,
+                seg_adj.as_ref(),
                 &mut best_dest,
                 egress,
                 s,
@@ -1053,16 +1190,33 @@ fn run_tbr(
                 if !s.active[ti] {
                     continue;
                 }
-                if line_id != u32::MAX {
-                    if s.line_stamp.get(line_id as usize).copied().unwrap_or(0) == round_stamp {
+                let adj = s.rt[ti].clone();
+                // TB line pruning: skip only when an *earlier* trip of the same
+                // FIFO line was boarded this round at the same or an earlier
+                // stop position (it reaches every later stop no later). Trips
+                // with realtime data are never pruned nor used for pruning,
+                // since delays can break the FIFO order.
+                let prunable = line_id != u32::MAX
+                    && adj.is_none()
+                    && s.line_fifo.get(line_id as usize).copied().unwrap_or(false);
+                if prunable
+                    && s.line_stamp.get(line_id as usize).copied().unwrap_or(0) == round_stamp
+                {
+                    let pos = s.trip_line_pos[ti];
+                    if s.line_boards[line_id as usize]
+                        .iter()
+                        .any(|&(p, o)| p < pos && o <= st_off)
+                    {
                         continue;
                     }
                 }
                 if st_board.pickup_type == 1 {
                     continue;
                 }
-                let adj = s.rt[ti].clone();
-                if adj.as_ref().is_some_and(|a| a.is_skipped(st_board.stop_sequence)) {
+                if adj
+                    .as_ref()
+                    .is_some_and(|a| a.is_skipped(st_board.stop_sequence))
+                {
                     continue;
                 }
 
@@ -1092,9 +1246,10 @@ fn run_tbr(
                     // is better (earlier departure or earlier stop offset).
                     let (_, prev_off, prev_dep, _) =
                         s.trip_boarding[ti].unwrap_or((0, 0, u32::MAX, 0));
-                    if board_dep < prev_dep
-                        || (board_dep == prev_dep && st_off < prev_off)
-                    {
+                    if board_dep < prev_dep || (board_dep == prev_dep && st_off < prev_off) {
+                        if prunable {
+                            s.record_line_board(line_id, ti, st_off, round_stamp);
+                        }
                         s.set_trip_boarding(ti, (stop_idx, st_off, board_dep, time_shift));
                         // Re-scan forward from this boarding point.
                         scan_trip_forward(
@@ -1121,10 +1276,8 @@ fn run_tbr(
 
                 // New trip this round — board and scan.
                 s.trip_stamp[ti] = round_stamp;
-                if line_id != u32::MAX {
-                    if let Some(ls) = s.line_stamp.get_mut(line_id as usize) {
-                        *ls = round_stamp;
-                    }
+                if prunable {
+                    s.record_line_board(line_id, ti, st_off, round_stamp);
                 }
                 s.set_trip_boarding(ti, (stop_idx, st_off, board_dep, time_shift));
                 scan_trip_forward(
@@ -1149,7 +1302,7 @@ fn run_tbr(
         }
 
         // --- Walk transfer phase ---
-        let transit_reached: Vec<u32> = next_reached.drain(..).collect();
+        let transit_reached: Vec<u32> = std::mem::take(&mut next_reached);
         for stop_idx in &transit_reached {
             let arrival_here = s.earliest[*stop_idx as usize];
             for &ei in epoch
@@ -1264,7 +1417,7 @@ fn run_tbr(
 #[inline]
 fn scan_trip_forward(
     epoch: &StaticEpoch,
-    _q: &ItineraryQuery,
+    q: &ItineraryQuery,
     ti: usize,
     trip: &crate::gtfs::pack::GlobalTrip,
     board_off: u32,
@@ -1332,11 +1485,19 @@ fn scan_trip_forward(
     if use_arc_flags {
         for off in (board_off + 1)..trip.stop_time_len {
             let st = &epoch.stop_times[(trip.stop_time_start + off) as usize];
-            if st.drop_off_type == 1 { continue; }
+            if st.drop_off_type == 1 {
+                continue;
+            }
             let arr = rt_effective_arr_s(adj, st, time_shift);
-            if arr >= *best_dest { break; }
-            
-            if let Some(transfers) = epoch.trip_transfers.get(ti).and_then(|v| v.get(off as usize)) {
+            if arr >= *best_dest {
+                break;
+            }
+
+            if let Some(transfers) = epoch
+                .trip_transfers
+                .get(ti)
+                .and_then(|v| v.get(off as usize))
+            {
                 for entry in transfers {
                     // Arc-flag prune via the compressed pattern table; unknown
                     // patterns are treated as flagged (safe side).
@@ -1348,21 +1509,26 @@ fn scan_trip_forward(
                     if !flagged {
                         continue;
                     }
-                    let t2 = entry.target_trip as usize;
-                    if t2 >= s.active.len() || !s.active[t2] { continue; }
-                    
-                    let trip2 = &epoch.trips[t2];
-                    let board_st = &epoch.stop_times[(trip2.stop_time_start + entry.target_board_off) as usize];
+                    // Feasibility on realtime-adjusted times: the precomputed
+                    // target is the earliest *scheduled* connection; when it is
+                    // inactive today, filtered out, or no longer reachable
+                    // because of delays, continue along the same line.
                     let effective_board = arr.saturating_add(entry.min_transfer_s);
-                    if board_st.departure_s < effective_board { continue; }
-                    if board_st.departure_s >= *best_dest { continue; }
-                    
+                    let Some((t2, board_off2, dep2, shift2)) =
+                        resolve_transfer_target(epoch, q, s, entry, effective_board, *best_dest)
+                    else {
+                        continue;
+                    };
+                    let trip2 = &epoch.trips[t2];
+                    let board_st = &epoch.stop_times[(trip2.stop_time_start + board_off2) as usize];
                     let si2 = board_st.stop_idx;
-                    if board_st.departure_s < s.earliest[si2 as usize] {
+                    if dep2 < s.earliest[si2 as usize] {
                         s.improve(
-                            round, si2, board_st.departure_s,
+                            round,
+                            si2,
+                            dep2,
                             TbrReach::Walk {
-                                arrival_s: board_st.departure_s,
+                                arrival_s: dep2,
                                 from_stop: st.stop_idx,
                                 to_stop: si2,
                                 duration_s: entry.min_transfer_s,
@@ -1375,7 +1541,7 @@ fn scan_trip_forward(
                             next_reached.push(si2);
                         }
                         if let Some(eg) = egress.get(&si2) {
-                            let total = board_st.departure_s.saturating_add(eg.duration_s);
+                            let total = dep2.saturating_add(eg.duration_s);
                             if total < *best_dest {
                                 *best_dest = total;
                             }
@@ -1384,18 +1550,105 @@ fn scan_trip_forward(
                     // Trip-centric continuation (paper TB): enqueue the target
                     // trip as a segment for the next round instead of leaving
                     // the query to rediscover it via a departure scan.
-                    let r = entry.target_board_off;
-                    if s.seg_reach[t2] > r {
+                    let r = board_off2;
+                    if !trip2.frequency_windows.is_empty() {
+                        // Frequency rides differ by shift: no per-trip dedup.
+                        s.seg_queue.push((t2 as u32, r, si2, shift2));
+                    } else if s.seg_reach[t2] > r {
                         if s.seg_reach[t2] == u32::MAX {
                             s.touched_segs.push(t2 as u32);
                         }
                         s.seg_reach[t2] = r;
-                        s.seg_queue.push((entry.target_trip, r, si2));
+                        s.seg_queue.push((t2 as u32, r, si2, shift2));
                     }
                 }
             }
         }
     }
+}
+
+/// Max trips inspected along a line when the precomputed transfer target is
+/// unusable (inactive / delayed / filtered).
+const TRANSFER_LINE_SCAN_CAP: usize = 64;
+
+/// Resolve a precomputed FLASH-TB transfer into a boardable trip using
+/// realtime-adjusted times: `(trip_idx, board_off, board_dep_s, time_shift_s)`.
+fn resolve_transfer_target(
+    epoch: &StaticEpoch,
+    q: &ItineraryQuery,
+    s: &TbrScratch,
+    entry: &crate::gtfs::pack::TripTransferEntry,
+    effective_board: u32,
+    best_dest: u32,
+) -> Option<(usize, u32, u32, i32)> {
+    let target = entry.target_trip as usize;
+    let off = entry.target_board_off;
+    let line = epoch.line_of_trip.get(target).copied().unwrap_or(u32::MAX);
+    let line_trips: &[u32] = epoch
+        .line_trips
+        .get(line as usize)
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+    let start_pos = s.trip_line_pos.get(target).copied().unwrap_or(u32::MAX) as usize;
+    let single = [entry.target_trip];
+    let candidates: &[u32] =
+        if start_pos < line_trips.len() && line_trips[start_pos] == entry.target_trip {
+            &line_trips[start_pos..]
+        } else {
+            &single
+        };
+    let fifo = s.line_fifo.get(line as usize).copied().unwrap_or(false);
+    for &t2 in candidates.iter().take(TRANSFER_LINE_SCAN_CAP) {
+        let t2u = t2 as usize;
+        let Some(trip2) = epoch.trips.get(t2u) else {
+            continue;
+        };
+        if off >= trip2.stop_time_len {
+            continue;
+        }
+        let st2 = &epoch.stop_times[(trip2.stop_time_start + off) as usize];
+        if fifo
+            && st2.departure_s >= best_dest.saturating_add(s.rt_margin_s)
+            && trip2.frequency_windows.is_empty()
+        {
+            break;
+        }
+        if t2u >= s.active.len() || !s.active[t2u] {
+            continue;
+        }
+        if q.excluded_trip_ids.contains(&trip2.id) || (q.wheelchair && trip2.wheelchair == 2) {
+            continue;
+        }
+        if st2.pickup_type == 1 {
+            continue;
+        }
+        let adj2 = s.rt[t2u].as_ref();
+        if adj2.is_some_and(|a| a.is_skipped(st2.stop_sequence)) {
+            continue;
+        }
+        let (dep, shift) = if !trip2.frequency_windows.is_empty() {
+            let base = trip_template_base(epoch, trip2);
+            let sched = rt_effective_dep_s(adj2, st2);
+            match earliest_freq_board(trip2, base, sched, effective_board) {
+                Some(v) => v,
+                None => continue,
+            }
+        } else {
+            let dep_rt = rt_effective_dep_s(adj2, st2);
+            if dep_rt < effective_board {
+                continue;
+            }
+            (dep_rt, (dep_rt as i64 - st2.departure_s as i64) as i32)
+        };
+        if dep >= best_dest {
+            if fifo {
+                break;
+            }
+            continue;
+        }
+        return Some((t2u, off, dep, shift));
+    }
+    None
 }
 
 fn place_from_query_from(epoch: &StaticEpoch, q: &ItineraryQuery) -> Place {
@@ -1415,8 +1668,7 @@ mod tests {
     use super::*;
     use crate::gtfs::calendar::ServiceCalendar;
     use crate::gtfs::pack::{
-        FrequencyWindow, GlobalTrip, PackedStopTime, RouteMode, StaticEpoch, StopRecord,
-        WalkEdge,
+        FrequencyWindow, GlobalTrip, PackedStopTime, RouteMode, StaticEpoch, StopRecord, WalkEdge,
     };
     use chrono::{TimeZone, Utc};
     use std::collections::HashMap;
@@ -1633,7 +1885,13 @@ mod tests {
             "svc".into(),
             start,
             end,
-            true, true, true, true, true, true, true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
         );
         epoch.calendars = HashMap::from([("test".into(), Arc::new(cal))]);
 
@@ -1700,9 +1958,11 @@ mod tests {
         let arr_r = res_r.journeys[0].arrival;
         let arr_t = res_t.journeys[0].arrival;
         assert_eq!(
-            arr_r, arr_t,
+            arr_r,
+            arr_t,
             "TBR arrival {:?} != RAPTOR arrival {:?} for {}→{}",
-            arr_t, arr_r,
+            arr_t,
+            arr_r,
             q.from_stop_id.as_deref().unwrap_or("?"),
             q.to_stop_id.as_deref().unwrap_or("?")
         );
@@ -1725,9 +1985,11 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            trips_r, trips_t,
+            trips_r,
+            trips_t,
             "TBR trip sequence {:?} != RAPTOR {:?} for {}→{}",
-            trips_t, trips_r,
+            trips_t,
+            trips_r,
             q.from_stop_id.as_deref().unwrap_or("?"),
             q.to_stop_id.as_deref().unwrap_or("?")
         );
@@ -1945,7 +2207,15 @@ mod tests {
         let end = chrono::NaiveDate::from_ymd_opt(2030, 12, 31).unwrap();
         cal.add_regular(
             "svc".into(),
-            start, end, true, true, true, true, true, true, true,
+            start,
+            end,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
         );
         epoch.calendars = HashMap::from([("test".into(), Arc::new(cal))]);
         epoch.walk_adj = vec![Vec::new(); epoch.stops.len()];

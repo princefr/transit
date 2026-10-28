@@ -117,7 +117,10 @@ pub fn estimate_vehicle_pos(
         return None;
     }
 
-    let base_key = trip_key.rsplit_once('@').map(|(b, _)| b).unwrap_or(trip_key);
+    let base_key = trip_key
+        .rsplit_once('@')
+        .map(|(b, _)| b)
+        .unwrap_or(trip_key);
     let hint = trip_resolve_hint(trip);
 
     let now_ts = now.timestamp();
@@ -146,7 +149,7 @@ pub fn estimate_vehicle_pos(
                     c.lat,
                     c.lon,
                     c.stop_id.clone(),
-                    Some(c.seq as u32),
+                    Some(c.seq),
                     now,
                     "STOPPED_AT",
                     None,
@@ -174,7 +177,7 @@ pub fn estimate_vehicle_pos(
                     lat,
                     lon,
                     next.stop_id.clone(),
-                    Some(next.seq as u32),
+                    Some(next.seq),
                     now,
                     geom.transit_status(),
                     bearing,
@@ -198,7 +201,7 @@ pub fn estimate_vehicle_pos(
                 last.lat,
                 last.lon,
                 last.stop_id.clone(),
-                Some(last.seq as u32),
+                Some(last.seq),
                 now,
                 "STOPPED_AT",
                 None,
@@ -209,9 +212,7 @@ pub fn estimate_vehicle_pos(
 
     // 3) Single SM MonitoredCall — typical for stop-monitoring
     if let Some(only) = calls.first() {
-        return estimate_approaching_single(
-            feed_id, trip_key, trip, epoch, now, base_key, only,
-        );
+        return estimate_approaching_single(feed_id, trip_key, trip, epoch, now, base_key, only);
     }
 
     None
@@ -223,7 +224,7 @@ pub fn estimate_vehicle_pos(
 
 #[derive(Clone)]
 struct CallPoint {
-    seq: u16,
+    seq: u32,
     stop_id: String,
     lat: f64,
     lon: f64,
@@ -317,7 +318,10 @@ fn resolve_stop_coords(
         }
     }
     // Sequence lookup on static trip (SIRI journey id rarely matches GTFS)
-    let base = trip_key.rsplit_once('@').map(|(b, _)| b).unwrap_or(trip_key);
+    let base = trip_key
+        .rsplit_once('@')
+        .map(|(b, _)| b)
+        .unwrap_or(trip_key);
     if let Some(&trip_idx) = epoch.trip_id_to_idx.get(base) {
         if let Some(trip) = epoch.trips.get(trip_idx as usize) {
             for off in 0..trip.stop_time_len {
@@ -380,7 +384,7 @@ fn estimate_approaching_single(
             target.lat,
             target.lon,
             target.stop_id.clone(),
-            Some(target.seq as u32),
+            Some(target.seq),
             now,
             "STOPPED_AT",
             None,
@@ -394,7 +398,7 @@ fn estimate_approaching_single(
             target.lat,
             target.lon,
             target.stop_id.clone(),
-            Some(target.seq as u32),
+            Some(target.seq),
             now,
             "IN_TRANSIT_TO",
             None,
@@ -413,7 +417,7 @@ fn estimate_approaching_single(
             target.lat,
             target.lon,
             target.stop_id.clone(),
-            Some(target.seq as u32),
+            Some(target.seq),
             now,
             "INCOMING_AT",
             None,
@@ -428,7 +432,7 @@ fn estimate_approaching_single(
         target.seq,
         Some(&trip_resolve_hint(trip)),
     )
-        .unwrap_or(120) as f64;
+    .unwrap_or(120) as f64;
     let scheduled_run = scheduled_run.max(30.0);
 
     // remaining large ⇒ still near previous; remaining 0 ⇒ at target
@@ -463,7 +467,7 @@ fn estimate_approaching_single(
         lat,
         lon,
         target.stop_id.clone(),
-        Some(target.seq as u32),
+        Some(target.seq),
         now,
         status,
         bearing,
@@ -472,7 +476,7 @@ fn estimate_approaching_single(
 }
 
 struct StaticStopPin {
-    stop_sequence: u16,
+    stop_sequence: u32,
     stop_idx: u32,
     stop_id: String,
     lat: f64,
@@ -501,9 +505,7 @@ fn previous_static_stop(
             lon,
         };
         // Match target by stop_idx or sequence
-        let is_target = target
-            .stop_idx
-            .is_some_and(|i| i == st.stop_idx)
+        let is_target = target.stop_idx.is_some_and(|i| i == st.stop_idx)
             || st.stop_sequence == target.seq
             || stop.id == target.stop_id
             || (!stop.raw_id.is_empty() && target.stop_id.contains(stop.raw_id.as_str()));
@@ -540,8 +542,8 @@ fn previous_static_stop(
 fn scheduled_run_secs(
     epoch: &StaticEpoch,
     base_key: &str,
-    from_seq: u16,
-    to_seq: u16,
+    from_seq: u32,
+    to_seq: u32,
     hint: Option<&TripResolveHint>,
 ) -> Option<u32> {
     let trip = resolve_trip(epoch, base_key, hint)?;
@@ -562,7 +564,7 @@ fn scheduled_run_secs(
 fn shape_dist_for_seq(
     epoch: &StaticEpoch,
     base_key: &str,
-    seq: u16,
+    seq: u32,
     hint: Option<&TripResolveHint>,
 ) -> Option<f32> {
     let trip = resolve_trip(epoch, base_key, hint)?;
@@ -654,21 +656,22 @@ fn interpolate_segment(
                 if pts.len() >= 2 {
                     let d0 = shape_dist_for_seq(epoch, base_key, prev.seq, hint);
                     let d1 = shape_dist_for_seq(epoch, base_key, next.seq, hint);
-                    if let (Some(d0), Some(d1)) = (d0, d1) {
+                    // shape_dist_traveled is in the feed's own unit (m, km, ft…):
+                    // convert through the trip's measured unit map before using it as
+                    // arc length in metres.
+                    let affine = crate::routing::geometry::trip_shape_dist_affine(epoch, trip);
+                    if let (Some(d0), Some(d1), Some(affine)) = (d0, d1, affine) {
                         if let Some((lat, lon, brg)) =
-                            crate::routing::geometry::interpolate_shape_by_dist(pts, d0, d1, frac)
+                            crate::routing::geometry::interpolate_shape_by_feed_dist(
+                                pts, d0, d1, frac, affine,
+                            )
                         {
                             return (lat, lon, Some(brg), PathGeom::Shape);
                         }
                     }
-                    if let Some((lat, lon, brg)) = interpolate_polyline(
-                        pts,
-                        prev.lat,
-                        prev.lon,
-                        next.lat,
-                        next.lon,
-                        frac,
-                    ) {
+                    if let Some((lat, lon, brg)) =
+                        interpolate_polyline(pts, prev.lat, prev.lon, next.lat, next.lon, frac)
+                    {
                         return (lat, lon, Some(brg), PathGeom::Shape);
                     }
                     // Multi-branch / bad nearest indices → fall through to stop-chain
@@ -707,7 +710,7 @@ fn build_stop_chain_polyline(
     let seq_hi = prev.seq.max(next.seq);
 
     // Collect stops whose sequence is in [lo, hi], in trip order
-    let mut chain: Vec<(u16, f64, f64)> = Vec::new();
+    let mut chain: Vec<(u32, f64, f64)> = Vec::new();
     for off in 0..trip.stop_time_len {
         let st = &epoch.stop_times[(trip.stop_time_start + off) as usize];
         if st.stop_sequence < seq_lo || st.stop_sequence > seq_hi {
@@ -879,8 +882,7 @@ fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     let rlat2 = lat2.to_radians();
     let dlat = (lat2 - lat1).to_radians();
     let dlon = (lon2 - lon1).to_radians();
-    let a = (dlat / 2.0).sin().powi(2)
-        + rlat1.cos() * rlat2.cos() * (dlon / 2.0).sin().powi(2);
+    let a = (dlat / 2.0).sin().powi(2) + rlat1.cos() * rlat2.cos() * (dlon / 2.0).sin().powi(2);
     2.0 * R * a.sqrt().asin()
 }
 
@@ -981,7 +983,7 @@ fn pin_at_best_stop(
         lat,
         lon,
         stop_id,
-        Some(su.stop_sequence as u32),
+        Some(su.stop_sequence),
         now,
         "IN_TRANSIT_TO",
         None,
@@ -1023,7 +1025,7 @@ mod tests {
     use crate::rt::overlay::{FeedRtState, StopTimeRt, TripRt};
     use std::collections::HashMap;
 
-    fn stop(seq: u16, id: &str, arr_delay: Option<i32>) -> (u16, StopTimeRt) {
+    fn stop(seq: u32, id: &str, arr_delay: Option<i32>) -> (u32, StopTimeRt) {
         (
             seq,
             StopTimeRt {
@@ -1036,7 +1038,7 @@ mod tests {
         )
     }
 
-    fn trip_with(stops: Vec<(u16, StopTimeRt)>, delay: Option<i32>, canceled: bool) -> TripRt {
+    fn trip_with(stops: Vec<(u32, StopTimeRt)>, delay: Option<i32>, canceled: bool) -> TripRt {
         TripRt {
             delay,
             canceled,
@@ -1068,12 +1070,7 @@ mod tests {
             ("idf:B", (48.1, 2.1)),
             ("idf:C", (48.05, 2.05)),
         ]);
-        let out = estimate_from_trip_updates(
-            &feed,
-            resolver(coords),
-            |_| Some("Line 1".into()),
-            0,
-        );
+        let out = estimate_from_trip_updates(&feed, resolver(coords), |_| Some("Line 1".into()), 0);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].trip_id, "idf:T1");
         assert_eq!(out[0].stop_id.as_deref(), Some("idf:B"));
@@ -1155,10 +1152,7 @@ mod tests {
             "f",
             "T",
             trip_with(
-                vec![
-                    stop(10, "f:GHOST", Some(0)),
-                    stop(3, "f:REAL", Some(15)),
-                ],
+                vec![stop(10, "f:GHOST", Some(0)), stop(3, "f:REAL", Some(15))],
                 None,
                 false,
             ),
@@ -1283,12 +1277,11 @@ mod tests {
         let pos = estimate_vehicle_pos("f", "f:T1", &trip, &epoch, now).expect("pos");
         assert!(pos.lat > 48.0 && pos.lat < 48.1);
         assert!(pos.lon > 2.0 && pos.lon < 2.1);
-        assert!(
-            pos.current_status
-                .as_deref()
-                .unwrap()
-                .starts_with("ESTIMATED_")
-        );
+        assert!(pos
+            .current_status
+            .as_deref()
+            .unwrap()
+            .starts_with("ESTIMATED_"));
     }
 
     #[test]
@@ -1661,8 +1654,10 @@ mod tests {
     #[test]
     fn canceled_trip_yields_none() {
         let epoch = mini_epoch();
-        let mut trip = TripRt::default();
-        trip.canceled = true;
+        let mut trip = TripRt {
+            canceled: true,
+            ..Default::default()
+        };
         trip.stop_updates.insert(
             1,
             StopTimeRt {
