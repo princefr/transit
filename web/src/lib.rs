@@ -880,7 +880,9 @@ fn journey_to_map(journey: &Value) -> MapPayload {
                     dashed: true,
                     points: pts,
                     label: format!(
-                        "{label_mode} {from_n} → {to_n}<br/>{dist:.0} m · {dur}s"
+                        "{label_mode} {} → {}<br/>{dist:.0} m · {dur}s",
+                        escape_html(from_n),
+                        escape_html(to_n)
                     ),
                 });
             }
@@ -923,7 +925,7 @@ fn journey_to_map(journey: &Value) -> MapPayload {
                         lat,
                         lon,
                         kind: "transfer".into(),
-                        title: format!("Correspondance · {name}"),
+                        title: format!("Correspondance · {}", escape_html(name)),
                         mode: Some(mode.clone()),
                         route_color: route_color.clone(),
                         bearing: None,
@@ -943,7 +945,13 @@ fn journey_to_map(journey: &Value) -> MapPayload {
             pts = fallback_points(leg, false);
         }
 
-        let label = format!("<b>{mode}</b> {route} {trip}<br/>{head}");
+        let label = format!(
+            "<b>{}</b> {} {}<br/>{}",
+            escape_html(&mode),
+            escape_html(route),
+            escape_html(trip),
+            escape_html(head)
+        );
         if pts.len() >= 2 {
             legs_out.push(MapLeg {
                 mode: mode.clone(),
@@ -968,7 +976,7 @@ fn journey_to_map(journey: &Value) -> MapPayload {
                     lat,
                     lon,
                     kind: "vehicle".into(),
-                    title: format!("{lbl} ({mode})"),
+                    title: format!("{} ({})", escape_html(lbl), escape_html(&mode)),
                     mode: Some(mode),
                     route_color,
                     bearing,
@@ -984,7 +992,7 @@ fn journey_to_map(journey: &Value) -> MapPayload {
                 lat,
                 lon,
                 kind: "origin".into(),
-                title: format!("Départ · {title}"),
+                title: format!("Départ · {}", escape_html(&title)),
                 mode: None,
                 route_color: None,
                 bearing: None,
@@ -996,7 +1004,7 @@ fn journey_to_map(journey: &Value) -> MapPayload {
             lat,
             lon,
             kind: "destination".into(),
-            title: format!("Arrivée · {title}"),
+            title: format!("Arrivée · {}", escape_html(&title)),
             mode: None,
             route_color: None,
             bearing: None,
@@ -1030,7 +1038,8 @@ fn set_html(id: &str, html: &str) {
 
 fn set_status(msg: &str, err: bool) {
     if let Some(e) = el("status") {
-        e.set_inner_html(msg);
+        // Plain text: messages may carry server / network error strings.
+        e.set_text_content(Some(msg));
         let _ = e.class_list().toggle_with_force("error", err);
     }
 }
@@ -1125,6 +1134,18 @@ fn escape_html(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// GTFS colour (`RRGGBB`, optional `#`) safe to splice into a `style` attribute;
+/// anything that is not exactly six ASCII hex digits yields `default`.
+fn css_hex(raw: &str, default: &str) -> String {
+    let h = raw.trim().trim_start_matches('#');
+    if h.len() == 6 && h.chars().all(|c| c.is_ascii_hexdigit()) {
+        h.to_string()
+    } else {
+        default.to_string()
+    }
 }
 
 fn mode_icon_path(mode: &str) -> String {
@@ -1489,11 +1510,12 @@ fn format_transit_time_html(
         "time"
     };
     let show = rt.clone().or(sched.clone()).unwrap_or_else(|| "—".into());
-    let mut html = format!(r#"<span class="{time_cls}">{show}</span>"#);
+    let mut html = format!(r#"<span class="{time_cls}">{}</span>"#, escape_html(&show));
     if let (Some(s), Some(r)) = (&sched, &rt) {
         if s != r && !canceled {
             html.push_str(&format!(
-                r#" <span class="time-scheduled" title="Horaire théorique">{s}</span>"#
+                r#" <span class="time-scheduled" title="Horaire théorique">{}</span>"#,
+                escape_html(s)
             ));
         }
     }
@@ -1554,7 +1576,11 @@ fn journey_times_html(j: &Value) -> String {
     let arr_html = format_transit_time_html(arr_sched_iso, arr_rt_iso, arr_delay, canceled);
     // Fallback when legs lack scheduled fields
     if dep_sched_iso.is_none() && _rt_dep.is_none() {
-        return format!(r#"<span class="journey-dep-arr">{sched_dep} → {sched_arr}</span>"#);
+        return format!(
+            r#"<span class="journey-dep-arr">{} → {}</span>"#,
+            escape_html(&sched_dep),
+            escape_html(&sched_arr)
+        );
     }
     format!(r#"<span class="journey-dep-arr">{dep_html} → {arr_html}</span>"#)
 }
@@ -1707,7 +1733,7 @@ fn set_live_empty(msg: Option<&str>) {
     if let Some(e) = el("live-vehicles-status") {
         match msg {
             Some(m) if !m.is_empty() => {
-                e.set_inner_html(m);
+                e.set_text_content(Some(m));
                 let _ = e.remove_attribute("hidden");
             }
             _ => {
@@ -2235,7 +2261,7 @@ fn set_global_live_empty(msg: Option<&str>) {
     if let Some(e) = el("global-live-status") {
         match msg {
             Some(m) if !m.is_empty() => {
-                e.set_inner_html(m);
+                e.set_text_content(Some(m));
                 let _ = e.remove_attribute("hidden");
             }
             _ => {
@@ -2700,17 +2726,18 @@ fn render_journeys(app: &App) {
                         .get("routeColor")
                         .and_then(|x| x.as_str())
                         .unwrap_or("334155");
-                    let color = color.trim_start_matches('#');
+                    let color = css_hex(color, "334155");
                     let text = leg
                         .get("routeTextColor")
                         .and_then(|x| x.as_str())
                         .unwrap_or("FFFFFF");
-                    let text = text.trim_start_matches('#');
+                    let text = css_hex(text, "FFFFFF");
                     let chip = if route.is_empty() {
                         String::new()
                     } else {
                         format!(
-                            r#"<span class="route-chip" style="background:#{color};color:#{text}">{route}</span>"#
+                            r#"<span class="route-chip" style="background:#{color};color:#{text}">{}</span>"#,
+                            escape_html(route)
                         )
                     };
                     let canceled = leg
@@ -2987,7 +3014,7 @@ fn render_departures(deps: &Value) {
               <span>{platform} {status} {delay_html}</span>
             </div>"#,
             time_cls = time_cls,
-            show_time = show_time,
+            show_time = escape_html(&show_time),
             live_badge = live_badge,
             icon = mode_icon_path(&mode),
             route = escape_html(route),
@@ -3027,14 +3054,12 @@ fn traffic_line_badge_html(line: &Value) -> Option<String> {
     let bg = line
         .get("color")
         .and_then(|x| x.as_str())
-        .map(|s| s.trim().trim_start_matches('#').to_string())
-        .filter(|s| s.len() == 6)
+        .map(|s| css_hex(s, "475569"))
         .unwrap_or_else(|| "475569".into());
     let fg = line
         .get("textColor")
         .and_then(|x| x.as_str())
-        .map(|s| s.trim().trim_start_matches('#').to_string())
-        .filter(|s| s.len() == 6)
+        .map(|s| css_hex(s, "FFFFFF"))
         .unwrap_or_else(|| "FFFFFF".into());
     let label = escape_html(short);
     let title = escape_html(short);
@@ -3236,7 +3261,7 @@ fn show_trip_detail_card(journey: &Value) {
                 .get("fareCurrency")
                 .and_then(|x| x.as_str())
                 .unwrap_or("EUR");
-            format!(" · {}", format_fare(a, Some(cur)))
+            format!(" · {}", escape_html(&format_fare(a, Some(cur))))
         }
         None => String::new(),
     };
@@ -3382,13 +3407,13 @@ fn show_trip_detail_card(journey: &Value) {
                 let color = leg
                     .get("routeColor")
                     .and_then(|x| x.as_str())
-                    .unwrap_or("334155")
-                    .trim_start_matches('#');
+                    .map(|s| css_hex(s, "334155"))
+                    .unwrap_or_else(|| "334155".into());
                 let text = leg
                     .get("routeTextColor")
                     .and_then(|x| x.as_str())
-                    .unwrap_or("FFFFFF")
-                    .trim_start_matches('#');
+                    .map(|s| css_hex(s, "FFFFFF"))
+                    .unwrap_or_else(|| "FFFFFF".into());
                 let delay = leg
                     .get("delayDepartureSeconds")
                     .and_then(|x| x.as_i64())
@@ -3403,8 +3428,8 @@ fn show_trip_detail_card(journey: &Value) {
                 } else {
                     format!(
                         r#"<span class="route-chip" style="background:#{color};color:#{text}">{route}</span>"#,
-                        color = escape_html(color),
-                        text = escape_html(text),
+                        color = color,
+                        text = text,
                         route = escape_html(route),
                     )
                 };

@@ -1,0 +1,13 @@
+# Keep the Docker build context small and free of secrets.
+.git
+.github
+target
+web/target
+web/dist
+data
+.env
+.env.*
+!.env.example
+docs/*.mp4
+*.log
+.claude

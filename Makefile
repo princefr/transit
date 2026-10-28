@@ -118,6 +118,10 @@ ban-bench: ## Benchmark BAN suggest latency (needs make ban-index first)
 
 # ─── Run ─────────────────────────────────────────────────────────────────────
 
+# Local dev runs enable GraphiQL (/graphiql); config/default.toml keeps it off.
+# Override with: make run TRANSIT__SERVER__GRAPHQL_PLAYGROUND=false
+run run-debug run-bin: export TRANSIT__SERVER__GRAPHQL_PLAYGROUND ?= true
+
 .PHONY: run
 run: ## GraphQL API (release via scripts/run_server.sh, loads .env)
 	cd $(ROOT) && $(SCRIPTS)/run_server.sh
@@ -181,11 +185,22 @@ fmt-check: ## cargo fmt --check
 
 .PHONY: clippy
 clippy: ## cargo clippy (all targets)
-	cd $(ROOT) && $(CARGO) clippy --all-targets -- -D warnings
+	cd $(ROOT) && $(CARGO) clippy --workspace --all-targets -- -D warnings
+
+.PHONY: audit
+audit: ## cargo audit (RustSec advisories) for server + web lockfiles
+	cd $(ROOT) && $(CARGO) audit
+	cd $(WEB_DIR) && $(CARGO) audit
 
 .PHONY: gate
 gate: fmt-check test-lib check-web ## CI-style gate: fmt + lib tests + wasm check
 	@echo "gate ok"
+
+.PHONY: ci
+ci: fmt-check clippy ## Same checks as .github/workflows/ci.yml
+	cd $(ROOT) && $(CARGO) test --workspace --all-targets
+	cd $(WEB_DIR) && $(CARGO) check --target wasm32-unknown-unknown
+	$(MAKE) audit
 
 # ─── Data / IDFM ─────────────────────────────────────────────────────────────
 

@@ -63,7 +63,7 @@ See also [`docs/IDFM_DAILY.md`](docs/IDFM_DAILY.md), [`docs/REDIS_CACHE.md`](doc
 | **`IDFM_PRIM_API_KEY`** | PRIM marketplace key for IDFM realtime SIRI Lite ([prim.iledefrance-mobilites.fr](https://prim.iledefrance-mobilites.fr/)); `apikey` header |
 | **`PRIM_DATASET_KEY`** | Separate PRIM key for GTFS zip downloads (`make sync-idfm`, `daily_sync.sh`); `X-API-KEY` header — not the same value as `IDFM_PRIM_API_KEY` |
 | **Redis** (optional) | Response cache for search / vehicles / itineraries |
-| **OSRM** (optional) | Street-level walk geometry; public demo URL in config |
+| **OSRM** (optional) | Street-level walk/bike geometry. **Off by default** (`[routing] osrm_url = ""`): when set, user origin/destination coordinates are sent to that server. Self-host OSRM; the public demo `router.project-osrm.org` forbids production use |
 
 ---
 
@@ -138,7 +138,7 @@ make smoke          # probes /health and GraphQL against BASE_URL
 |-----|---------|
 | `http://127.0.0.1:8080/health` | Process & feed status (JSON) |
 | `http://127.0.0.1:8080/graphql` | GraphQL queries |
-| `http://127.0.0.1:8080/graphiql` | GraphiQL playground |
+| `http://127.0.0.1:8080/graphiql` | GraphiQL playground — **disabled by default**; `make run` / `make run-debug` enable it (`TRANSIT__SERVER__GRAPHQL_PLAYGROUND=true`) |
 | `ws://127.0.0.1:8080/ws` | GraphQL subscriptions |
 | `http://127.0.0.1:8088` | Map UI (Trunk dev server) |
 
@@ -150,6 +150,7 @@ make smoke          # probes /health and GraphQL against BASE_URL
 - **Override:** `TRANSIT_CONFIG=/path/to.toml`
 - **Secrets:** `.env` (loaded by `make run`, `scripts/run_server.sh`, systemd) — never commit
 - **Env overrides:** `TRANSIT__SERVER__BIND=127.0.0.1:8080` (figment `__` nesting)
+- **Secure defaults:** `[server] bind = "127.0.0.1:8080"` (loopback; the Docker image sets `TRANSIT__SERVER__BIND=0.0.0.0:8080`), `graphql_playground = false`, `[routing] osrm_url = ""` (straight-line walk legs, no third-party calls). Enable OSRM with `osrm_url = "http://your-osrm:5000"` or `TRANSIT_OSRM_URL=…`.
 
 Key sections: `[server]`, `[routing]`, `[graphql]`, `[prim]`, `[[feeds]]`, optional `[redis]` and `[ban]`.
 
@@ -169,7 +170,7 @@ make ban-index
 - **French stop search** — accent-insensitive, station-biased ranking
 - **IDFM loading UX** — progress while the large feed parses
 - **Multi-feed** — namespaced ids (`idfm:…`, `sncf:…`), configurable `[[feeds]]`
-- **Docker** — `docker compose up --build` (mounts `./data` for GTFS cache)
+- **Docker** — `docker compose up --build` (named volume `transit-data` for the GTFS cache)
 
 ---
 
@@ -178,9 +179,16 @@ make ban-index
 ```bash
 make test           # unit + integration tests
 make gate           # fmt + lib tests + wasm check
+make ci             # same checks as CI: fmt, clippy -D warnings, tests, wasm check, audit
+make audit          # cargo audit (RustSec) on Cargo.lock and web/Cargo.lock
 make dev            # print two-terminal run instructions
 make help           # all make targets
 ```
+
+**CI** (`.github/workflows/ci.yml`) runs on every push/PR and weekly: `cargo fmt --check`,
+`cargo clippy --all-targets -- -D warnings`, `cargo test --all-targets`, a
+`wasm32-unknown-unknown` check of `web/`, `cargo audit` on both lockfiles, and a
+`docker build`. Install the auditor locally with `cargo install cargo-audit --locked`.
 
 ---
 
@@ -190,6 +198,11 @@ make help           # all make targets
 docker compose up --build -d
 BASE_URL=http://127.0.0.1:8080 make smoke
 ```
+
+The compose file publishes the API on **127.0.0.1:8080 only**; put a TLS reverse
+proxy in front (or change the port mapping deliberately) to expose it. GTFS data
+lives in the named volume `transit-data` because the container runs as uid 10001
+(a host bind mount like `./data` would need `chown 10001:10001` first).
 
 ---
 

@@ -6,6 +6,11 @@ cd "$(dirname "$0")"
 
 export PATH="${HOME}/.cargo/bin:${PATH}"
 
+# Prebuilt trunk download is verified against a SHA-256 before install:
+#   1. TRUNK_SHA256=<hex>  — enforced when set (pin it in CI / your shell profile);
+#   2. otherwise the release's published "<asset>.sha256" file is fetched and used;
+#   3. if neither is available the install is refused (use `cargo install trunk --locked`).
+# TRUNK_VERSION overrides the pinned release (default below).
 if ! command -v trunk >/dev/null 2>&1; then
   echo "trunk not found. Installing prebuilt binary..."
   ARCH=$(uname -m)
@@ -13,18 +18,44 @@ if ! command -v trunk >/dev/null 2>&1; then
     x86_64) ASSET=trunk-x86_64-unknown-linux-gnu.tar.gz ;;
     aarch64) ASSET=trunk-aarch64-unknown-linux-gnu.tar.gz ;;
     *)
-      echo "Unsupported arch $ARCH — run: cargo install trunk"
+      echo "Unsupported arch $ARCH — run: cargo install trunk --locked" >&2
       exit 1
       ;;
   esac
-  VER=v0.21.14
+  VER="${TRUNK_VERSION:-v0.21.14}"
+  URL="https://github.com/trunk-rs/trunk/releases/download/${VER}/${ASSET}"
   TMP=$(mktemp -d)
-  curl -fsSL "https://github.com/trunk-rs/trunk/releases/download/${VER}/${ASSET}" -o "$TMP/trunk.tgz"
+  trap 'rm -rf "$TMP"' EXIT
+  curl -fsSL --proto '=https' --tlsv1.2 "$URL" -o "$TMP/trunk.tgz"
+
+  EXPECTED="${TRUNK_SHA256:-}"
+  if [ -z "$EXPECTED" ]; then
+    if curl -fsSL --proto '=https' --tlsv1.2 "${URL}.sha256" -o "$TMP/trunk.tgz.sha256"; then
+      EXPECTED=$(awk '{print $1; exit}' "$TMP/trunk.tgz.sha256")
+    fi
+  fi
+  if ! printf '%s' "$EXPECTED" | grep -Eq '^[0-9a-fA-F]{64}$'; then
+    echo "serve.sh: no SHA-256 available for ${ASSET} (${VER})." >&2
+    echo "  Set TRUNK_SHA256=<sha256 of the release asset> or run: cargo install trunk --locked" >&2
+    exit 1
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    ACTUAL=$(sha256sum "$TMP/trunk.tgz" | awk '{print $1}')
+  else
+    ACTUAL=$(shasum -a 256 "$TMP/trunk.tgz" | awk '{print $1}')
+  fi
+  EXPECTED=$(printf '%s' "$EXPECTED" | tr 'A-F' 'a-f')
+  if [ "$ACTUAL" != "$EXPECTED" ]; then
+    echo "serve.sh: SHA-256 mismatch for ${ASSET}: expected ${EXPECTED}, got ${ACTUAL}" >&2
+    exit 1
+  fi
+
   tar -xzf "$TMP/trunk.tgz" -C "$TMP"
   mkdir -p "${HOME}/.cargo/bin"
   install -m 755 "$TMP/trunk" "${HOME}/.cargo/bin/trunk"
   rm -rf "$TMP"
-  echo "Installed trunk to ${HOME}/.cargo/bin/trunk"
+  trap - EXIT
+  echo "Installed trunk ${VER} (sha256 ${ACTUAL}) to ${HOME}/.cargo/bin/trunk"
 fi
 
 rustup target add wasm32-unknown-unknown >/dev/null
@@ -51,6 +82,7 @@ mkdir -p dist
 
 echo "Building & serving → http://127.0.0.1:8088"
 echo "GraphQL API should be running at http://127.0.0.1:8080 (cargo run in parent dir)"
-# One clean build first so serve doesn't start from a broken dist
-trunk build "$@" || true
+# One clean build first so serve doesn't start from a broken dist.
+# A failed build aborts here (set -e) instead of serving stale output.
+trunk build "$@"
 exec trunk serve "$@"

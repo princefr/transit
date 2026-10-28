@@ -39,7 +39,12 @@ fn parse_date(s: &str) -> Option<NaiveDate> {
 fn read_zip_entry(archive: &mut ZipArchive<Cursor<Vec<u8>>>, name: &str) -> Result<String> {
     // case-insensitive search
     let names: Vec<String> = (0..archive.len())
-        .filter_map(|i| archive.by_index(i).ok().map(|f| f.name().to_string()))
+        .filter_map(|i| {
+            archive
+                .by_index(i)
+                .ok()
+                .and_then(|f| f.name().ok().map(|n| n.to_string()))
+        })
         .collect();
     let found = names.iter().find(|n| {
         let base = Path::new(n)
