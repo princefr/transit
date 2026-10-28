@@ -11,7 +11,8 @@
 //! | Messages écrans | `GET /marketplace/general-message?LineRef=` | ~18k/day (cap 20k) |
 //!
 //! GraphQL live boards call stop-monitoring on demand and
-//! [`register_sm_interest`] so the warm SM poller keeps that stop refreshed.
+//! [`register_sm_interest`]; once PRIM returns data for it, [`confirm_sm_interest`]
+//! makes the warm SM poller keep that stop refreshed.
 //! Map `vehicles(bbox|near)` also registers nearby stations for SM interest.
 //!
 //! Static schedules: configure `[[feeds]] id = "idfm"` with the public GTFS zip.
@@ -22,7 +23,7 @@ pub mod stop_board;
 
 pub use client::PrimClient;
 pub use poller::{
-    new_shared_prim, register_et_line_interest, register_nearby_sm_interest,
+    confirm_sm_interest, new_shared_prim, register_et_line_interest, register_nearby_sm_interest,
     register_sm_interest, register_viewport_live_interest, sm_try_consume_quota,
     spawn_prim_poller, spawn_prim_pollers, PrimCatalog, SharedPrim,
 };

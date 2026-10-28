@@ -9,6 +9,13 @@ use zip::ZipArchive;
 const DOWNLOAD_RETRIES: u32 = 2;
 const RETRY_BASE_MS: u64 = 500;
 
+/// Upper bound for a static GTFS zip download (IDFM is ~100 MB today).
+pub const MAX_STATIC_ZIP_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
+/// Upper bound for a single GTFS-RT / SIRI realtime payload.
+pub const MAX_RT_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
+/// Timestamped zips kept in `incoming/` after a promotion (most recent first).
+const KEEP_INCOMING_ZIPS: usize = 2;
+
 #[derive(Debug, Clone)]
 pub struct DownloadResult {
     pub bytes: Vec<u8>,
@@ -92,6 +99,7 @@ async fn download_conditional_once(
     etag: Option<&str>,
     timeout: Duration,
     extra_headers: &[(String, String)],
+    max_bytes: u64,
 ) -> Result<DownloadResult> {
     let mut req = client
         .get(url)
@@ -126,12 +134,19 @@ async fn download_conditional_once(
         .get(ETAG)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    let bytes = resp
-        .bytes()
+    let bytes = read_body_capped(resp, url, max_bytes).await?;
+    // Hashing a ~100 MB static zip takes long enough to stall an async worker.
+    let (bytes, sha256) = if bytes.len() > 1024 * 1024 {
+        tokio::task::spawn_blocking(move || {
+            let sha = sha256_hex(&bytes);
+            (bytes, sha)
+        })
         .await
-        .map_err(|e| TransitError::Http(e.to_string()))?
-        .to_vec();
-    let sha256 = sha256_hex(&bytes);
+        .map_err(|e| TransitError::Other(e.into()))?
+    } else {
+        let sha = sha256_hex(&bytes);
+        (bytes, sha)
+    };
     info!(url, bytes = bytes.len(), %sha256, "downloaded");
     Ok(DownloadResult {
         bytes,
@@ -141,7 +156,39 @@ async fn download_conditional_once(
     })
 }
 
+fn body_too_large(url: &str, max_bytes: u64) -> TransitError {
+    TransitError::Http(format!(
+        "GET {url}: response body exceeds limit of {max_bytes} bytes"
+    ))
+}
+
+/// Stream the response body, rejecting it as soon as it exceeds `max_bytes`
+/// (also up-front when the server announces a larger `Content-Length`).
+async fn read_body_capped(
+    mut resp: reqwest::Response,
+    url: &str,
+    max_bytes: u64,
+) -> Result<Vec<u8>> {
+    let announced = resp.content_length();
+    if announced.is_some_and(|n| n > max_bytes) {
+        return Err(body_too_large(url, max_bytes));
+    }
+    let mut buf: Vec<u8> = Vec::with_capacity(announced.unwrap_or(0) as usize);
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| TransitError::Http(e.to_string()))?
+    {
+        if buf.len() as u64 + chunk.len() as u64 > max_bytes {
+            return Err(body_too_large(url, max_bytes));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
 /// Conditional GET with up to 2 retries and exponential backoff on transient errors.
+/// Body is capped at [`MAX_STATIC_ZIP_BYTES`].
 pub async fn download_conditional(
     client: &reqwest::Client,
     url: &str,
@@ -149,10 +196,20 @@ pub async fn download_conditional(
     etag: Option<&str>,
     timeout: Duration,
 ) -> Result<DownloadResult> {
-    download_conditional_with_headers(client, url, user_agent, etag, timeout, &[]).await
+    download_conditional_with_headers(
+        client,
+        url,
+        user_agent,
+        etag,
+        timeout,
+        &[],
+        MAX_STATIC_ZIP_BYTES,
+    )
+    .await
 }
 
-/// Same as [`download_conditional`] with optional extra HTTP headers (e.g. PRIM `apikey`).
+/// Same as [`download_conditional`] with optional extra HTTP headers (e.g. PRIM `apikey`)
+/// and an explicit response body cap.
 pub async fn download_conditional_with_headers(
     client: &reqwest::Client,
     url: &str,
@@ -160,11 +217,20 @@ pub async fn download_conditional_with_headers(
     etag: Option<&str>,
     timeout: Duration,
     extra_headers: &[(String, String)],
+    max_bytes: u64,
 ) -> Result<DownloadResult> {
     let mut attempt = 0u32;
     loop {
-        match download_conditional_once(client, url, user_agent, etag, timeout, extra_headers)
-            .await
+        match download_conditional_once(
+            client,
+            url,
+            user_agent,
+            etag,
+            timeout,
+            extra_headers,
+            max_bytes,
+        )
+        .await
         {
             Ok(r) => return Ok(r),
             Err(e) if attempt < DOWNLOAD_RETRIES && is_transient_http(&e) => {
@@ -191,7 +257,7 @@ pub async fn download_bytes(
     user_agent: &str,
     timeout: Duration,
 ) -> Result<Vec<u8>> {
-    download_bytes_with_headers(client, url, user_agent, timeout, &[]).await
+    download_bytes_with_headers(client, url, user_agent, timeout, &[], MAX_RT_BYTES).await
 }
 
 pub async fn download_bytes_with_headers(
@@ -200,10 +266,18 @@ pub async fn download_bytes_with_headers(
     user_agent: &str,
     timeout: Duration,
     extra_headers: &[(String, String)],
+    max_bytes: u64,
 ) -> Result<Vec<u8>> {
-    let r =
-        download_conditional_with_headers(client, url, user_agent, None, timeout, extra_headers)
-            .await?;
+    let r = download_conditional_with_headers(
+        client,
+        url,
+        user_agent,
+        None,
+        timeout,
+        extra_headers,
+        max_bytes,
+    )
+    .await?;
     Ok(r.bytes)
 }
 
@@ -249,25 +323,56 @@ pub fn write_meta(data_dir: &Path, feed_id: &str, meta: &FeedMeta) -> Result<()>
     Ok(())
 }
 
-/// Write bytes to incoming/, validate GTFS tables, then promote to current.zip.
+/// Validate GTFS tables, stage bytes in incoming/, then promote to current.zip.
+///
+/// The staged file is consumed by the promotion (renamed into place) and removed
+/// on failure, so `incoming/` does not grow with every static update; leftovers
+/// from older versions / crashes are pruned to the newest [`KEEP_INCOMING_ZIPS`].
 pub fn write_current_zip(data_dir: &Path, feed_id: &str, bytes: &[u8]) -> Result<PathBuf> {
     validate_gtfs_zip(bytes)?;
     let dir = ensure_feed_dirs(data_dir, feed_id)?;
-    let incoming = dir.join("incoming").join(format!(
+    let incoming_dir = dir.join("incoming");
+    let incoming = incoming_dir.join(format!(
         "{}.zip",
-        chrono::Utc::now().format("%Y%m%d%H%M%S")
+        chrono::Utc::now().format("%Y%m%d%H%M%S%3f")
     ));
-    std::fs::write(&incoming, bytes)?;
     let current = dir.join("current.zip");
-    // Atomic-ish promote: write temp then rename when possible
-    let tmp = dir.join("current.zip.tmp");
-    std::fs::copy(&incoming, &tmp)?;
-    std::fs::rename(&tmp, &current).or_else(|_| {
-        std::fs::copy(&incoming, &current)?;
-        let _ = std::fs::remove_file(&tmp);
-        Ok::<(), std::io::Error>(())
-    })?;
+    let promoted = std::fs::write(&incoming, bytes).and_then(|()| {
+        // Same directory tree → rename is atomic; fall back to copy across devices.
+        std::fs::rename(&incoming, &current).or_else(|_| {
+            let tmp = dir.join("current.zip.tmp");
+            let r = std::fs::copy(&incoming, &tmp)
+                .and_then(|_| std::fs::rename(&tmp, &current));
+            let _ = std::fs::remove_file(&tmp);
+            r
+        })
+    });
+    // Rename consumed it on success; remove whatever is left otherwise.
+    let _ = std::fs::remove_file(&incoming);
+    prune_incoming(&incoming_dir, KEEP_INCOMING_ZIPS);
+    promoted?;
     Ok(current)
+}
+
+/// Keep only the newest `keep` `*.zip` files in `incoming/` (names are timestamps).
+fn prune_incoming(incoming_dir: &Path, keep: usize) {
+    let Ok(rd) = std::fs::read_dir(incoming_dir) else {
+        return;
+    };
+    let mut zips: Vec<PathBuf> = rd
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "zip"))
+        .collect();
+    if zips.len() <= keep {
+        return;
+    }
+    zips.sort();
+    let drop_n = zips.len() - keep;
+    for p in zips.into_iter().take(drop_n) {
+        if let Err(e) = std::fs::remove_file(&p) {
+            warn!(path = %p.display(), error = %e, "failed to prune incoming zip");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -354,6 +459,27 @@ mod tests {
         let path = write_current_zip(dir.path(), "f", &good).unwrap();
         assert!(path.exists());
         assert_eq!(std::fs::read(&path).unwrap(), good);
+        // Staged file is consumed by the promotion.
+        let incoming = dir.path().join("f").join("incoming");
+        assert_eq!(std::fs::read_dir(&incoming).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn write_current_prunes_leftover_incoming() {
+        let dir = tempfile::tempdir().unwrap();
+        let incoming = dir.path().join("f").join("incoming");
+        std::fs::create_dir_all(&incoming).unwrap();
+        for name in ["20200101000000.zip", "20200102000000.zip", "20200103000000.zip"] {
+            std::fs::write(incoming.join(name), b"old").unwrap();
+        }
+        let good = make_zip_with(&[("stops.txt", "s"), ("stop_times.txt", "t")]);
+        write_current_zip(dir.path(), "f", &good).unwrap();
+        let mut left: Vec<String> = std::fs::read_dir(&incoming)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec!["20200102000000.zip", "20200103000000.zip"]);
     }
 
     #[test]
